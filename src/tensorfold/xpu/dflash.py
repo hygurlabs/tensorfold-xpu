@@ -77,7 +77,7 @@ class DFlash2(cuda_dflash2.DFlash2):
             for name in [n for n in packed if n.endswith(".qweight")]:
                 base = name[:-len(".qweight")]
                 self.q4[base + ".weight"] = Int4(packed.pop(name).t().contiguous(), packed.pop(base + ".scales").contiguous(),
-                                                 zero, GROUP)
+                                                 zero, GROUP, out=torch.bfloat16)
         self.fast = False
         self.heads_local, self.kv_local = self.heads, self.kv_heads
         torch.cuda.empty_cache()
@@ -92,6 +92,26 @@ class DFlash2(cuda_dflash2.DFlash2):
             proj = self.q4[name]
             return proj(x) if x.shape[0] <= ROWS else proj.prefill(x)      # the drafter is not held to the verify bits
         return F.linear(x, self.weights[name])
+
+    def _layer(self, i: int, x: torch.Tensor) -> torch.Tensor:
+        """The reference layer on the fused kernels the CUDA fast path uses: the convolutions and their residual adds in
+        one launch each, the norms in one. Same roundings as the reference ``_layer``; about 150 launches fewer a round."""
+
+        w = self.weights
+        base = f"layers.{i}."
+        rows = len(x)
+        normed = F.rms_norm(x, (self.hidden,), w[base + "input_layernorm.weight"], self.eps)
+        dyn = self._lin(normed, base + "attention_conv.kernel_projection.weight")
+        conv = w[base + "attention_conv.base_kernel"]
+        attended = self._attention(i, cuda_dflash2._dconv(normed, dyn, conv, 0, self.group_size, seg=rows))
+        x = cuda_dflash2._dconv(attended, dyn, conv, 1, self.group_size, x, seg=rows)
+        normed = F.rms_norm(x, (self.hidden,), w[base + "post_attention_layernorm.weight"], self.eps)
+        dyn = self._lin(normed, base + "mlp_conv.kernel_projection.weight")
+        conv = w[base + "mlp_conv.base_kernel"]
+        h = cuda_dflash2._dconv(normed, dyn, conv, 0, self.group_size, seg=rows)
+        mlp = self._lin(F.silu(self._lin(h, base + "mlp.gate_proj.weight")) * self._lin(h, base + "mlp.up_proj.weight"),
+                        base + "mlp.down_proj.weight")
+        return cuda_dflash2._dconv(mlp, dyn, conv, 1, self.group_size, x, seg=rows)
 
     @torch.no_grad()
     def launch_blocks(self, snaps: list, pendings: list[int], max_nodes: int, block: int | None = None) -> list:

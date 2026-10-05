@@ -54,7 +54,10 @@ def _kernels() -> None:
 
 @dataclass
 class Int4:
-    """A GPTQ projection on ``int4_gemm_w4a16``: fp16 activations, fp32 sums, bf16 result, at most ``ROWS`` rows a call."""
+    """A GPTQ projection on ``int4_gemm_w4a16``: fp16 activations, fp32 sums, at most ``ROWS`` rows a call.
+
+    A decode call returns what the kernel returns, fp16, for the glue kernels that read it; ``out`` bf16 converts it, for
+    the rows torch ops or the attention read as bf16. A prompt call always returns bf16."""
 
     words: torch.Tensor    # (N, K/8) int32: the checkpoint's qweight, transposed
     scales: torch.Tensor   # (K/gs, N) fp16
@@ -63,6 +66,7 @@ class Int4:
     layout: str = "gptq"
     bits: int = 4
     fast: bool = False     # no FP8 prompt kernel on this backend
+    out: torch.dtype = torch.float16
 
     @property
     def n(self) -> int:
@@ -78,24 +82,29 @@ class Int4:
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         """Decode and verify rows in calls of exactly ``ROWS`` rows: a row has the same bits at any width of window."""
 
-        return self._blocks(x, ROWS)
+        return self._blocks(x, ROWS, self.out)
 
-    def _blocks(self, x: torch.Tensor, size: int) -> torch.Tensor:
+    def _blocks(self, x: torch.Tensor, size: int, out: torch.dtype) -> torch.Tensor:
         """Rows in calls of exactly ``size`` rows, the last one padded with whatever the buffer holds: rows do not meet."""
 
         _kernels()
         rows = x.shape[0]
         padded = -(-rows // size) * size
-        x16 = torch.empty((padded, self.k), dtype=torch.float16, device=x.device)
-        x16[:rows].copy_(x)                                      # the conversion; the padding rows are never read back
+        if x.dtype == torch.float16 and x.is_contiguous() and (
+                padded == rows or (x.storage_offset() == 0 and x.untyped_storage().nbytes() >= padded * self.k * 2)):
+            x16 = x if padded == rows else x.as_strided((padded, self.k), (self.k, 1))   # the glue's padded buffer, as it lies
+        else:
+            x16 = torch.empty((padded, self.k), dtype=torch.float16, device=x.device)
+            x16[:rows].copy_(x)                                  # the conversion; the padding rows are never read back
         parts = [torch.ops._xpu_C.int4_gemm_w4a16(x16[r0:r0 + size], self.words.t(), None, self.scales, self.zero, self.gs,
                                                   None) for r0 in range(0, padded, size)]
-        return (parts[0] if len(parts) == 1 else torch.cat(parts))[:rows].to(torch.bfloat16)
+        y = (parts[0] if len(parts) == 1 else torch.cat(parts))[:rows]
+        return y if out == torch.float16 else y.to(out)
 
     def prefill(self, x: torch.Tensor) -> torch.Tensor:
         """Prompt rows in calls of exactly ``BLOCK`` rows: any chunking gives a row the same bits."""
 
-        return self._blocks(x, BLOCK)
+        return self._blocks(x, BLOCK, torch.bfloat16)
 
 
 @dataclass
@@ -174,13 +183,13 @@ def load_gptq(model_dir: str | Path, device: str = "xpu"):
     def get(name: str) -> torch.Tensor:
         return t.pop(name)
 
-    def int4(name: str) -> Int4:
+    def int4(name: str, out: torch.dtype = torch.float16) -> Int4:
         words = get(name + ".qweight")
         scales = get(name + ".scales").contiguous()
         get(name + ".qzeros")                  # symmetric: every zero point is 8, checked by the tests
         if name + ".g_idx" in t:
             get(name + ".g_idx")               # act-order is refused above: the indices are the plain group runs
-        return Int4(words.t().contiguous(), scales, zero, gs)
+        return Int4(words.t().contiguous(), scales, zero, gs, out=out)
 
     def norm(name: str) -> torch.Tensor:
         """A centred RMSNorm weight (stored as gamma - 1) with its 1 back, as the MLX converter writes it."""
@@ -198,13 +207,13 @@ def load_gptq(model_dir: str | Path, device: str = "xpu"):
         gdn = attn = None
         if cfg.is_linear(i):
             q = p + "linear_attn."
-            gdn = GDN(qkv=int4(q + "in_proj_qkv"), z=int4(q + "in_proj_z"), b=dense(q + "in_proj_b"), a=dense(q + "in_proj_a"),
+            gdn = GDN(qkv=int4(q + "in_proj_qkv", torch.bfloat16), z=int4(q + "in_proj_z"), b=dense(q + "in_proj_b"), a=dense(q + "in_proj_a"),
                       out=int4(q + "out_proj"), conv=get(q + "conv1d.weight").reshape(-1, cfg.conv_kernel).contiguous(),
                       A_log=get(q + "A_log").float().contiguous(), dt_bias=get(q + "dt_bias").float().contiguous(),
                       norm=get(q + "norm.weight").contiguous())
         else:
             q = p + "self_attn."
-            attn = Attention(q=int4(q + "q_proj"), k=int4(q + "k_proj"), v=int4(q + "v_proj"), o=int4(q + "o_proj"),
+            attn = Attention(q=int4(q + "q_proj"), k=int4(q + "k_proj"), v=int4(q + "v_proj", torch.bfloat16), o=int4(q + "o_proj"),
                              q_norm=norm(q + "q_norm.weight"), k_norm=norm(q + "k_norm.weight"))
         layers.append(Layer(linear=cfg.is_linear(i), input_norm=norm(p + "input_layernorm.weight"),
                             post_norm=norm(p + "post_attention_layernorm.weight"), gdn=gdn, attn=attn,

@@ -120,8 +120,41 @@ def test_padding_rows_do_not_reach_the_real_ones():
 
     layer, _ = _linear()
     x = torch.randn(5, 1024, dtype=torch.bfloat16, device="xpu")
-    reference = layer(x).view(torch.int16)
+    reference = layer(x).to(torch.bfloat16).view(torch.int16)
     x16 = torch.full((16, 1024), float("nan"), dtype=torch.float16, device="xpu")
     x16[:5].copy_(x)
     out = torch.ops._xpu_C.int4_gemm_w4a16(x16, layer.words.t(), None, layer.scales, layer.zero, layer.gs, None)[:5]
     assert torch.equal(out.to(torch.bfloat16).view(torch.int16), reference)
+
+
+@pytest.mark.parametrize("rows", [1, 5, 16])
+def test_a_padded_glue_buffer_is_read_where_it_lies_with_the_same_bits(rows):
+    """What the glue kernels write (fp16 into a buffer padded to 16 rows, the padding unset) needs no conversion launch."""
+
+    from tensorfold.xpu import glue
+
+    layer, _ = _linear()
+    x = torch.randn(rows, 1024, dtype=torch.bfloat16, device="xpu")
+    buffer = glue.rows_buffer(rows, 1024, "xpu")
+    buffer.copy_(x)
+    full = buffer.as_strided((16, 1024), (1024, 1))
+    full[rows:] = float("nan")                                  # whatever the allocator left
+    assert torch.equal(layer(buffer).view(torch.int16), layer(x).view(torch.int16))
+    assert layer(buffer).dtype == torch.float16
+
+
+def test_the_glue_kernels_do_the_cuda_glues_arithmetic_in_fp16():
+    from tensorfold.families.qwen3_5.cuda import glue as cuda_glue
+    from tensorfold.xpu import glue
+
+    g = torch.Generator().manual_seed(2)
+    x = torch.randn(3, 5120, generator=g).bfloat16().to("xpu")
+    r = torch.randn(3, 5120, generator=g).bfloat16().to("xpu")
+    w = (torch.randn(5120, generator=g) * 0.1 + 1).bfloat16().to("xpu")
+    h, y, none = glue.add_rmsnorm(x, r, w, 1e-6)
+    h0, y0, _ = cuda_glue.add_rmsnorm(x, r, w, 1e-6)
+    assert none is None and torch.equal(h, h0) and y.dtype == torch.float16
+    assert ((y.float() - y0.float()).abs().max() / y0.float().abs().max()) < 1e-2
+    gate, up = (torch.randn(3, 17408, generator=g).bfloat16().to("xpu") for _ in range(2))
+    act = glue.swiglu(gate, up)[0]
+    assert act.dtype == torch.float16 and ((act.float() - cuda_glue.swiglu(gate, up)[0].float()).abs().max() < 1e-1)

@@ -70,6 +70,11 @@ def install() -> None:
 
     dflash2.DFlash2 = dflash.DFlash2                         # the drafter in bf16: no packed 4-bit lane kernels here
     affine_memory.draft_weights = dflash.draft_weights
+    from tensorfold.families.qwen3_5.cuda import glue as cuda_glue
+    from tensorfold.xpu import glue
+
+    for name in ("add_rmsnorm", "swiglu", "gated_norm", "gate_mul"):    # the rows a 4-bit projection reads, written as fp16
+        setattr(cuda_glue, name, getattr(glue, name))
     from tensorfold.cuda.kernels import prefill_attention
 
     prefill_attention.attention = xpu_attention.prefill                                  # the Triton kernel, tiled for an Arc GPU
