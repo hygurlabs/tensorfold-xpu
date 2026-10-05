@@ -17,7 +17,7 @@ PROMPT_ROWS = 128   # prompt rows a program holds; the bits do not depend on it 
 PROMPT_KEYS = 32    # keys a prompt tile folds at once, by absolute position: the bits' definition on this backend
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["W"])
 def _shared(Q, KC, VC, OFF, STREAM, ITEMS, PO, PM, PL, W, TO, TB, H: tl.constexpr, HK: tl.constexpr, D: tl.constexpr,
             G: tl.constexpr, CH: tl.constexpr, SCALE: tl.constexpr, GR: tl.constexpr, TS: tl.constexpr):
     """The CUDA kernel's arithmetic, in TS-key tiles; its fp32 tile goes to TO whole and TB says where each row belongs (-1: none)."""
@@ -71,7 +71,7 @@ def _shared(Q, KC, VC, OFF, STREAM, ITEMS, PO, PM, PL, W, TO, TB, H: tl.constexp
         tl.store(PL + base, gl, mask=ok)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["W", "KNO", "VNO"])      # one binary whatever the window and the cache rows' offsets
 def _tail(Q, ORIGIN, OFF, STREAM, ROWS, PATHS, DEPTHS, PO, PM, PL, W, KNO, VNO, H: tl.constexpr, HK: tl.constexpr,
           D: tl.constexpr, G: tl.constexpr, CH: tl.constexpr, MAXD: tl.constexpr, SCALE: tl.constexpr,
           GR: tl.constexpr, RT: tl.constexpr, TT: tl.constexpr):
