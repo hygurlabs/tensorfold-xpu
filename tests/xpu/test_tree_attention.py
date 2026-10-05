@@ -33,7 +33,7 @@ def _reference(q, kc, vc, k_nodes, v_nodes, parents, ctx, scale):
     return out
 
 
-@pytest.mark.parametrize("ctx", [0, 37, 600])
+@pytest.mark.parametrize("ctx", [0, 37, 600, 2100, 4300])
 @pytest.mark.parametrize("parents", [[-1], [-1, 0, 1, 2], [-1, 0, 0, 1, 1, 2, 4]])
 def test_matches_a_float32_reference(ctx, parents):
     g = torch.Generator().manual_seed(ctx + len(parents))
@@ -62,22 +62,42 @@ def test_a_row_does_not_depend_on_its_window():
     assert torch.equal(whole[0].view(torch.int16), alone[0].view(torch.int16))
 
 
-@pytest.mark.parametrize("ctx", [0, 5, 70, 511, 512, 600])
-def test_the_tail_visiting_fewer_tiles_changes_no_bit(ctx):
-    from tensorfold.xpu import attention as xpu_attention
+@pytest.mark.parametrize("ctx", [600, 2100, 4300, 9000])
+def test_a_row_does_not_depend_on_its_window_at_any_context(ctx):
+    """Every row of a branching window equals the same row alone: the whole-group and chunk paths of the long contexts."""
 
     g = torch.Generator().manual_seed(ctx)
     mk = lambda *s: (torch.randn(*s, generator=g) * 0.5).bfloat16().to("xpu")
-    parents = [-1, 0, 0, 1, 2, 4, 4, 3, 7, 7, 1, 10, 10, 6, 13, 0]       # 16 nodes, branching
+    parents = [-1, 0, 0, 1, 2, 4, 4, 3, 7, 7, 1, 10, 10, 6, 13, 0]
     w = len(parents)
-    kc, vc = mk(max(ctx, 1) + 8, HK, D), mk(max(ctx, 1) + 8, HK, D)
+    kc, vc = mk(ctx + 20, HK, D), mk(ctx + 20, HK, D)
     q, k_nodes, v_nodes = mk(w, H, D), mk(w, HK, D), mk(w, HK, D)
     offs = torch.tensor(ta.offsets([(kc, vc)], "xpu"), dtype=torch.int64).view(1, 2).to("xpu")
-    plan = ta.plan([parents], [ctx], H // HK, "xpu")
-    fast = ta.attention(q, k_nodes, v_nodes, offs, plan, scale=0.0625).view(torch.int16)
-    ta._tail = xpu_attention.cuda_tail
-    try:
-        reference = ta.attention(q, k_nodes, v_nodes, offs, plan, scale=0.0625).view(torch.int16)
-    finally:
-        ta._tail = xpu_attention._tail
-    assert torch.equal(fast, reference)
+    whole = ta.attention(q, k_nodes, v_nodes, offs, ta.plan([parents], [ctx], H // HK, "xpu"), scale=0.0625)
+    for node in range(w):
+        path = [node]
+        while parents[path[-1]] >= 0:
+            path.append(parents[path[-1]])
+        path.reverse()
+        local = [-1] + list(range(len(path) - 1))
+        idx = torch.tensor(path, device="xpu")
+        alone = ta.attention(q[idx].contiguous(), k_nodes[idx].contiguous(), v_nodes[idx].contiguous(), offs,
+                             ta.plan([local], [ctx], H // HK, "xpu"), scale=0.0625)
+        assert torch.equal(whole[node].view(torch.int16), alone[-1].view(torch.int16)), f"node {node} at context {ctx}"
+
+
+@pytest.mark.parametrize("ctx", [600, 4300, 9000])
+@pytest.mark.parametrize("behind", [1, 3, 31, 33, 70])
+def test_a_row_does_not_depend_on_how_many_tokens_were_committed_before_its_round(ctx, behind):
+    """The same keys, committed or still on the path: serial decoding and a wide round must give one row."""
+
+    g = torch.Generator().manual_seed(ctx + behind)
+    mk = lambda *s: (torch.randn(*s, generator=g) * 0.5).bfloat16().to("xpu")
+    kc, vc = mk(ctx + 1, HK, D), mk(ctx + 1, HK, D)
+    q = mk(behind + 1, H, D)
+    offs = torch.tensor(ta.offsets([(kc, vc)], "xpu"), dtype=torch.int64).view(1, 2).to("xpu")
+    alone = ta.attention(q[-1:].contiguous(), kc[ctx:ctx + 1].contiguous(), vc[ctx:ctx + 1].contiguous(), offs,
+                         ta.plan([[-1]], [ctx], H // HK, "xpu"), scale=0.0625)
+    chain = ta.attention(q, kc[ctx - behind:].contiguous(), vc[ctx - behind:].contiguous(), offs,
+                         ta.plan([[-1] + list(range(behind))], [ctx - behind], H // HK, "xpu"), scale=0.0625)
+    assert torch.equal(alone[0].view(torch.int16), chain[-1].view(torch.int16))

@@ -63,7 +63,8 @@ def install() -> None:
     from tensorfold.xpu import attention as xpu_attention
 
     tree_attention._shared = xpu_attention.shared            # IGC crashes on the CUDA kernel's masked row-indexed store
-    tree_attention._tail = xpu_attention._tail               # the same arithmetic, without the empty tiles
+    tree_attention._tail = xpu_attention.tail                # the same arithmetic, without the empty tiles
+    tree_attention._merge = xpu_attention.merge             # no fused multiply-add in any of the three, so the folds agree
     from tensorfold.families.qwen3_5.cuda import affine_memory, dflash2
     from tensorfold.xpu import dflash
 
