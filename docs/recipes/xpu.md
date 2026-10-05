@@ -29,11 +29,11 @@ draft stage drops from 11.8 to 8.4 ms.
 
 | | |
 |---|---|
-| serial decoding | 40 ms a token (25 tok/s) |
-| drafted decoding, 8 unseen prompts | 77 tok/s (4.5 tokens a round) |
-| drafted, 9,000-token context | 35 tok/s |
-| prompt, 2,000 tokens | 1,778 tok/s |
-| prompt, 4,000 / 9,000 / 14,000 tokens | 1,740 / 1,622 / 1,519 tok/s |
+| serial decoding | 38 ms a token (26 tok/s) |
+| drafted decoding, short context | 76-86 tok/s (4.4 tokens a round) |
+| drafted, 9,000-token context | 61 tok/s |
+| prompt, 2,000 tokens | 1,810 tok/s |
+| prompt, 4,000 / 9,000 / 14,000 tokens | 1,751 / 1,635 / 1,530 tok/s |
 
 The same card with vLLM-XPU's MTP (the DFlash2 architecture is not supported there): 45 to 61 tok/s drafted, 33.8 serial.
 
@@ -69,4 +69,6 @@ activation outliers.
 - Activations stay fp16 from the glue to the int4 kernel and back (`xpu/glue.py`), padded to the kernel's rows: about 740
   conversion launches a round fewer. `qkv` and `v` stay bf16 (the convolution state and the attention read them so).
 - `torch.topk` is replaced by a two-stage top-k: the stock kernel compiles for 38 s on its first use.
-- A prompt is cut at multiples of 1,024 absolute positions.
+- A prompt is cut at multiples of 1,024 absolute positions, and tree attention folds 128-key chunks (the last, partial
+  chunk is a sequential tail). The tree-attention kernels share each tile's output columns over four programs, which keeps
+  the tile in registers.
