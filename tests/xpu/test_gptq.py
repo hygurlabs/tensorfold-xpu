@@ -85,3 +85,12 @@ def test_more_rows_than_a_call_takes_split_without_changing_bits():
     x = torch.randn(20, 1024, dtype=torch.bfloat16, device="xpu")
     split = torch.cat([layer(x[r:r + 8].contiguous()) for r in range(0, 20, 8)])
     assert torch.equal(layer(x).view(torch.int16), split.view(torch.int16))
+
+
+def test_prompt_rows_keep_their_bits_whatever_the_chunking():
+    layer, _ = _linear()
+    x = torch.randn(300, 1024, dtype=torch.bfloat16, device="xpu")
+    whole = layer.prefill(x).view(torch.int16)
+    for cut in (1, 37, 128, 129, 250):
+        parts = torch.cat([layer.prefill(x[:cut].contiguous()), layer.prefill(x[cut:].contiguous())])
+        assert torch.equal(parts.view(torch.int16), whole), cut

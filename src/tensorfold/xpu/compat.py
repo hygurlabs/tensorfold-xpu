@@ -59,6 +59,10 @@ def install() -> None:
 
     for name in ("chain", "tree", "replay", "replay_table", "to_device", "pointers"):    # the CUDA extension's entry points
         setattr(cuda_gdn, name, getattr(gdn, name))
+    from tensorfold.cuda.kernels import attention as tree_attention
+    from tensorfold.xpu import attention as xpu_attention
+
+    tree_attention._shared = xpu_attention.shared            # IGC crashes on the CUDA kernel's masked row-indexed store
     from tensorfold.cuda.kernels import prefill_attention
 
     prefill_attention.attention = prefill_attention.triton_attention                    # the Triton kernel defines its bits

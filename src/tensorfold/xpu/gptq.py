@@ -10,6 +10,7 @@ import torch
 
 ZERO_POINT = 8        # a symmetric pack stores 7, read as 7 + 1
 ROWS = 8              # rows a call takes while its bits equal one row's (measured: the first M class of every shape)
+BLOCK = 128           # rows of every prompt call: a row meets the same kernel shape however the prompt is chunked
 
 
 def quant_config(model_dir: str | Path) -> dict | None:
@@ -84,11 +85,20 @@ class Int4:
         return out
 
     def prefill(self, x: torch.Tensor) -> torch.Tensor:
-        """Prompt rows; one call for now, so its bits depend on the chunk's row count."""
+        """Prompt rows in calls of exactly ``BLOCK`` rows, the last one padded: any chunking gives a row the same bits."""
 
         _kernels()
-        out = torch.ops._xpu_C.int4_gemm_w4a16(x.to(torch.float16), self.words.t(), None, self.scales, self.zero, self.gs, None)
-        return out.to(torch.bfloat16)
+        rows = x.shape[0]
+        x16 = x.to(torch.float16)
+        out = torch.empty((rows, self.n), dtype=torch.bfloat16, device=x.device)
+        for r0 in range(0, rows, BLOCK):
+            block = x16[r0:r0 + BLOCK]
+            have = block.shape[0]
+            if have < BLOCK:
+                block = torch.cat([block, torch.zeros((BLOCK - have, self.k), dtype=torch.float16, device=x.device)])
+            out[r0:r0 + have] = torch.ops._xpu_C.int4_gemm_w4a16(block, self.words.t(), None, self.scales, self.zero, self.gs,
+                                                                 None)[:have]
+        return out
 
 
 @dataclass
@@ -111,7 +121,9 @@ class Dense:
         return self.weight.numel() * self.weight.element_size()
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
-        return torch.nn.functional.linear(x.to(self.weight.dtype), self.weight).to(torch.bfloat16)
+        from .dense import matmul
+
+        return matmul(x.contiguous(), self.weight)
 
     prefill = __call__
 
