@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import types
 
+TREE_CHUNK = 128         # keys of a tree-attention chunk: the last, partial chunk is a sequential tail, so a short one is faster
 PROMPT_CHUNK = 1024      # rows of a prompt chunk: the largest block of the wide projections
 
 # torch.xpu has each of these under the same name, with the same meaning
@@ -64,6 +65,7 @@ def install() -> None:
     from tensorfold.cuda.kernels import attention as tree_attention
     from tensorfold.xpu import attention as xpu_attention
 
+    tree_attention.CHUNK, tree_attention.SPAN = TREE_CHUNK, TREE_CHUNK * tree_attention.GROUP
     tree_attention._shared = xpu_attention.shared            # IGC crashes on the CUDA kernel's masked row-indexed store
     tree_attention._tail = xpu_attention.tail                # the same arithmetic, without the empty tiles
     tree_attention._merge = xpu_attention.merge             # no fused multiply-add in any of the three, so the folds agree
