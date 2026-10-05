@@ -111,3 +111,38 @@ def test_replaying_the_accepted_rows_equals_the_chain_state():
     inplace = state.clone()
     gdn.replay(gdn.replay_table([k], [v], [g], [beta], [[inplace]]), 1, 1, rows, counts, k, v, in_place=True)
     assert torch.equal(_bits(inplace), _bits(final))
+
+
+PARENT_SETS = ([-1, 0, 1, 2], [-1, 0, 0, 1, 1, 2], [-1], [-1, 0, 0, 0, 3, 3, 1])
+
+
+def _multi(windows, order):
+    """The streams' windows in one call over a table of their states' addresses, in the stream order ``order``."""
+
+    inputs = [_inputs(len(parents), seed=11 + i) for i, parents in enumerate(windows)]
+    entries, starts, slots, rows = base.plan_host([windows[i] for i in order])
+    plan = base.Plan(torch.tensor(entries, dtype=torch.int32, device="xpu").view(-1, 3),
+                     torch.tensor(starts, dtype=torch.int32, device="xpu"), slots, rows)
+    cat = lambda n: torch.cat([inputs[i][n] for i in order])
+    table = torch.tensor(gdn.pointers([inputs[i][5] for i in order]), dtype=torch.int64, device="xpu")
+    got = gdn.tree(cat(0), cat(1), cat(2), cat(3), cat(4), plan, table=table)
+    return inputs, got
+
+
+def test_streams_walked_together_equal_each_walked_alone():
+    inputs, got = _multi(PARENT_SETS, range(len(PARENT_SETS)))
+    row = 0
+    for parents, (q, k, v, g, beta, state) in zip(PARENT_SETS, inputs):
+        alone = gdn.tree(q, k, v, g, beta, _plan(parents), state=state)
+        assert torch.equal(got[row:row + len(parents)].view(torch.int16), alone.view(torch.int16))
+        row += len(parents)
+
+
+def test_a_stream_has_the_same_bits_in_any_place_among_the_others():
+    _, a = _multi(PARENT_SETS, [0, 1, 2, 3])
+    _, b = _multi(PARENT_SETS, [3, 1, 0, 2])
+    sizes = [len(p) for p in PARENT_SETS]
+    where = lambda order, i: sum(sizes[j] for j in order[:order.index(i)])
+    for i, n in enumerate(sizes):
+        x, y = where([0, 1, 2, 3], i), where([3, 1, 0, 2], i)
+        assert torch.equal(a[x:x + n].view(torch.int16), b[y:y + n].view(torch.int16))

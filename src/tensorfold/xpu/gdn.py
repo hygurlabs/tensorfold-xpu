@@ -32,48 +32,63 @@ def _inputs(Q, K, V, G, BETA, node, kh, head, rows, ok, dk, HK: tl.constexpr, HV
 
 
 @triton.jit
-def _walk(Q, K, V, G, BETA, STATE, FINAL, SLOTS, ENTRIES, Y, W, HK: tl.constexpr, HV: tl.constexpr, DV: tl.constexpr,
-          DK: tl.constexpr, BV: tl.constexpr, CHAIN: tl.constexpr, HAS_FINAL: tl.constexpr):
-    """Each step's inputs are loaded while the step before computes: the chain is one load latency a step otherwise."""
+def _walk(Q, K, V, G, BETA, STATE, FINAL, SLOTS, ENTRIES, Y, W, STARTS, TABLE, ORIGIN, SLOT_STRIDE, HK: tl.constexpr,
+          HV: tl.constexpr, DV: tl.constexpr, DK: tl.constexpr, BV: tl.constexpr, CHAIN: tl.constexpr,
+          HAS_FINAL: tl.constexpr, MULTI: tl.constexpr):
+    """Each step's inputs are loaded while the step before computes: the chain is one load latency a step otherwise.
+
+    ``MULTI``: program z is stream z, its entries STARTS[z]..STARTS[z + 1], its state at ORIGIN + TABLE[z] (elements),
+    its slots a SLOT_STRIDE-element region of SLOTS: each stream walks as it would alone."""
 
     vb, head = tl.program_id(0), tl.program_id(1)
+    if MULTI:
+        stream = tl.program_id(2)
+        first = tl.load(STARTS + stream)
+        count = tl.load(STARTS + stream + 1) - first
+        state_ptr = ORIGIN + tl.load(TABLE + stream)
+        slots_ptr = SLOTS + stream.to(tl.int64) * SLOT_STRIDE
+    else:
+        first = tl.program_id(0) * 0
+        count = W
+        state_ptr = STATE
+        slots_ptr = SLOTS
     rows = vb * BV + tl.arange(0, BV)
     ok = rows < DV
     dk = tl.arange(0, DK)
     kh = head // (HV // HK)
-    init = tl.load(STATE + (head * DV + rows[:, None]) * DK + dk[None, :], mask=ok[:, None], other=0.0)
+    init = tl.load(state_ptr + (head * DV + rows[:, None]) * DK + dk[None, :], mask=ok[:, None], other=0.0)
     cur = init
     if CHAIN:
         node_n = tl.program_id(0) * 0
         source_n = node_n
         dest_n = node_n
     else:
-        node_n = tl.load(ENTRIES)
-        source_n = tl.load(ENTRIES + 1)
-        dest_n = tl.load(ENTRIES + 2)
+        node_n = tl.load(ENTRIES + 3 * first)
+        source_n = tl.load(ENTRIES + 3 * first + 1)
+        dest_n = tl.load(ENTRIES + 3 * first + 2)
     q_n, k_n, v_n, g_n, beta_n = _inputs(Q, K, V, G, BETA, node_n, kh, head, rows, ok, dk, HK, HV, DV, DK)
-    for e in range(0, W):
+    for e in range(0, count):
         node, source, dest = node_n, source_n, dest_n
         q, k, v, g, beta = q_n, k_n, v_n, g_n, beta_n
-        ahead = tl.minimum(e + 1, W - 1)
+        ahead = tl.minimum(e + 1, count - 1)
         if CHAIN:
             node_n = ahead
         else:
-            node_n = tl.load(ENTRIES + 3 * ahead)
-            source_n = tl.load(ENTRIES + 3 * ahead + 1)
-            dest_n = tl.load(ENTRIES + 3 * ahead + 2)
+            node_n = tl.load(ENTRIES + 3 * (first + ahead))
+            source_n = tl.load(ENTRIES + 3 * (first + ahead) + 1)
+            dest_n = tl.load(ENTRIES + 3 * (first + ahead) + 2)
         q_n, k_n, v_n, g_n, beta_n = _inputs(Q, K, V, G, BETA, node_n, kh, head, rows, ok, dk, HK, HV, DV, DK)
         if CHAIN:
             s = tl.where(e == 0, init, cur)
         else:
-            slot = tl.load(SLOTS + ((tl.maximum(source, 0) * HV + head) * DV + rows[:, None]) * DK + dk[None, :],
+            slot = tl.load(slots_ptr + ((tl.maximum(source, 0) * HV + head) * DV + rows[:, None]) * DK + dk[None, :],
                            mask=ok[:, None] & (source >= 0), other=0.0)
             s = tl.where(source == -1, init, tl.where(source >= 0, slot, cur))
         s = _step(s, k, v, g, beta)
         y = tl.sum(s * q[None, :], axis=1)
         tl.store(Y + (node * HV + head) * DV + rows, y.to(tl.bfloat16), mask=ok)
         if not CHAIN:
-            tl.store(SLOTS + ((tl.maximum(dest, 0) * HV + head) * DV + rows[:, None]) * DK + dk[None, :], s,
+            tl.store(slots_ptr + ((tl.maximum(dest, 0) * HV + head) * DV + rows[:, None]) * DK + dk[None, :], s,
                      mask=ok[:, None] & (dest >= 0))
         cur = s
     if HAS_FINAL:
@@ -124,9 +139,9 @@ def chain(q, k, v, g, beta, state, final):
     nodes, hk, hv, dv, dk = _dims(q, v)
     y = torch.empty((nodes, hv, dv), dtype=torch.bfloat16, device=q.device)
     if nodes:
-        _walk[(triton.cdiv(dv, BV), hv)](q, k, v, g, beta, state, final, state, state, y, nodes, HK=hk, HV=hv, DV=dv,
-                                         DK=dk, BV=BV, CHAIN=True, HAS_FINAL=True, num_warps=WARPS,
-                                         enable_fp_fusion=False)
+        _walk[(triton.cdiv(dv, BV), hv)](q, k, v, g, beta, state, final, state, state, y, nodes, state, state, state, 0,
+                                         HK=hk, HV=hv, DV=dv, DK=dk, BV=BV, CHAIN=True, HAS_FINAL=True, MULTI=False,
+                                         num_warps=WARPS, enable_fp_fusion=False)
     else:
         final.copy_(state)
     return y
@@ -134,20 +149,41 @@ def chain(q, k, v, g, beta, state, final):
 
 # the plan helpers are pure Python and torch: the CUDA module's own are kept
 def tree(q, k, v, g, beta, p, state=None, table=None, pending=None, final=None):
-    """Outputs (W, Hv, Dv) bf16 for a window's nodes, each from its ancestors' states; ``state`` is not changed."""
+    """Outputs (W, Hv, Dv) bf16 for a window's nodes, each from its ancestors' states; no state is changed. One stream's
+    ``state``, or a ``table`` of every stream's state address (one device int64 a stream) with ``p.starts``' row ranges."""
 
-    if table is not None or pending is not None or final is not None:
-        raise NotImplementedError("the XPU tree takes one stream's state, without pending rows or a final state yet")
-    if state is None:
-        raise ValueError("pass one stream's state")
-    _check(q, k, v, g, beta, state, p.entries)
+    if pending is not None or final is not None:
+        raise NotImplementedError("the XPU tree takes no pending rows or final state yet")
+    if (state is None) == (table is None):
+        raise ValueError("pass one stream's state or a table of every stream's")
+    _check(q, k, v, g, beta, p.entries)
     nodes, hk, hv, dv, dk = _dims(q, v)
     y = torch.empty((nodes, hv, dv), dtype=torch.bfloat16, device=q.device)
-    slots = torch.empty((max(p.slots, 1), hv, dv, dk), dtype=torch.float32, device=q.device)
-    _walk[(triton.cdiv(dv, BV), hv)](q, k, v, g, beta, state, state, slots, p.entries, y, nodes, HK=hk, HV=hv, DV=dv,
-                                     DK=dk, BV=BV, CHAIN=False, HAS_FINAL=False, num_warps=WARPS,
-                                     enable_fp_fusion=False)
+    slots_each = max(p.slots, 1)
+    if state is not None:
+        _check(state)
+        slots = torch.empty((slots_each, hv, dv, dk), dtype=torch.float32, device=q.device)
+        _walk[(triton.cdiv(dv, BV), hv)](q, k, v, g, beta, state, state, slots, p.entries, y, nodes, state, state, state, 0,
+                                         HK=hk, HV=hv, DV=dv, DK=dk, BV=BV, CHAIN=False, HAS_FINAL=False, MULTI=False,
+                                         num_warps=WARPS, enable_fp_fusion=False)
+        return y
+    streams = int(p.starts.shape[0]) - 1
+    origin = _origin(q.device)
+    at = table.reshape(-1).div(4, rounding_mode="floor")                  # byte offsets from the origin to fp32 elements
+    slots = torch.empty((streams * slots_each, hv, dv, dk), dtype=torch.float32, device=q.device)
+    _walk[(triton.cdiv(dv, BV), hv, streams)](q, k, v, g, beta, origin, origin, slots, p.entries, y, nodes, p.starts, at,
+                                              origin, slots_each * hv * dv * dk, HK=hk, HV=hv, DV=dv, DK=dk, BV=BV,
+                                              CHAIN=False, HAS_FINAL=False, MULTI=True, num_warps=WARPS,
+                                              enable_fp_fusion=False)
     return y
+
+
+def _origin(device) -> torch.Tensor:
+    """The fixed fp32 tensor every state's address is measured from (the attention's own origin, viewed as fp32)."""
+
+    from tensorfold.cuda.kernels import attention as tree_attention
+
+    return tree_attention.base(device).view(torch.float32)
 
 
 @dataclass
@@ -177,9 +213,12 @@ def to_device(values, dtype, device):
 
 
 def pointers(tensors: Sequence[torch.Tensor]) -> list[int]:
+    """Byte offsets from the fixed origin, the XPU's pointer table: its addresses do not fit a signed 64-bit integer."""
+
     if any(t.device.type != "xpu" or not t.is_contiguous() for t in tensors):
         raise ValueError("pointer tables take contiguous XPU tensors")
-    return [t.data_ptr() for t in tensors]
+    origin = _origin(tensors[0].device).data_ptr()
+    return [t.data_ptr() - origin for t in tensors]
 
 
 def replay(table: Table, layers: int, streams: int, rows: torch.Tensor, counts: torch.Tensor, k0: torch.Tensor,

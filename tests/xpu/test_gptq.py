@@ -206,3 +206,35 @@ def test_the_down_projections_grid_gives_a_row_one_place_whatever_the_chunking()
         assert torch.equal(torch.cat(parts).view(torch.int16), whole), f"chunks cut at {cuts}"
     with gptq.anchor(1500):                                              # a prompt resumed mid-block: the same rows
         assert torch.equal(layer.prefill(x[1500:2600].contiguous()).view(torch.int16), whole[1500:2600])
+
+
+@pytest.mark.parametrize("streams", [2, 3, 4])
+@pytest.mark.parametrize("shape", [(17408, 5120), (5120, 17408), (10240, 5120), (1024, 5120), (5120, 6144)])
+def test_a_streams_decode_rows_have_the_same_bits_in_any_place_among_the_others(shape, streams):
+    """A decode call of ``16 * streams`` rows: a stream's rows depend neither on its slot, nor on the others', nor on padding."""
+
+    _xpu()
+    n, k = shape
+    g = torch.Generator().manual_seed(n + k + streams)
+    words = torch.randint(-2 ** 31, 2 ** 31 - 1, (n, k // 8), dtype=torch.int32, generator=g).to("xpu")
+    scales = (torch.rand(k // 128, n, generator=g) * 0.02).half().to("xpu")
+    zero = torch.tensor([gptq.ZERO_POINT], dtype=torch.int8, device="xpu")
+    layer = gptq.Int4(words, scales, zero, 128, rows=16 * streams)
+    xs = [torch.randn(16, k, generator=g).bfloat16().to("xpu") for _ in range(streams)]
+    reference = layer(torch.cat(xs))
+    assert torch.equal(layer(torch.cat(xs)).view(torch.int16), reference.view(torch.int16)), "a repeat"
+    for slot in range(1, streams):
+        moved = layer(torch.cat(xs[-slot:] + xs[:-slot]))
+        assert torch.equal(moved[slot * 16:(slot + 1) * 16].view(torch.int16), reference[:16].view(torch.int16)), f"slot {slot}"
+    alone = layer(xs[0])                                               # one stream, the rest padding
+    assert torch.equal(alone.view(torch.int16), reference[:16].view(torch.int16))
+
+
+def test_the_decode_class_follows_the_stream_count_and_refuses_an_untested_one():
+    try:
+        gptq.set_decode_rows(4)
+        assert gptq.DECODE_ROWS == 64
+        with pytest.raises(ValueError):
+            gptq.set_decode_rows(5)
+    finally:
+        gptq.set_decode_rows(1)

@@ -13,14 +13,14 @@ import torch
 import triton
 import triton.language as tl
 
-from .gptq import ROWS
+from . import gptq
 
 
 def rows_buffer(rows: int, width: int, device) -> torch.Tensor:
-    """(rows, width) fp16 view of a buffer padded to whole ``ROWS`` (a window) or to whole 1,024 rows (a prompt chunk):
+    """(rows, width) fp16 view of a buffer padded to the decode call's rows (a window) or to whole 1,024 rows (a prompt chunk):
     ``Int4`` reads the padding where it lies, whatever block size its shape's prompt calls use."""
 
-    pad = ROWS if rows <= ROWS else 1024
+    pad = gptq.DECODE_ROWS if rows <= gptq.DECODE_ROWS else 1024
     return torch.empty((-(-rows // pad) * pad, width), dtype=torch.float16, device=device)[:rows]
 
 

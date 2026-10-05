@@ -271,6 +271,10 @@ def _serve_cuda(args: argparse.Namespace, family: Any, model_dir: Path, context:
     streams = 1 if str(args.parallel).strip().lower() == "auto" else _parallel(args.parallel)
     if streams > 1:
         options["parallel"] = streams
+    if args.backend == "xpu":
+        from tensorfold import xpu
+
+        xpu.streams(streams)       # one decode call size for every stream count's bits to agree
     if getattr(args, "checkpoint_slots", None) is not None and getattr(family.package, "CUDA_CHECKPOINT_SLOTS", False):
         options["checkpoint_slots"] = int(args.checkpoint_slots)
     served = args.name or (args.model.rstrip("/").split("/")[-1] if hub.is_repo_id(args.model) else model_dir.name)

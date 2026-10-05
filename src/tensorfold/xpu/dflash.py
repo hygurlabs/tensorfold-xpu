@@ -77,7 +77,7 @@ class DFlash2(cuda_dflash2.DFlash2):
             for name in [n for n in packed if n.endswith(".qweight")]:
                 base = name[:-len(".qweight")]
                 self.q4[base + ".weight"] = Int4(packed.pop(name).t().contiguous(), packed.pop(base + ".scales").contiguous(),
-                                                 zero, GROUP, out=torch.bfloat16)
+                                                 zero, GROUP, out=torch.bfloat16, rows=ROWS)
         self.fast = False
         self.heads_local, self.kv_local = self.heads, self.kv_heads
         torch.cuda.empty_cache()

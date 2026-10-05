@@ -103,4 +103,7 @@ def install() -> None:
 
     cuda_prefill.prefill_chunk = prefill_chunk
     cuda_prefill.chunks = chunks
+    from tensorfold.families.qwen3_5.cuda import multi
+
+    multi.BATCH = False             # queued prompts' steps do not share a forward: the down projection's grid is per prompt
     _ACTIVE = True

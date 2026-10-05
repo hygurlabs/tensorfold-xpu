@@ -11,6 +11,8 @@ import torch
 
 ZERO_POINT = 8        # a symmetric pack stores 7, read as 7 + 1
 ROWS = 16             # rows of every decode and verify call, padded to this many: one kernel class, one read of the weights
+DECODE_ROWS = ROWS    # ``16 * --parallel``: one class for every decode call of a server, a lone stream's included
+CLASSES = (16, 32, 48, 64)   # the decode sizes whose bits do not depend on a row's place or its neighbours (tests/xpu)
 BLOCK = 128           # rows of every prompt call of a shape not listed below: the kernel is bit-repeatable here (192 and 256 are not)
 # Rows of the prompt calls of the wide projections, by (N, K). Within one of these sets a row has the same bits at any block
 # size, in any position of the block and beside any padding (tests/xpu/test_gptq.py), and the kernel runs at 125-142 TFLOPs
@@ -36,6 +38,16 @@ def anchor(position: int):
         yield
     finally:
         _anchor[0] = before
+
+
+def set_decode_rows(streams: int) -> None:
+    """Every decode call of this process takes ``16 * streams`` rows, so a stream's bits are the same alone or with others."""
+
+    global DECODE_ROWS
+    rows = ROWS * int(streams)
+    if rows not in CLASSES:
+        raise ValueError(f"--parallel on the XPU backend takes 1 to {CLASSES[-1] // ROWS} streams, not {streams}")
+    DECODE_ROWS = rows
 
 
 def quant_config(model_dir: str | Path) -> dict | None:
@@ -92,6 +104,7 @@ class Int4:
     bits: int = 4
     fast: bool = False     # no FP8 prompt kernel on this backend
     out: torch.dtype = torch.float16
+    rows: int = 0          # decode call size; 0: ``DECODE_ROWS``
 
     @property
     def n(self) -> int:
@@ -107,7 +120,7 @@ class Int4:
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         """Decode and verify rows in calls of exactly ``ROWS`` rows: a row has the same bits at any width of window."""
 
-        return self._blocks(x, (ROWS,), self.out)
+        return self._blocks(x, (self.rows or DECODE_ROWS,), self.out)
 
     def _blocks(self, x: torch.Tensor, sizes: tuple[int, ...], out: torch.dtype) -> torch.Tensor:
         """Rows in calls of the ``sizes`` (ascending), the last one padded with whatever the buffer holds: rows do not meet."""

@@ -95,6 +95,19 @@ def _shared(Q, KC, VC, OFF, STREAM, ITEMS, PO, PM, PL, W, TO, TB, H: tl.constexp
             tl.store(PL + base, gl, mask=ok)
 
 
+@triton.jit
+def _update(acc, vv, valid, m, l, o, SCALE: tl.constexpr):
+    """One tile's online-softmax step from its scores ``acc`` (the CUDA ``_tile``'s arithmetic) and values ``vv``."""
+
+    scores = tl.where(valid[None, :], acc * SCALE, float("-inf"))
+    tile_m = tl.max(scores, 1)
+    active = tile_m != float("-inf")
+    next_m = tl.where(active, tl.maximum(m, tile_m), m)
+    alpha = tl.where(active, tl.where(m == float("-inf"), 0.0, tl.exp(m - next_m)), 1.0)
+    pr = tl.where(valid[None, :] & active[:, None], tl.exp(scores - next_m[:, None]), 0.0)
+    return next_m, l * alpha + tl.sum(pr, 1), o * alpha[:, None] + tl.dot(pr.to(tl.bfloat16), vv.to(tl.bfloat16))
+
+
 @triton.jit(do_not_specialize=["W", "KNO", "VNO"])
 def _tail(Q, ORIGIN, OFF, STREAM, ROWS, PATHS, DEPTHS, PO, PM, PL, W, KNO, VNO, H: tl.constexpr, HK: tl.constexpr,
           D: tl.constexpr, G: tl.constexpr, CH: tl.constexpr, MAXD: tl.constexpr, SCALE: tl.constexpr,
@@ -103,8 +116,9 @@ def _tail(Q, ORIGIN, OFF, STREAM, ROWS, PATHS, DEPTHS, PO, PM, PL, W, KNO, VNO, 
     whatever p is (a tile cut at p would make a row depend on how many tokens were committed before its round).
 
     Programs (node, kv head, chunk * NS + part): each holds D / NS of the output columns and reads q and the keys DC
-    columns at a time, which keeps the tile in registers; the bits are those of one program holding all of D. The two
-    key sources are chosen on the loaded values. Keys and values are element offsets from ORIGIN."""
+    columns at a time, which keeps the tile in registers; the bits are those of one program holding all of D. Tiles
+    of committed keys only load them unmasked; the few that hold the path choose the source on the loaded values, and
+    never read a committed row that does not exist. Keys and values are element offsets from ORIGIN."""
 
     node = tl.program_id(0)
     hk = tl.program_id(1)
@@ -130,7 +144,19 @@ def _tail(Q, ORIGIN, OFF, STREAM, ROWS, PATHS, DEPTHS, PO, PM, PL, W, KNO, VNO, 
         lane = tl.arange(0, TT)
         end = tl.minimum((chunk + 1) * CH, p + depth)
         tiles = (tl.maximum(end - chunk * CH, 0) + TT - 1) // TT
-        for t in range(tiles):
+        whole = tl.minimum(tl.maximum(p - chunk * CH, 0) // TT, tiles)           # tiles of committed keys only
+        every = lane < TT
+        for t in range(whole):
+            row = chunk * CH + t * TT + lane
+            ckr = tl.multiple_of(koff + (row * HK + hk) * D, 8)
+            cvr = tl.multiple_of(voff + (row * HK + hk) * D, 8)
+            acc = tl.zeros((RT, TT), tl.float32)
+            for c in tl.static_range(D // DC):
+                qc = tl.load(Q + qbase[:, None] + (c * DC + dc)[None, :]).to(tl.bfloat16)
+                kc = tl.load(ORIGIN + ckr[:, None] + (c * DC + dc)[None, :])
+                acc = tl.dot(qc, tl.trans(kc.to(tl.bfloat16)), acc)
+            m, l, o = _update(acc, tl.load(ORIGIN + cvr[:, None] + ds[None, :]), every, m, l, o, SCALE)
+        for t in range(whole, tiles):
             logical = chunk * CH + t * TT + lane
             valid = logical < end
             committed = logical < p
@@ -144,20 +170,12 @@ def _tail(Q, ORIGIN, OFF, STREAM, ROWS, PATHS, DEPTHS, PO, PM, PL, W, KNO, VNO, 
             acc = tl.zeros((RT, TT), tl.float32)
             for c in tl.static_range(D // DC):
                 qc = tl.load(Q + qbase[:, None] + (c * DC + dc)[None, :]).to(tl.bfloat16)
-                kc = tl.where(committed[:, None], tl.load(ORIGIN + ckr[:, None] + (c * DC + dc)[None, :]),
+                kc = tl.where(committed[:, None], tl.load(ORIGIN + ckr[:, None] + (c * DC + dc)[None, :], mask=committed[:, None], other=0.0),
                               tl.load(ORIGIN + pkr[:, None] + (c * DC + dc)[None, :]))
                 acc = tl.dot(qc, tl.trans(kc.to(tl.bfloat16)), acc)
-            scores = tl.where(valid[None, :], acc * SCALE, float("-inf"))
-            tile_m = tl.max(scores, 1)
-            active = tile_m != float("-inf")
-            next_m = tl.where(active, tl.maximum(m, tile_m), m)
-            alpha = tl.where(active, tl.where(m == float("-inf"), 0.0, tl.exp(m - next_m)), 1.0)
-            pr = tl.where(valid[None, :] & active[:, None], tl.exp(scores - next_m[:, None]), 0.0)
-            vv = tl.where(committed[:, None], tl.load(ORIGIN + cvr[:, None] + ds[None, :]),
+            vv = tl.where(committed[:, None], tl.load(ORIGIN + cvr[:, None] + ds[None, :], mask=committed[:, None], other=0.0),
                           tl.load(ORIGIN + pvr[:, None] + ds[None, :]))
-            o = o * alpha[:, None] + tl.dot(pr.to(tl.bfloat16), vv.to(tl.bfloat16))
-            l = l * alpha + tl.sum(pr, 1)
-            m = next_m
+            m, l, o = _update(acc, vv, valid, m, l, o, SCALE)
         base = ((chunk - groups * (GR - 1)) * W + node) * H + hk * G + gg
         tl.store(PO + base[:, None] * D + ds[None, :], o, mask=gg[:, None] < G)
         if part == 0:
