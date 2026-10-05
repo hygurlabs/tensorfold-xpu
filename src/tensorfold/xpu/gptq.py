@@ -9,7 +9,7 @@ from pathlib import Path
 import torch
 
 ZERO_POINT = 8        # a symmetric pack stores 7, read as 7 + 1
-ROWS = 8              # rows a call takes while its bits equal one row's (measured: the first M class of every shape)
+ROWS = 16             # rows of every decode and verify call, padded to this many: one kernel class, one read of the weights
 BLOCK = 128           # rows of every prompt call, however the prompt is chunked; the kernel is bit-repeatable up to here (192 and 256 are not)
 
 
@@ -76,26 +76,26 @@ class Int4:
         return sum(t.numel() * t.element_size() for t in (self.words, self.scales, self.zero))
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
-        _kernels()
-        x16 = x.to(torch.float16)
-        out = torch.empty((x.shape[0], self.n), dtype=torch.bfloat16, device=x.device)
-        for r0 in range(0, x.shape[0], ROWS):
-            out[r0:r0 + ROWS] = torch.ops._xpu_C.int4_gemm_w4a16(x16[r0:r0 + ROWS], self.words.t(), None, self.scales,
-                                                                  self.zero, self.gs, None)
-        return out
+        """Decode and verify rows in calls of exactly ``ROWS`` rows: a row has the same bits at any width of window."""
 
-    def prefill(self, x: torch.Tensor) -> torch.Tensor:
-        """Prompt rows in calls of exactly ``BLOCK`` rows, the last one padded: any chunking gives a row the same bits."""
+        return self._blocks(x, ROWS)
+
+    def _blocks(self, x: torch.Tensor, size: int) -> torch.Tensor:
+        """Rows in calls of exactly ``size`` rows, the last one padded with whatever the buffer holds: rows do not meet."""
 
         _kernels()
         rows = x.shape[0]
-        padded = -(-rows // BLOCK) * BLOCK
+        padded = -(-rows // size) * size
         x16 = torch.empty((padded, self.k), dtype=torch.float16, device=x.device)
-        x16[:rows].copy_(x)                                      # the conversion and the padding in one pass
-        x16[rows:].zero_()
-        parts = [torch.ops._xpu_C.int4_gemm_w4a16(x16[r0:r0 + BLOCK], self.words.t(), None, self.scales, self.zero, self.gs,
-                                                  None) for r0 in range(0, padded, BLOCK)]
+        x16[:rows].copy_(x)                                      # the conversion; the padding rows are never read back
+        parts = [torch.ops._xpu_C.int4_gemm_w4a16(x16[r0:r0 + size], self.words.t(), None, self.scales, self.zero, self.gs,
+                                                  None) for r0 in range(0, padded, size)]
         return (parts[0] if len(parts) == 1 else torch.cat(parts))[:rows].to(torch.bfloat16)
+
+    def prefill(self, x: torch.Tensor) -> torch.Tensor:
+        """Prompt rows in calls of exactly ``BLOCK`` rows: any chunking gives a row the same bits."""
+
+        return self._blocks(x, BLOCK)
 
 
 @dataclass

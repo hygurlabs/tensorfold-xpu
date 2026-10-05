@@ -74,9 +74,9 @@ def test_projection_matches_a_dequantized_reference():
 
 def test_rows_of_one_call_keep_the_bits_of_a_single_row():
     layer, _ = _linear()
-    x = torch.randn(8, 1024, dtype=torch.bfloat16, device="xpu")
+    x = torch.randn(16, 1024, dtype=torch.bfloat16, device="xpu")
     whole = layer(x).view(torch.int16)
-    for rows in (1, 2, 5, 8):
+    for rows in (1, 2, 5, 8, 9, 12):
         assert torch.equal(layer(x[:rows].contiguous()).view(torch.int16), whole[:rows])
 
 
@@ -108,8 +108,20 @@ def test_every_row_count_the_engine_uses_is_bit_repeatable(name):
     k, n = SHAPES[name]
     words, scales, _ = _pack(k, n)
     layer = gptq.Int4(words.t().contiguous().to("xpu"), scales.to("xpu"), torch.tensor([8], dtype=torch.int8, device="xpu"), 128)
-    for rows in (1, 2, 8, 9, 64, gptq.BLOCK):
+    for rows in (1, 2, 8, 9, 12, gptq.ROWS, gptq.ROWS + 1, 64, gptq.BLOCK):
         x = torch.randn(rows, k, dtype=torch.bfloat16, device="xpu")
-        call = layer.prefill if rows == gptq.BLOCK else layer
+        call = layer.prefill if rows in (64, gptq.BLOCK) else layer
         first = call(x).view(torch.int16)
         assert all(torch.equal(call(x).view(torch.int16), first) for _ in range(25)), f"{name} at {rows} rows"
+
+
+def test_padding_rows_do_not_reach_the_real_ones():
+    """The padded rows hold whatever the buffer had, even NaN: a row's bits are the same."""
+
+    layer, _ = _linear()
+    x = torch.randn(5, 1024, dtype=torch.bfloat16, device="xpu")
+    reference = layer(x).view(torch.int16)
+    x16 = torch.full((16, 1024), float("nan"), dtype=torch.float16, device="xpu")
+    x16[:5].copy_(x)
+    out = torch.ops._xpu_C.int4_gemm_w4a16(x16, layer.words.t(), None, layer.scales, layer.zero, layer.gs, None)[:5]
+    assert torch.equal(out.to(torch.bfloat16).view(torch.int16), reference)
