@@ -291,6 +291,10 @@ def _serve_cuda(args: argparse.Namespace, family: Any, model_dir: Path, context:
     if asked and not fp8:
         raise ValueError("--prefill-fp8: this checkpoint's prompt matmuls have no FP8 kernel (EXL3 packs, MLX formats "
                          "other than Qwen's 4-bit g64, Flash Next without MXFP8 layers); drop the flag")
+    if args.backend == "xpu":
+        from tensorfold import xpu
+
+        xpu.warm(engine)    # compile before the first request, not during it
     stacks.arm()            # its warmup may have loaded a compiler that took USR1
     if args.tp == 2 and args.rank == 1:
         print(f"[tensorfold] rank 1 ready in {time.perf_counter() - started:.1f}s, following rank 0", flush=True)

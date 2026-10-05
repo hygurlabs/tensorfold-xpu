@@ -70,6 +70,9 @@ def install() -> None:
 
     dflash2.DFlash2 = dflash.DFlash2                         # the drafter in bf16: no packed 4-bit lane kernels here
     affine_memory.draft_weights = dflash.draft_weights
+    from tensorfold.xpu import topk
+
+    topk.install()                                           # the stock large-slice kernel compiles for 38 s on first use
     from tensorfold.families.qwen3_5.cuda import glue as cuda_glue
     from tensorfold.xpu import glue
 
