@@ -173,6 +173,12 @@ def load_gptq(model_dir: str | Path, device: str = "xpu"):
             get(name + ".g_idx")               # act-order is refused above: the indices are the plain group runs
         return Int4(words.t().contiguous(), scales, zero, gs)
 
+    def norm(name: str) -> torch.Tensor:
+        """A centred RMSNorm weight (stored as gamma - 1) with its 1 back, as the MLX converter writes it."""
+
+        w = get(name)
+        return (w.float() + 1.0).to(w.dtype).contiguous()
+
     def dense(name: str) -> Dense:
         return Dense(get(name + ".weight").contiguous())
 
@@ -190,12 +196,12 @@ def load_gptq(model_dir: str | Path, device: str = "xpu"):
         else:
             q = p + "self_attn."
             attn = Attention(q=int4(q + "q_proj"), k=int4(q + "k_proj"), v=int4(q + "v_proj"), o=int4(q + "o_proj"),
-                             q_norm=get(q + "q_norm.weight").contiguous(), k_norm=get(q + "k_norm.weight").contiguous())
-        layers.append(Layer(linear=cfg.is_linear(i), input_norm=get(p + "input_layernorm.weight").contiguous(),
-                            post_norm=get(p + "post_attention_layernorm.weight").contiguous(), gdn=gdn, attn=attn,
+                             q_norm=norm(q + "q_norm.weight"), k_norm=norm(q + "k_norm.weight"))
+        layers.append(Layer(linear=cfg.is_linear(i), input_norm=norm(p + "input_layernorm.weight"),
+                            post_norm=norm(p + "post_attention_layernorm.weight"), gdn=gdn, attn=attn,
                             gate=int4(p + "mlp.gate_proj"), up=int4(p + "mlp.up_proj"), down=int4(p + "mlp.down_proj")))
     embed = QLinear(get(base + "embed_tokens.weight").contiguous(), None, None, layout="dense", bits=0, gs=0)
-    w = Weights(config=cfg, embed=embed, layers=layers, norm=get(base + "norm.weight"), head=dense("lm_head"), quant="gptq")
+    w = Weights(config=cfg, embed=embed, layers=layers, norm=norm(base + "norm.weight"), head=dense("lm_head"), quant="gptq")
     half = cfg.rope_dims // 2
     w.inv_freq = (cfg.rope_theta ** (-torch.arange(0, half, dtype=torch.float64) / half)).to(torch.float32).to(device)
     if t.left():

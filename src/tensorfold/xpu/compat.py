@@ -54,4 +54,12 @@ def install() -> None:
 
     build.refuse_old_gpu = lambda need=None: None             # the floor is an NVIDIA compute capability
     build.load = no_extension
+    from tensorfold.cuda.kernels import gdn as cuda_gdn
+    from tensorfold.xpu import gdn
+
+    for name in ("chain", "tree", "replay", "replay_table", "to_device", "pointers"):    # the CUDA extension's entry points
+        setattr(cuda_gdn, name, getattr(gdn, name))
+    from tensorfold.cuda.kernels import prefill_attention
+
+    prefill_attention.attention = prefill_attention.triton_attention                    # the Triton kernel defines its bits
     _ACTIVE = True

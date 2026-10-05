@@ -43,7 +43,7 @@ def capture(logits, tokens, positions, probabilities, rows=None):
         return
     if rows is not None:
         logits = logits.index_select(0, torch.tensor(rows, dtype=torch.long, device=logits.device))
-    if not logits.is_cuda or logits.ndim != 2 or logits.shape[0] != len(tokens) or logits.stride(1) != 1:
+    if logits.is_cpu or logits.ndim != 2 or logits.shape[0] != len(tokens) or logits.stride(1) != 1:
         raise ValueError("probabilities need CUDA target rows and one accepted token per row")
     n, vocab = logits.shape
     tiles = tr.cdiv(vocab, 1024)

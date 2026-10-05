@@ -284,12 +284,12 @@ def base(device) -> torch.Tensor:
     """A fixed bf16 tensor that cache offsets are measured from (so an empty cache still has a valid offset)."""
 
     device = torch.device(device)
-    return _base(device.index if device.index is not None else torch.cuda.current_device())
+    return _base(device.type, device.index if device.index is not None else torch.cuda.current_device())
 
 
 @lru_cache(maxsize=None)
-def _base(index: int) -> torch.Tensor:
-    return torch.zeros(64, dtype=torch.bfloat16, device=torch.device("cuda", index))
+def _base(kind: str, index: int) -> torch.Tensor:
+    return torch.zeros(64, dtype=torch.bfloat16, device=torch.device(kind, index))
 
 
 def offsets(caches: Sequence[tuple[torch.Tensor, torch.Tensor]], device) -> list[int]:
@@ -317,7 +317,7 @@ def attention(q: torch.Tensor, k_nodes: torch.Tensor, v_nodes: torch.Tensor, off
     if not (w == p.width and d in (128, 256) and k_nodes.shape == (w, hk, d) and v_nodes.shape == k_nodes.shape
             and h % hk == 0 and h // hk <= QUERY_TILE):
         raise ValueError("unsupported attention shape")
-    if any(x.dtype != torch.bfloat16 or not x.is_cuda or not x.is_contiguous() for x in (q, k_nodes, v_nodes)):
+    if any(x.dtype != torch.bfloat16 or x.is_cpu or not x.is_contiguous() for x in (q, k_nodes, v_nodes)):
         raise ValueError("q and node keys and values must be contiguous CUDA bf16 tensors")
     origin = base(q.device)
     if not math.isfinite(scale) or scale <= 0:
