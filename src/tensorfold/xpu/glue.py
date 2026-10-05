@@ -17,9 +17,11 @@ from .gptq import ROWS
 
 
 def rows_buffer(rows: int, width: int, device) -> torch.Tensor:
-    """(rows, width) fp16 view of a buffer padded to whole ``ROWS``: ``Int4`` reads the padding where it lies."""
+    """(rows, width) fp16 view of a buffer padded to whole ``ROWS`` (a window) or to whole 1,024 rows (a prompt chunk):
+    ``Int4`` reads the padding where it lies, whatever block size its shape's prompt calls use."""
 
-    return torch.empty((-(-rows // ROWS) * ROWS, width), dtype=torch.float16, device=device)[:rows]
+    pad = ROWS if rows <= ROWS else 1024
+    return torch.empty((-(-rows // pad) * pad, width), dtype=torch.float16, device=device)[:rows]
 
 
 @triton.jit

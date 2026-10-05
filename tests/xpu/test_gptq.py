@@ -158,3 +158,51 @@ def test_the_glue_kernels_do_the_cuda_glues_arithmetic_in_fp16():
     gate, up = (torch.randn(3, 17408, generator=g).bfloat16().to("xpu") for _ in range(2))
     act = glue.swiglu(gate, up)[0]
     assert act.dtype == torch.float16 and ((act.float() - cuda_glue.swiglu(gate, up)[0].float()).abs().max() < 1e-1)
+
+
+@pytest.mark.parametrize("shape", sorted(gptq.PROMPT_BLOCKS))
+def test_a_wide_projections_prompt_rows_have_the_same_bits_whatever_the_chunking(shape):
+    """The block sizes of ``PROMPT_BLOCKS``: one class of bits, whatever the plan, the position in a block or the padding."""
+
+    _xpu()
+    n, k = shape
+    g = torch.Generator().manual_seed(n + k)
+    words = torch.randint(-2 ** 31, 2 ** 31 - 1, (n, k // 8), dtype=torch.int32, generator=g).to("xpu")
+    scales = (torch.rand(k // 128, n, generator=g) * 0.02).half().to("xpu")
+    zero = torch.tensor([gptq.ZERO_POINT], dtype=torch.int8, device="xpu")
+    layer = gptq.Int4(words, scales, zero, 128)                       # (N, K/8), as the loader keeps it
+    x = torch.randn(2600, k, generator=g).half().to("xpu")
+    whole = layer.prefill(x).view(torch.int16)
+    assert torch.equal(layer.prefill(x).view(torch.int16), whole), "a repeat of the same call"
+    for cuts in ((1024, 2048), (700, 1500), (37, 1400, 2000), (512, 1024, 1536, 2048)):
+        edges = (0, *cuts, 2600)
+        parts = torch.cat([layer.prefill(x[a:b].contiguous()) for a, b in zip(edges, edges[1:])])
+        assert torch.equal(parts.view(torch.int16), whole), f"chunks cut at {cuts}"
+    padded = torch.full((1024, k), float("nan"), dtype=torch.float16, device="xpu")
+    padded[:90] = x[1000:1090]
+    assert torch.equal(layer.prefill(padded)[:90].view(torch.int16), whole[1000:1090]), "padding rows never reach the real ones"
+
+
+def test_the_down_projections_grid_gives_a_row_one_place_whatever_the_chunking():
+    """Anchored blocks: chunks cut anywhere, each told its absolute start, give every row the bits of the whole prompt."""
+
+    _xpu()
+    n, k = next(iter(gptq.ANCHORED))
+    g = torch.Generator().manual_seed(11)
+    words = torch.randint(-2 ** 31, 2 ** 31 - 1, (n, k // 8), dtype=torch.int32, generator=g).to("xpu")
+    scales = (torch.rand(k // 128, n, generator=g) * 0.02).half().to("xpu")
+    zero = torch.tensor([gptq.ZERO_POINT], dtype=torch.int8, device="xpu")
+    layer = gptq.Int4(words, scales, zero, 128)
+    x = torch.randn(3100, k, generator=g).half().to("xpu")
+    with gptq.anchor(0):
+        whole = layer.prefill(x).view(torch.int16)
+    for cuts in ((1024, 2048), (700, 1500), (37, 1400, 2000), (512, 1024, 1536, 2048, 3000)):
+        edges = (0, *cuts, 3100)
+        with torch.no_grad():
+            parts = []
+            for a, b in zip(edges, edges[1:]):
+                with gptq.anchor(a):
+                    parts.append(layer.prefill(x[a:b].contiguous()))
+        assert torch.equal(torch.cat(parts).view(torch.int16), whole), f"chunks cut at {cuts}"
+    with gptq.anchor(1500):                                              # a prompt resumed mid-block: the same rows
+        assert torch.equal(layer.prefill(x[1500:2600].contiguous()).view(torch.int16), whole[1500:2600])

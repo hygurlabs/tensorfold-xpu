@@ -13,8 +13,8 @@ ROWS = 16     # query rows a program holds (the CUDA kernel's tile)
 TAIL_TILE = 32
 SHARED_TILE = 32
 WARPS = 2     # a tile costs 20 us on two warps and 36 on four (measured, one program, 4,096 keys)
-PROMPT_ROWS = 128   # prompt rows a program holds; the bits do not depend on it (measured: one checksum for 32..128)
-PROMPT_KEYS = 32    # keys a prompt tile folds at once, by absolute position: the bits' definition on this backend
+PROMPT_ROWS = 64    # prompt rows a program holds; the bits do not depend on it (measured: one checksum for 32..128)
+PROMPT_KEYS = 16    # keys a prompt tile folds at once, by absolute position: the bits' definition on this backend
 
 
 @triton.jit(do_not_specialize=["W"])
@@ -184,7 +184,7 @@ def prefill(q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, p0: i
     hk = _check(q, k_cache, v_cache, p0)
     out = torch.empty_like(q) if out is None else out
     _attend[(triton.cdiv(w, PROMPT_ROWS), h)](q, k_cache, v_cache, out, p0, w, H=h, HK=hk, D=d, BM=PROMPT_ROWS,
-                                              BN=PROMPT_KEYS, SCALE=scale, num_warps=16, num_stages=1)
+                                              BN=PROMPT_KEYS, SCALE=scale, num_warps=8, num_stages=1)
     return out
 
 

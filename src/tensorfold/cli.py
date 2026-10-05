@@ -368,6 +368,12 @@ def cmd_serve(args: argparse.Namespace) -> int:
     if args.ple_on_ssd and not hasattr(family.package, "ple_bytes"):
         raise ValueError(f"--ple-on-ssd: {family.title} has no n-gram (PLE) tables to read from SSD")
     backend = _backend(args.backend, family)
+    if getattr(args, "prefill_int8", "off") != "off":
+        if args.backend != "xpu":
+            raise ValueError("--prefill-int8 is for --backend xpu (an Intel Arc GPU)")
+        from tensorfold.xpu import a8
+
+        a8.configure(args.prefill_int8)
     _check_serve_options(args, family, backend, config_dir)
     families.require_readable(family, families.read_config(config_dir), backend)
     _note_untested(family, args.model)

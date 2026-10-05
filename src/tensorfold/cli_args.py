@@ -142,6 +142,11 @@ def build_parser(handlers: dict[str, Callable[[argparse.Namespace], int]]) -> ar
                            "docs/recipes/cuda.md#prompt-precision has the measured cost). Default: "
                            f"{'FP8' if FP8_BY_DEFAULT else 'bf16'} activations. Replies equal this server's own serial "
                            "decoding either way")
+    cuda.add_argument("--prefill-int8", choices=("off", "mlp", "all"), default="off",
+                      help="--backend xpu: prompt matmuls take int8 activations, one scale a row, on the 4-bit weights' "
+                           "int8 kernel: mlp (gate, up, down) or all projections. Faster prompts, lower precision "
+                           "(docs/recipes/xpu.md has the measured cost). Default off: fp16 activations. "
+                           "Replies equal this server's own serial decoding either way")
     cuda.add_argument("--precision", choices=("checkpoint", "full"), default=argparse.SUPPRESS,
                       help="the math for checkpoints that name their activations' formats (NVFP4): checkpoint, the "
                            "default, runs their own math as their runtimes do (FP4 x FP4 in NVFP4 layers on SM 12.x "

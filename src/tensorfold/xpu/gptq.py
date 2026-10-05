@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -10,7 +11,31 @@ import torch
 
 ZERO_POINT = 8        # a symmetric pack stores 7, read as 7 + 1
 ROWS = 16             # rows of every decode and verify call, padded to this many: one kernel class, one read of the weights
-BLOCK = 128           # rows of every prompt call, however the prompt is chunked; the kernel is bit-repeatable up to here (192 and 256 are not)
+BLOCK = 128           # rows of every prompt call of a shape not listed below: the kernel is bit-repeatable here (192 and 256 are not)
+# Rows of the prompt calls of the wide projections, by (N, K). Within one of these sets a row has the same bits at any block
+# size, in any position of the block and beside any padding (tests/xpu/test_gptq.py), and the kernel runs at 125-142 TFLOPs
+# against 85-110 at 128 rows. Not listed: the MLP's down projection, whose bits depend on the row's place in a block beyond
+# 128 rows, and every shape of another model.
+# The MLP's down projection: a row's bits depend on its place in the block (at 127 TFLOPs, against 89 at 128 rows), but they
+# are the same for the same place of the same grid. Its blocks sit on a fixed grid of absolute positions, so a row has one
+# place whatever the chunking; the chunk that starts mid-block pads the front (``anchor``).
+ANCHORED = {(5120, 17408): 1024}
+PROMPT_BLOCKS = {(17408, 5120): (512, 1024), (10240, 5120): (512, 1024), (6144, 5120): (512, 1024),
+                 (5120, 6144): (512, 1024), (12288, 5120): (512, 1024), (1024, 5120): (1024,)}
+
+
+_anchor = [0]
+
+
+@contextmanager
+def anchor(position: int):
+    """The absolute position of the first row of the prompt calls made inside: where an anchored shape's grid starts."""
+
+    before, _anchor[0] = _anchor[0], int(position)
+    try:
+        yield
+    finally:
+        _anchor[0] = before
 
 
 def quant_config(model_dir: str | Path) -> dict | None:
@@ -56,8 +81,8 @@ def _kernels() -> None:
 class Int4:
     """A GPTQ projection on ``int4_gemm_w4a16``: fp16 activations, fp32 sums, at most ``ROWS`` rows a call.
 
-    A decode call returns what the kernel returns, fp16, for the glue kernels that read it; ``out`` bf16 converts it, for
-    the rows torch ops or the attention read as bf16. A prompt call always returns bf16."""
+    A call returns what the kernel returns, fp16, for the glue kernels that read it; ``out`` bf16 converts it, for the rows
+    torch ops or the attention read as bf16."""
 
     words: torch.Tensor    # (N, K/8) int32: the checkpoint's qweight, transposed
     scales: torch.Tensor   # (K/gs, N) fp16
@@ -82,29 +107,89 @@ class Int4:
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         """Decode and verify rows in calls of exactly ``ROWS`` rows: a row has the same bits at any width of window."""
 
-        return self._blocks(x, ROWS, self.out)
+        return self._blocks(x, (ROWS,), self.out)
 
-    def _blocks(self, x: torch.Tensor, size: int, out: torch.dtype) -> torch.Tensor:
-        """Rows in calls of exactly ``size`` rows, the last one padded with whatever the buffer holds: rows do not meet."""
+    def _blocks(self, x: torch.Tensor, sizes: tuple[int, ...], out: torch.dtype) -> torch.Tensor:
+        """Rows in calls of the ``sizes`` (ascending), the last one padded with whatever the buffer holds: rows do not meet."""
 
         _kernels()
         rows = x.shape[0]
-        padded = -(-rows // size) * size
+        blocks, left = [], rows
+        while left > sizes[-1]:
+            blocks.append(sizes[-1])
+            left -= sizes[-1]
+        if left:
+            blocks.append(next(b for b in sizes if b >= left))
+        padded = sum(blocks)
         if x.dtype == torch.float16 and x.is_contiguous() and (
                 padded == rows or (x.storage_offset() == 0 and x.untyped_storage().nbytes() >= padded * self.k * 2)):
             x16 = x if padded == rows else x.as_strided((padded, self.k), (self.k, 1))   # the glue's padded buffer, as it lies
         else:
             x16 = torch.empty((padded, self.k), dtype=torch.float16, device=x.device)
             x16[:rows].copy_(x)                                  # the conversion; the padding rows are never read back
-        parts = [torch.ops._xpu_C.int4_gemm_w4a16(x16[r0:r0 + size], self.words.t(), None, self.scales, self.zero, self.gs,
-                                                  None) for r0 in range(0, padded, size)]
+        parts, r0 = [], 0
+        for size in blocks:
+            parts.append(torch.ops._xpu_C.int4_gemm_w4a16(x16[r0:r0 + size], self.words.t(), None, self.scales, self.zero,
+                                                          self.gs, None))
+            r0 += size
         y = (parts[0] if len(parts) == 1 else torch.cat(parts))[:rows]
         return y if out == torch.float16 else y.to(out)
 
     def prefill(self, x: torch.Tensor) -> torch.Tensor:
-        """Prompt rows in calls of exactly ``BLOCK`` rows: any chunking gives a row the same bits."""
+        """Prompt rows in calls of the shape's block sizes: any chunking gives a row the same bits."""
 
-        return self._blocks(x, BLOCK, torch.bfloat16)
+        from . import a8
+
+        if a8.runs(self.n, self.k):
+            return self._prefill8(x)
+        cell = ANCHORED.get((self.n, self.k))
+        if cell:
+            return self._on_grid(x, cell)
+        return self._blocks(x, PROMPT_BLOCKS.get((self.n, self.k), (BLOCK,)), self.out)
+
+    def _prefill8(self, x: torch.Tensor) -> torch.Tensor:
+        """Prompt rows as int8 on ``int4_gemm_w4a8`` (``a8``): integer sums, so any block plan gives a row the same bits."""
+
+        from . import a8
+
+        _kernels()
+        rows = x.shape[0]
+        q, scale = a8.quantized(x)
+        sizes = (1024,) if self.n == 1024 else (512, 1024)      # the k/v projection has one class from 1,024 rows
+        blocks, left = [], rows
+        while left > sizes[-1]:
+            blocks.append(sizes[-1])
+            left -= sizes[-1]
+        if left:
+            blocks.append(next(b for b in sizes if b >= left))
+        zp = a8.zero_points(x.device, sum(blocks))
+        parts, r0 = [], 0
+        for size in blocks:
+            parts.append(torch.ops._xpu_C.int4_gemm_w4a8(q[r0:r0 + size], scale[r0:r0 + size], zp[r0:r0 + size],
+                                                         self.words.t(), self.scales, self.zero, self.gs, None, None))
+            r0 += size
+        y = (parts[0] if len(parts) == 1 else torch.cat(parts))[:rows]
+        return y if self.out == torch.float16 else y.to(self.out)
+
+    def _on_grid(self, x: torch.Tensor, cell: int) -> torch.Tensor:
+        """Rows in calls of ``cell`` rows on the grid of absolute positions: a block's unused rows are padding."""
+
+        _kernels()
+        rows, at = x.shape[0], _anchor[0] % cell
+        x16 = x if x.dtype == torch.float16 and x.is_contiguous() else x.to(torch.float16).contiguous()
+        parts, r0 = [], 0
+        while r0 < rows:
+            take = min(rows - r0, cell - at)
+            if at == 0 and x16.untyped_storage().nbytes() >= (x16.storage_offset() // self.k + r0 + cell) * self.k * 2:
+                block = x16.as_strided((cell, self.k), (self.k, 1), x16.storage_offset() + r0 * self.k)   # as it lies
+            else:
+                block = torch.empty((cell, self.k), dtype=torch.float16, device=x.device)
+                block[at:at + take].copy_(x16[r0:r0 + take])
+            parts.append(torch.ops._xpu_C.int4_gemm_w4a16(block, self.words.t(), None, self.scales, self.zero, self.gs,
+                                                          None)[at:at + take])
+            r0, at = r0 + take, 0
+        y = parts[0] if len(parts) == 1 else torch.cat(parts)
+        return y if self.out == torch.float16 else y.to(self.out)
 
 
 @dataclass

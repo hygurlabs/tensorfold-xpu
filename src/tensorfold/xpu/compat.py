@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import types
 
+PROMPT_CHUNK = 1024      # rows of a prompt chunk: the largest block of the wide projections
+
 # torch.xpu has each of these under the same name, with the same meaning
 _SAME = ("synchronize", "empty_cache", "Event", "Stream", "current_stream", "stream", "set_device", "current_device",
          "device", "device_count", "memory_allocated", "memory_reserved", "max_memory_allocated", "reset_peak_memory_stats",
@@ -81,4 +83,22 @@ def install() -> None:
     from tensorfold.cuda.kernels import prefill_attention
 
     prefill_attention.attention = xpu_attention.prefill                                  # the Triton kernel, tiled for an Arc GPU
+    from tensorfold.families.qwen3_5.cuda import prefill as cuda_prefill
+    from tensorfold.xpu import gptq
+
+    def chunks(start: int, end: int, size: int = 0) -> list[tuple[int, int]]:
+        """Chunks that end on the 1,024-row grid of absolute positions: each is one call of the largest block of a wide
+        projection and one block of the down projection's grid, nothing to join; the first and last may be short."""
+
+        edges = [start, *range((start // PROMPT_CHUNK + 1) * PROMPT_CHUNK, end, PROMPT_CHUNK), end]
+        return [(a, b) for a, b in zip(edges, edges[1:]) if b > a]
+
+    chunk = cuda_prefill.prefill_chunk
+
+    def prefill_chunk(w, tokens, st, **kwargs):
+        with gptq.anchor(st.pos):
+            return chunk(w, tokens, st, **kwargs)
+
+    cuda_prefill.prefill_chunk = prefill_chunk
+    cuda_prefill.chunks = chunks
     _ACTIVE = True
