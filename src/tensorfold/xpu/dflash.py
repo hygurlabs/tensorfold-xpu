@@ -13,6 +13,8 @@ from safetensors import safe_open
 from tensorfold.families.qwen3_5.cuda import dflash2 as cuda_dflash2
 from tensorfold.families.qwen3_5.cuda.glue import embedding
 
+from .gptq import ROWS
+
 SELECTOR_CODEBOOKS = ("candidate_selector.predecessor_codebook", "candidate_selector.successor_codebook")
 
 
@@ -51,9 +53,13 @@ class DFlash2(cuda_dflash2.DFlash2):
         self.target_embed = target.embed
         self.device = target.norm.device
         self.weights: dict = {}
+        packed: dict = {}
         with safe_open(str(path / "model.safetensors"), "pt") as f:
             for name in f.keys():
                 tensor = f.get_tensor(name)
+                if name.endswith((".qweight", ".scales")):       # a pack from ``quantize_drafter``: 4-bit projections
+                    packed[name] = tensor.to(self.device)
+                    continue
                 self.weights[name] = tensor.float().numpy().copy() if name in SELECTOR_CODEBOOKS else tensor.to(self.device)
         self.inv_freq = (1.0 / self.theta ** (torch.arange(self.head_dim // 2, device=self.device, dtype=torch.float32)
                                               * 2 / self.head_dim))
@@ -63,6 +69,15 @@ class DFlash2(cuda_dflash2.DFlash2):
         self.head_cols = self.sub_rows = self.sub_parts = None
         self.head_rows = [target.head.weight[a:b] for a, b in self.vocab_spans]      # views of the target's head: no copy
         self.q4: dict = {}
+        if packed:
+            from .gptq import Int4, ZERO_POINT
+            from .quantize_drafter import GROUP
+
+            zero = torch.tensor([ZERO_POINT], dtype=torch.int8, device=self.device)
+            for name in [n for n in packed if n.endswith(".qweight")]:
+                base = name[:-len(".qweight")]
+                self.q4[base + ".weight"] = Int4(packed.pop(name).t().contiguous(), packed.pop(base + ".scales").contiguous(),
+                                                 zero, GROUP)
         self.fast = False
         self.heads_local, self.kv_local = self.heads, self.kv_heads
         torch.cuda.empty_cache()
@@ -72,7 +87,11 @@ class DFlash2(cuda_dflash2.DFlash2):
         self.context_end = 0
 
     def _lin(self, x: torch.Tensor, name: str) -> torch.Tensor:
-        return F.linear(x.to(torch.bfloat16), self.weights[name])
+        x = x.to(torch.bfloat16)
+        if name in self.q4:
+            proj = self.q4[name]
+            return proj(x) if x.shape[0] <= ROWS else proj.prefill(x)      # the drafter is not held to the verify bits
+        return F.linear(x, self.weights[name])
 
     @torch.no_grad()
     def launch_blocks(self, snaps: list, pendings: list[int], max_nodes: int, block: int | None = None) -> list:
