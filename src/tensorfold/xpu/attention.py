@@ -98,13 +98,12 @@ def _tail(Q, KN, VN, KC, VC, OFF, STREAM, ROWS, PATHS, DEPTHS, PO, PM, PL, W, H:
             path_slot = logical - p
             on_path = (path_slot >= 0) & (path_slot < depth)
             path_node = tl.load(PATHS + node * MAXD + path_slot, mask=on_path, other=0)
-            kc = tl.load(KC + koff + (logical[:, None] * HK + hk) * D + d[None, :], mask=committed[:, None], other=0)
-            vc = tl.load(VC + voff + (logical[:, None] * HK + hk) * D + d[None, :], mask=committed[:, None], other=0)
-            kn = tl.load(KN + (path_node[:, None] * HK + hk) * D + d[None, :], mask=on_path[:, None], other=0)
-            vn = tl.load(VN + (path_node[:, None] * HK + hk) * D + d[None, :], mask=on_path[:, None], other=0)
-            kk = tl.where(committed[:, None], kc, kn).to(tl.bfloat16)
-            vv = tl.where(committed[:, None], vc, vn).to(tl.bfloat16)
-            m, l, o = _tile(q, kk, vv, m, l, o, committed | on_path, SCALE)
+            have = committed | on_path
+            kk = tl.load(tl.where(committed[:, None], KC + koff + (logical[:, None] * HK + hk) * D + d[None, :],
+                                  KN + (path_node[:, None] * HK + hk) * D + d[None, :]), mask=have[:, None], other=0)
+            vv = tl.load(tl.where(committed[:, None], VC + voff + (logical[:, None] * HK + hk) * D + d[None, :],
+                                  VN + (path_node[:, None] * HK + hk) * D + d[None, :]), mask=have[:, None], other=0)
+            m, l, o = _tile(q, kk.to(tl.bfloat16), vv.to(tl.bfloat16), m, l, o, have, SCALE)
         base = ((chunk - groups * (GR - 1)) * W + node) * H + hk * G + gg
         tl.store(PO + base[:, None] * D + d[None, :], o, mask=gg[:, None] < G)
         tl.store(PM + base, m, mask=gg < G)

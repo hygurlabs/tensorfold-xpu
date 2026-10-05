@@ -68,7 +68,7 @@ def test_the_tail_visiting_fewer_tiles_changes_no_bit(ctx):
 
     g = torch.Generator().manual_seed(ctx)
     mk = lambda *s: (torch.randn(*s, generator=g) * 0.5).bfloat16().to("xpu")
-    parents = [-1, 0, 0, 1, 2, 4]
+    parents = [-1, 0, 0, 1, 2, 4, 4, 3, 7, 7, 1, 10, 10, 6, 13, 0]       # 16 nodes, branching
     w = len(parents)
     kc, vc = mk(max(ctx, 1) + 8, HK, D), mk(max(ctx, 1) + 8, HK, D)
     q, k_nodes, v_nodes = mk(w, H, D), mk(w, HK, D), mk(w, HK, D)

@@ -64,6 +64,11 @@ def install() -> None:
 
     tree_attention._shared = xpu_attention.shared            # IGC crashes on the CUDA kernel's masked row-indexed store
     tree_attention._tail = xpu_attention._tail               # the same arithmetic, without the empty tiles
+    from tensorfold.families.qwen3_5.cuda import affine_memory, dflash2
+    from tensorfold.xpu import dflash
+
+    dflash2.DFlash2 = dflash.DFlash2                         # the drafter in bf16: no packed 4-bit lane kernels here
+    affine_memory.draft_weights = dflash.draft_weights
     from tensorfold.cuda.kernels import prefill_attention
 
     prefill_attention.attention = xpu_attention.prefill                                  # the Triton kernel, tiled for an Arc GPU
