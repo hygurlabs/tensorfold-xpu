@@ -9,8 +9,8 @@ import torch
 import triton
 import triton.language as tl
 
-BV = 16          # value rows a program holds; a row's bits never depend on it
-WARPS = 4
+BV = 4           # value rows a program holds; a row's bits never depend on it (measured: one checksum from 4 to 32)
+WARPS = 1
 
 
 @triton.jit

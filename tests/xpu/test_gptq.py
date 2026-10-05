@@ -94,3 +94,22 @@ def test_prompt_rows_keep_their_bits_whatever_the_chunking():
     for cut in (1, 37, 128, 129, 250):
         parts = torch.cat([layer.prefill(x[:cut].contiguous()), layer.prefill(x[cut:].contiguous())])
         assert torch.equal(parts.view(torch.int16), whole), cut
+
+
+SHAPES = {"qkv": (5120, 10240), "z": (5120, 6144), "out": (6144, 5120), "q": (5120, 12288), "kv": (5120, 1024),
+          "gate": (5120, 17408), "down": (17408, 5120)}
+
+
+@pytest.mark.parametrize("name", list(SHAPES))
+def test_every_row_count_the_engine_uses_is_bit_repeatable(name):
+    """The kernel is not repeatable for every row count (192 rows and more on several shapes): the engine stays below."""
+
+    _xpu()
+    k, n = SHAPES[name]
+    words, scales, _ = _pack(k, n)
+    layer = gptq.Int4(words.t().contiguous().to("xpu"), scales.to("xpu"), torch.tensor([8], dtype=torch.int8, device="xpu"), 128)
+    for rows in (1, 2, 8, 9, 64, gptq.BLOCK):
+        x = torch.randn(rows, k, dtype=torch.bfloat16, device="xpu")
+        call = layer.prefill if rows == gptq.BLOCK else layer
+        first = call(x).view(torch.int16)
+        assert all(torch.equal(call(x).view(torch.int16), first) for _ in range(25)), f"{name} at {rows} rows"

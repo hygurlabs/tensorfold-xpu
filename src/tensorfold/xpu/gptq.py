@@ -10,7 +10,7 @@ import torch
 
 ZERO_POINT = 8        # a symmetric pack stores 7, read as 7 + 1
 ROWS = 8              # rows a call takes while its bits equal one row's (measured: the first M class of every shape)
-BLOCK = 128           # rows of every prompt call: a row meets the same kernel shape however the prompt is chunked
+BLOCK = 128           # rows of every prompt call, however the prompt is chunked; the kernel is bit-repeatable up to here (192 and 256 are not)
 
 
 def quant_config(model_dir: str | Path) -> dict | None:
@@ -89,16 +89,13 @@ class Int4:
 
         _kernels()
         rows = x.shape[0]
-        x16 = x.to(torch.float16)
-        out = torch.empty((rows, self.n), dtype=torch.bfloat16, device=x.device)
-        for r0 in range(0, rows, BLOCK):
-            block = x16[r0:r0 + BLOCK]
-            have = block.shape[0]
-            if have < BLOCK:
-                block = torch.cat([block, torch.zeros((BLOCK - have, self.k), dtype=torch.float16, device=x.device)])
-            out[r0:r0 + have] = torch.ops._xpu_C.int4_gemm_w4a16(block, self.words.t(), None, self.scales, self.zero, self.gs,
-                                                                 None)[:have]
-        return out
+        padded = -(-rows // BLOCK) * BLOCK
+        x16 = torch.empty((padded, self.k), dtype=torch.float16, device=x.device)
+        x16[:rows].copy_(x)                                      # the conversion and the padding in one pass
+        x16[rows:].zero_()
+        parts = [torch.ops._xpu_C.int4_gemm_w4a16(x16[r0:r0 + BLOCK], self.words.t(), None, self.scales, self.zero, self.gs,
+                                                  None) for r0 in range(0, padded, BLOCK)]
+        return (parts[0] if len(parts) == 1 else torch.cat(parts))[:rows].to(torch.bfloat16)
 
 
 @dataclass

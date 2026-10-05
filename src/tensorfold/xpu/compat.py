@@ -66,5 +66,5 @@ def install() -> None:
     tree_attention._tail = xpu_attention._tail               # the same arithmetic, without the empty tiles
     from tensorfold.cuda.kernels import prefill_attention
 
-    prefill_attention.attention = prefill_attention.triton_attention                    # the Triton kernel defines its bits
+    prefill_attention.attention = xpu_attention.prefill                                  # the Triton kernel, tiled for an Arc GPU
     _ACTIVE = True
