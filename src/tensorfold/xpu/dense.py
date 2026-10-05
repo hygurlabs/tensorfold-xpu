@@ -10,7 +10,7 @@ ROWS = 16        # rows a program holds; every row meets the same instructions w
 OUTPUTS = 64
 BLOCK = 64
 SPLIT_BELOW = 4096   # a projection with fewer outputs than this spreads its sum over K across programs
-SPLITS = (16, 8, 4, 2)
+SPLITS = (80, 40, 20, 16, 8, 4, 2)      # parts of the sum over K, the most that divide it: one dot a program
 
 
 @triton.jit

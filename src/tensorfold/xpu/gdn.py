@@ -24,8 +24,18 @@ def _step(s, k, v, g, beta):
 
 
 @triton.jit
+def _inputs(Q, K, V, G, BETA, node, kh, head, rows, ok, dk, HK: tl.constexpr, HV: tl.constexpr, DV: tl.constexpr, DK: tl.constexpr):
+    q = tl.load(Q + (node * HK + kh) * DK + dk).to(tl.float32)
+    k = tl.load(K + (node * HK + kh) * DK + dk).to(tl.float32)
+    v = tl.load(V + (node * HV + head) * DV + rows, mask=ok, other=0.0).to(tl.float32)
+    return q, k, v, tl.load(G + node * HV + head), tl.load(BETA + node * HV + head)
+
+
+@triton.jit
 def _walk(Q, K, V, G, BETA, STATE, FINAL, SLOTS, ENTRIES, Y, W, HK: tl.constexpr, HV: tl.constexpr, DV: tl.constexpr,
           DK: tl.constexpr, BV: tl.constexpr, CHAIN: tl.constexpr, HAS_FINAL: tl.constexpr):
+    """Each step's inputs are loaded while the step before computes: the chain is one load latency a step otherwise."""
+
     vb, head = tl.program_id(0), tl.program_id(1)
     rows = vb * BV + tl.arange(0, BV)
     ok = rows < DV
@@ -33,22 +43,32 @@ def _walk(Q, K, V, G, BETA, STATE, FINAL, SLOTS, ENTRIES, Y, W, HK: tl.constexpr
     kh = head // (HV // HK)
     init = tl.load(STATE + (head * DV + rows[:, None]) * DK + dk[None, :], mask=ok[:, None], other=0.0)
     cur = init
+    if CHAIN:
+        node_n = tl.program_id(0) * 0
+        source_n = node_n
+        dest_n = node_n
+    else:
+        node_n = tl.load(ENTRIES)
+        source_n = tl.load(ENTRIES + 1)
+        dest_n = tl.load(ENTRIES + 2)
+    q_n, k_n, v_n, g_n, beta_n = _inputs(Q, K, V, G, BETA, node_n, kh, head, rows, ok, dk, HK, HV, DV, DK)
     for e in range(0, W):
+        node, source, dest = node_n, source_n, dest_n
+        q, k, v, g, beta = q_n, k_n, v_n, g_n, beta_n
+        ahead = tl.minimum(e + 1, W - 1)
         if CHAIN:
-            node = e
+            node_n = ahead
+        else:
+            node_n = tl.load(ENTRIES + 3 * ahead)
+            source_n = tl.load(ENTRIES + 3 * ahead + 1)
+            dest_n = tl.load(ENTRIES + 3 * ahead + 2)
+        q_n, k_n, v_n, g_n, beta_n = _inputs(Q, K, V, G, BETA, node_n, kh, head, rows, ok, dk, HK, HV, DV, DK)
+        if CHAIN:
             s = tl.where(e == 0, init, cur)
         else:
-            node = tl.load(ENTRIES + 3 * e)
-            source = tl.load(ENTRIES + 3 * e + 1)
-            dest = tl.load(ENTRIES + 3 * e + 2)
             slot = tl.load(SLOTS + ((tl.maximum(source, 0) * HV + head) * DV + rows[:, None]) * DK + dk[None, :],
                            mask=ok[:, None] & (source >= 0), other=0.0)
             s = tl.where(source == -1, init, tl.where(source >= 0, slot, cur))
-        q = tl.load(Q + (node * HK + kh) * DK + dk).to(tl.float32)
-        k = tl.load(K + (node * HK + kh) * DK + dk).to(tl.float32)
-        v = tl.load(V + (node * HV + head) * DV + rows, mask=ok, other=0.0).to(tl.float32)
-        g = tl.load(G + node * HV + head)
-        beta = tl.load(BETA + node * HV + head)
         s = _step(s, k, v, g, beta)
         y = tl.sum(s * q[None, :], axis=1)
         tl.store(Y + (node * HV + head) * DV + rows, y.to(tl.bfloat16), mask=ok)
@@ -70,11 +90,20 @@ def _replay(K, V, G, BETA, STATE, OUT, ROWS, COUNT, HK: tl.constexpr, HV: tl.con
     kh = head // (HV // HK)
     at = (head * DV + rows[:, None]) * DK + dk[None, :]
     cur = tl.load(STATE + at, mask=ok[:, None], other=0.0)
-    for i in range(0, tl.load(COUNT)):
-        node = tl.load(ROWS + i)
-        k = tl.load(K + (node * HK + kh) * DK + dk).to(tl.float32)
-        v = tl.load(V + (node * HV + head) * DV + rows, mask=ok, other=0.0).to(tl.float32)
-        cur = _step(cur, k, v, tl.load(G + node * HV + head), tl.load(BETA + node * HV + head))
+    count = tl.load(COUNT)
+    node_n = tl.load(ROWS)
+    k_n = tl.load(K + (node_n * HK + kh) * DK + dk).to(tl.float32)
+    v_n = tl.load(V + (node_n * HV + head) * DV + rows, mask=ok, other=0.0).to(tl.float32)
+    g_n = tl.load(G + node_n * HV + head)
+    beta_n = tl.load(BETA + node_n * HV + head)
+    for i in range(0, count):
+        k, v, g, beta = k_n, v_n, g_n, beta_n
+        node_n = tl.load(ROWS + tl.minimum(i + 1, count - 1))
+        k_n = tl.load(K + (node_n * HK + kh) * DK + dk).to(tl.float32)
+        v_n = tl.load(V + (node_n * HV + head) * DV + rows, mask=ok, other=0.0).to(tl.float32)
+        g_n = tl.load(G + node_n * HV + head)
+        beta_n = tl.load(BETA + node_n * HV + head)
+        cur = _step(cur, k, v, g, beta)
     tl.store(OUT + at, cur, mask=ok[:, None])
 
 
