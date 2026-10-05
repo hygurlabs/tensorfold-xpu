@@ -132,6 +132,10 @@ def backends_of(family: Family) -> tuple[str, ...]:
 def readable_quants(family: Family, backend: str) -> tuple[str | None, ...]:
     """Return formats supported by the backend, using the family QUANT_METHODS override when present."""
 
+    from tensorfold import xpu
+
+    if backend == "cuda" and xpu.active():
+        return ("gptq",)
     declared = getattr(family.package, "QUANT_METHODS", {}) or {}
     default = (MLX_QUANT, None) if backend == "mlx" else (MLX_QUANT,)
     return tuple(declared.get(backend, default))

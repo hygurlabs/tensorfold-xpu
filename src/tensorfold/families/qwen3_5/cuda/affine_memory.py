@@ -11,6 +11,12 @@ from pathlib import Path
 def weight_transform(model_dir, *, one_gpu: bool = False):
     """Tensor bytes; the head counts twice (the drafter's copy), once on ``one_gpu`` where the drafter views it."""
 
+    from tensorfold import xpu
+
+    if xpu.active():
+        from tensorfold.xpu.gptq import weight_transform as gptq_transform
+
+        return gptq_transform(model_dir, one_gpu=one_gpu)
     from tensorfold.cuda.geometry import linear_weights, size
     from tensorfold.cuda.capacity import headers
     from tensorfold.quantization import resolve_affine

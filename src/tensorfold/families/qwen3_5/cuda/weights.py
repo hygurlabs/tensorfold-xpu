@@ -273,7 +273,13 @@ def load(model_dir: str | Path, device: str = "cuda", *, tiled: bool = False, ml
     from .exl3_load import load_exl3, quant_config
     from .nvfp4_load import load_nvfp4, quantized
 
+    from tensorfold import xpu
+
     model_dir = Path(model_dir)
+    if xpu.active():
+        from tensorfold.xpu.gptq import load_gptq
+
+        return load_gptq(model_dir)
     if quant_config(model_dir) is not None:
         return load_exl3(model_dir, device)
     if quantized(model_dir):

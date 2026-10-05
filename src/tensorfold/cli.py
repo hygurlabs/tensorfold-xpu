@@ -229,6 +229,11 @@ def _note_untested(family: Any, model: str) -> None:
 def _backend(choice: str, family: Any) -> str:
     """mlx or cuda: auto picks MLX on macOS and CUDA elsewhere; a family serves only the backends it has."""
 
+    if choice == "xpu":                    # the CUDA engine, its torch.cuda calls answered by torch.xpu
+        from tensorfold import xpu
+
+        xpu.install()
+        choice = "cuda"
     backend = choice if choice != "auto" else ("mlx" if sys.platform == "darwin" else "cuda")
     if backend == "cuda" and not hasattr(family.package, "cuda_engine"):
         raise ValueError(f"{family.title} has no CUDA engine yet: serve it on Apple Silicon")
