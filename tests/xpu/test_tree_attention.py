@@ -60,3 +60,24 @@ def test_a_row_does_not_depend_on_its_window():
     alone = ta.attention(q[:1].contiguous(), k_nodes[:1].contiguous(), v_nodes[:1].contiguous(), offs,
                          ta.plan([[-1]], [ctx], H // HK, "xpu"), scale=0.0625)
     assert torch.equal(whole[0].view(torch.int16), alone[0].view(torch.int16))
+
+
+@pytest.mark.parametrize("ctx", [0, 5, 70, 511, 512, 600])
+def test_the_tail_visiting_fewer_tiles_changes_no_bit(ctx):
+    from tensorfold.xpu import attention as xpu_attention
+
+    g = torch.Generator().manual_seed(ctx)
+    mk = lambda *s: (torch.randn(*s, generator=g) * 0.5).bfloat16().to("xpu")
+    parents = [-1, 0, 0, 1, 2, 4]
+    w = len(parents)
+    kc, vc = mk(max(ctx, 1) + 8, HK, D), mk(max(ctx, 1) + 8, HK, D)
+    q, k_nodes, v_nodes = mk(w, H, D), mk(w, HK, D), mk(w, HK, D)
+    offs = torch.tensor(ta.offsets([(kc, vc)], "xpu"), dtype=torch.int64).view(1, 2).to("xpu")
+    plan = ta.plan([parents], [ctx], H // HK, "xpu")
+    fast = ta.attention(q, k_nodes, v_nodes, offs, plan, scale=0.0625).view(torch.int16)
+    ta._tail = xpu_attention.cuda_tail
+    try:
+        reference = ta.attention(q, k_nodes, v_nodes, offs, plan, scale=0.0625).view(torch.int16)
+    finally:
+        ta._tail = xpu_attention._tail
+    assert torch.equal(fast, reference)

@@ -6,7 +6,7 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorfold.cuda.kernels.attention import _fold, _tile
+from tensorfold.cuda.kernels.attention import _fold, _tail as cuda_tail, _tile  # noqa: F401  (cuda_tail: the bits' reference)
 
 ROWS = 16     # query rows a program holds (the CUDA kernel's tile)
 
@@ -62,6 +62,50 @@ def _shared(Q, KC, VC, OFF, STREAM, ITEMS, PO, PM, PL, W, TO, TB, H: tl.constexp
         tl.store(TB + prog * 16 + local, tl.where(ok, base, -1))
         tl.store(PM + base, gm, mask=ok)
         tl.store(PL + base, gl, mask=ok)
+
+
+@triton.jit
+def _tail(Q, KN, VN, KC, VC, OFF, STREAM, ROWS, PATHS, DEPTHS, PO, PM, PL, W, H: tl.constexpr, HK: tl.constexpr,
+          D: tl.constexpr, G: tl.constexpr, CH: tl.constexpr, MAXD: tl.constexpr, SCALE: tl.constexpr,
+          GR: tl.constexpr):
+    """The CUDA kernel's tail, visiting only the 64-key tiles that hold a key: an empty tile changes no bit."""
+
+    node = tl.program_id(0)
+    hk = tl.program_id(1)
+    s = tl.load(ROWS + node)
+    p = tl.load(STREAM + s * 4 + 2)
+    nch = (p + tl.load(STREAM + s * 4 + 1) + CH - 1) // CH
+    groups = (nch - tl.load(STREAM + s * 4 + 3)) // (GR - 1)
+    chunk = p // CH + tl.program_id(2)
+    if chunk < nch:
+        koff = tl.multiple_of(tl.load(OFF + s * 2), 8)
+        voff = tl.multiple_of(tl.load(OFF + s * 2 + 1), 8)
+        gg = tl.arange(0, 16)
+        d = tl.arange(0, D)
+        q = tl.load(Q + (node * H + hk * G + gg[:, None]) * D + d[None, :], mask=gg[:, None] < G, other=0).to(tl.bfloat16)
+        depth = tl.load(DEPTHS + node)
+        m = tl.full((16,), float("-inf"), tl.float32)
+        l = tl.zeros((16,), tl.float32)
+        o = tl.zeros((16, D), tl.float32)
+        key = chunk * CH + tl.arange(0, 64)
+        tiles = tl.minimum(CH // 64, (p + depth - chunk * CH + 63) // 64)       # tiles below the last valid key
+        for t in range(tiles):
+            logical = key + t * 64
+            committed = logical < p
+            path_slot = logical - p
+            on_path = (path_slot >= 0) & (path_slot < depth)
+            path_node = tl.load(PATHS + node * MAXD + path_slot, mask=on_path, other=0)
+            kc = tl.load(KC + koff + (logical[:, None] * HK + hk) * D + d[None, :], mask=committed[:, None], other=0)
+            vc = tl.load(VC + voff + (logical[:, None] * HK + hk) * D + d[None, :], mask=committed[:, None], other=0)
+            kn = tl.load(KN + (path_node[:, None] * HK + hk) * D + d[None, :], mask=on_path[:, None], other=0)
+            vn = tl.load(VN + (path_node[:, None] * HK + hk) * D + d[None, :], mask=on_path[:, None], other=0)
+            kk = tl.where(committed[:, None], kc, kn).to(tl.bfloat16)
+            vv = tl.where(committed[:, None], vc, vn).to(tl.bfloat16)
+            m, l, o = _tile(q, kk, vv, m, l, o, committed | on_path, SCALE)
+        base = ((chunk - groups * (GR - 1)) * W + node) * H + hk * G + gg
+        tl.store(PO + base[:, None] * D + d[None, :], o, mask=gg[:, None] < G)
+        tl.store(PM + base, m, mask=gg < G)
+        tl.store(PL + base, l, mask=gg < G)
 
 
 class _Launcher:

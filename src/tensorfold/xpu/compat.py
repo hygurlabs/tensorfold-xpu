@@ -63,6 +63,7 @@ def install() -> None:
     from tensorfold.xpu import attention as xpu_attention
 
     tree_attention._shared = xpu_attention.shared            # IGC crashes on the CUDA kernel's masked row-indexed store
+    tree_attention._tail = xpu_attention._tail               # the same arithmetic, without the empty tiles
     from tensorfold.cuda.kernels import prefill_attention
 
     prefill_attention.attention = prefill_attention.triton_attention                    # the Triton kernel defines its bits

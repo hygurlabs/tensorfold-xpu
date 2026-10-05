@@ -37,3 +37,11 @@ def test_the_same_call_gives_the_same_bits_every_time():
     first = matmul(x, w).view(torch.int16)
     for _ in range(25):
         assert torch.equal(matmul(x, w).view(torch.int16), first)
+
+
+def test_a_large_output_count_keeps_the_same_properties():
+    x, w = _operands(20, n=5000, k=1024, seed=4)               # beyond the split threshold: one program a slice of outputs
+    whole = matmul(x, w).view(torch.int16)
+    assert torch.equal(matmul(x[:3].contiguous(), w).view(torch.int16), whole[:3])
+    ref = x.float().cpu() @ w.float().cpu().T
+    assert ((matmul(x, w).float().cpu() - ref).abs().max() / ref.abs().max()) < 8e-3
