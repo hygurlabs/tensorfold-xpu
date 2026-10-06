@@ -7,7 +7,7 @@ import triton
 import triton.language as tl
 
 from tensorfold.cuda.kernels.attention import _fold, _merge as _cuda_merge, _tail as cuda_tail, _tile  # noqa: F401  (cuda_tail: the bits' reference)
-from tensorfold.cuda.kernels.prefill_attention import _attend, _check
+from tensorfold.cuda.kernels.prefill_attention import _check, _tile as _prompt_tile
 
 ROWS = 16     # query rows a program holds (the CUDA kernel's tile)
 TAIL_TILE = 32
@@ -16,8 +16,9 @@ TAIL_SPLIT = 4      # programs that share a tail tile's output columns
 SHARED_TILE = 32
 SHARED_SPLIT = 4    # programs that share a shared-chunk tile's output columns
 WARPS = 2     # a tile costs 20 us on two warps and 36 on four (measured, one program, 4,096 keys)
-PROMPT_ROWS = 64    # prompt rows a program holds; the bits do not depend on it (measured: one checksum for 32..128)
+PROMPT_ROWS = 128   # prompt rows a program holds; the bits do not depend on it
 PROMPT_KEYS = 16    # keys a prompt tile folds at once, by absolute position: the bits' definition on this backend
+PROMPT_WARPS = 16
 
 
 @triton.jit(do_not_specialize=["W"])
@@ -237,15 +238,41 @@ class _TailLauncher:
 tail = _TailLauncher()
 
 
+@triton.jit(do_not_specialize=["p0", "W", "L"])
+def _prompt(Q, K, V, OUT, p0, W, L, H: tl.constexpr, HK: tl.constexpr, D: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr,
+            SCALE: tl.constexpr):
+    """The CUDA prompt kernel's fold (keys in tiles of BN by absolute position), its tiles moved as 2D blocks."""
+
+    block = tl.program_id(0)
+    head = tl.program_id(1)
+    hk = head // (H // HK)
+    dq = tl.make_tensor_descriptor(Q + head * D, shape=[W, D], strides=[H * D, 1], block_shape=[BM, D])
+    dk = tl.make_tensor_descriptor(K + hk * D, shape=[L, D], strides=[HK * D, 1], block_shape=[BN, D])
+    dv = tl.make_tensor_descriptor(V + hk * D, shape=[L, D], strides=[HK * D, 1], block_shape=[BN, D])
+    do = tl.make_tensor_descriptor(OUT + head * D, shape=[W, D], strides=[H * D, 1], block_shape=[BM, D])
+    pos = p0 + block * BM + tl.arange(0, BM)
+    q = dq.load([block * BM, 0])
+    m = tl.full((BM,), float("-inf"), tl.float32)
+    l = tl.zeros((BM,), tl.float32)
+    o = tl.zeros((BM, D), tl.float32)
+    full = (p0 + block * BM + 1) // BN                  # tiles every row of the block sees whole
+    last_pos = p0 + tl.minimum(block * BM + BM, W) - 1
+    for t in range(0, full):
+        m, l, o = _prompt_tile(q, dk.load([t * BN, 0]), dv.load([t * BN, 0]), m, l, o, (t * BN + tl.arange(0, BN))[None, :] <= pos[:, None], SCALE)
+    for t in range(full, last_pos // BN + 1):
+        m, l, o = _prompt_tile(q, dk.load([t * BN, 0]), dv.load([t * BN, 0]), m, l, o, (t * BN + tl.arange(0, BN))[None, :] <= pos[:, None], SCALE)
+    do.store([block * BM, 0], (o / l[:, None]).to(tl.bfloat16))
+
+
 def prefill(q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, p0: int, *, scale: float,
             out: torch.Tensor | None = None) -> torch.Tensor:
-    """Prompt attention (the CUDA module's kernel) in tiles that suit an Arc GPU: 3x faster, chunking still changes no bit."""
+    """Prompt attention, the CUDA module's fold with tiles that suit an Arc GPU: chunking changes no bit."""
 
     w, h, d = q.shape
     hk = _check(q, k_cache, v_cache, p0)
     out = torch.empty_like(q) if out is None else out
-    _attend[(triton.cdiv(w, PROMPT_ROWS), h)](q, k_cache, v_cache, out, p0, w, H=h, HK=hk, D=d, BM=PROMPT_ROWS,
-                                              BN=PROMPT_KEYS, SCALE=scale, num_warps=8, num_stages=1)
+    _prompt[(triton.cdiv(w, PROMPT_ROWS), h)](q, k_cache, v_cache, out, p0, w, p0 + w, H=h, HK=hk, D=d, BM=PROMPT_ROWS, BN=PROMPT_KEYS,
+                                               SCALE=scale, num_warps=PROMPT_WARPS, num_stages=2, grf_mode="256")
     return out
 
 

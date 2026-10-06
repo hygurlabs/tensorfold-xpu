@@ -43,3 +43,17 @@ def test_chunking_the_prompt_changes_no_bit(cut):
     first = prefill(q[:cut].contiguous(), kc, vc, 0, scale=0.0625)
     second = prefill(q[cut:].contiguous(), kc, vc, cut, scale=0.0625)
     assert torch.equal(torch.cat([first, second]).view(torch.int16), whole)
+
+
+@pytest.mark.parametrize("p0,rows", [(0, 300), (70, 200), (1000, 400)])
+def test_the_kernel_gives_the_bits_of_the_cuda_modules_triton_kernel(p0, rows):
+    import triton
+
+    from tensorfold.cuda.kernels.prefill_attention import _attend
+
+    q, kc, vc = _operands(p0 + rows, seed=p0)
+    mine = prefill(q[p0:].contiguous(), kc, vc, p0, scale=0.0625)
+    ref = torch.empty_like(mine)
+    _attend[(triton.cdiv(rows, 64), H)](q[p0:].contiguous(), kc, vc, ref, p0, rows, H=H, HK=HK, D=D, BM=64, BN=16, SCALE=0.0625,
+                                        num_warps=8, num_stages=1)
+    assert torch.equal(mine.view(torch.int16), ref.view(torch.int16))

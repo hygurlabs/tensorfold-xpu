@@ -34,8 +34,8 @@ load (0.7 s): proposals only, the target still verifies every token.
 | drafted decoding, short context | 76-86 tok/s (4.4 tokens a round) |
 | drafted, 9,000-token context | 67 tok/s |
 | prompt, 20 / 128 / 300 tokens | 48 / 98 / 245 ms |
-| prompt, 2,000 tokens | 1,810 tok/s |
-| prompt, 4,000 / 9,000 / 14,000 tokens | 1,751 / 1,635 / 1,530 tok/s |
+| prompt, 2,000 tokens | 1,870 tok/s |
+| prompt, 4,000 / 9,000 / 14,000 tokens | 1,820 / 1,740 / 1,680 tok/s |
 
 The same card with vLLM-XPU's MTP (the DFlash2 architecture is not supported there): 45 to 61 tok/s drafted, 33.8 serial.
 
