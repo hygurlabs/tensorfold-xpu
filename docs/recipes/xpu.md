@@ -37,6 +37,21 @@ draft stage drops from 11.8 to 8.4 ms.
 
 The same card with vLLM-XPU's MTP (the DFlash2 architecture is not supported there): 45 to 61 tok/s drafted, 33.8 serial.
 
+## Several streams
+
+`--parallel 2` to `4` serves that many requests at once. Every decode call of the server then takes `16 * parallel` rows
+(a lone stream's too), so a stream's tokens are the same alone or beside others: concurrent == solo == serial, tested in
+`tests/xpu` and with `tools/bench_concurrent.py --alone --serial` against a running server.
+
+Aggregate decode speed, drafted, 192 tokens a stream:
+
+| streams | 1 | 2 | 3 | 4 |
+|---|---|---|---|---|
+| tok/s | 74 | 100 | 104 | 119 |
+
+Over HTTP, `bench_concurrent.py` with the code and chat prompts at four streams gives 113 to 157 tok/s. Four streams of
+60,000-token prompts run to the end and equal their solo runs.
+
 ## Prompt precision
 
 `--prefill-int8 off|mlp|all` (default off) runs the prompt matmuls on the 4-bit weights' int8 kernel, one scale a row.
