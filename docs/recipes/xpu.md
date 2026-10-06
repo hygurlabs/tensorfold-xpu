@@ -35,7 +35,7 @@ load (0.7 s): proposals only, the target still verifies every token.
 | drafted, 9,000-token context | 67 tok/s |
 | prompt, 20 / 128 / 300 tokens | 48 / 98 / 245 ms |
 | prompt, 2,000 tokens | 1,870 tok/s |
-| prompt, 4,000 / 9,000 / 14,000 tokens | 1,820 / 1,740 / 1,680 tok/s |
+| prompt, 4,000 / 9,000 / 14,000 tokens | 1,820 / 1,740 / 1,690 tok/s |
 
 The same card with vLLM-XPU's MTP (the DFlash2 architecture is not supported there): 45 to 61 tok/s drafted, 33.8 serial.
 
@@ -92,4 +92,4 @@ activation outliers.
 - `torch.topk` is replaced by a two-stage top-k: the stock kernel compiles for 38 s on its first use.
 - A prompt is cut at multiples of 1,024 absolute positions, and tree attention folds 128-key chunks (the last, partial
   chunk is a sequential tail). The tree-attention kernels share each tile's output columns over four programs, which keeps
-  the tile in registers.
+  the tile in registers. Prompt attention moves its tiles as 2D blocks (tensor descriptors, 256 registers a thread): the CUDA kernel's fold, bit for bit.
