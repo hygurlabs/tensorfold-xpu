@@ -186,7 +186,7 @@ def main() -> None:
                 for key, ref in alone.items():
                     serial = stream(args.base, args.model, next(q for q in PROMPTS if q["name"] == key[0]),
                                     args.tokens, temp, key[1], draft=False)
-                    ref["serial_equal"] = (None if serial.get("error") or ref.get("error")
+                    ref["serial_equal"] = (None if serial.get("error") or ref.get("error") or not serial["token_sha"] or not ref["token_sha"]
                                            else serial["token_sha"] == ref["token_sha"])
             for n in levels:
                 reps = []
@@ -197,8 +197,9 @@ def main() -> None:
                     rep["ttft_s"] = [round(r["ttft_s"] or 0.0, 2) for r in runs]
                     rep["errors"] = [r["error"] for r in runs if r.get("error")]
                     if alone:
-                        # None: the request or its solo run failed (not an exactness result)
+                        # None: the request or its solo run failed, or the server returns no token_sha (not an exactness result)
                         rep["equal_alone"] = [None if r.get("error") or alone[(r["prompt"], r["seed"])].get("error")
+                                              or not r["token_sha"] or not alone[(r["prompt"], r["seed"])]["token_sha"]
                                               else alone[(r["prompt"], r["seed"])]["token_sha"] == r["token_sha"]
                                               for r in runs]
                     reps.append(rep)
