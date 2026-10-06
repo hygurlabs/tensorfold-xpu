@@ -98,12 +98,59 @@ def install() -> None:
     chunk = cuda_prefill.prefill_chunk
 
     def prefill_chunk(w, tokens, st, **kwargs):
-        with gptq.anchor(st.pos):
+        with gptq.anchor(st.pos, st.short):
             return chunk(w, tokens, st, **kwargs)
 
     cuda_prefill.prefill_chunk = prefill_chunk
     cuda_prefill.chunks = chunks
-    from tensorfold.families.qwen3_5.cuda import multi
+    from tensorfold.families.qwen3_5.cuda import decode, forward, multi
 
+    _short_prompts(decode, forward, cuda_prefill, multi, gptq)
     multi.BATCH = False             # queued prompts' steps do not share a forward: the down projection's grid is per prompt
     _ACTIVE = True
+
+
+def _short_prompts(decode, forward, cuda_prefill, multi, gptq) -> None:
+    """A state knows whether its prompt is a short one (``gptq.short``): copies keep it, and a cached state resumes only a
+    prompt of the same kind, so every row of a prompt has the bits of one block class however the prompt came to be computed."""
+
+    from tensorfold.cuda import streams
+
+    forward.State.short = False
+    clone = decode.clone_state
+
+    def clone_state(st):
+        other = clone(st)
+        other.short = st.short
+        return other
+
+    for module in (decode, cuda_prefill, multi):
+        module.clone_state = clone_state
+    prefill = decode.prefill
+
+    def prefill_prompt(w, prompt, *args, state=None, **kwargs):
+        if state is None:
+            state = forward.State(w)
+            state.short = gptq.short(len(prompt))
+        return prefill(w, prompt, *args, state=state, **kwargs)
+
+    decode.prefill = prefill_prompt
+    queue = multi.MultiDecoder._queue
+
+    def _queue(self, s, hit):
+        queue(self, s, hit)
+        if hit is None:
+            s.st.short = gptq.short(len(s.prompt))
+
+    multi.MultiDecoder._queue = _queue
+
+    def longest(self, prompt):
+        small, best = gptq.short(len(prompt)), None
+        for entry in self.entries:
+            ids = entry[0]
+            if (entry[1].short == small and len(ids) < len(prompt) and list(prompt[:len(ids)]) == ids
+                    and (best is None or len(ids) > len(best[0]))):
+                best = entry
+        return self._touch(best)
+
+    streams.PrefixCache.longest = longest

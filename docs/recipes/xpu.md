@@ -32,6 +32,7 @@ draft stage drops from 11.8 to 8.4 ms.
 | serial decoding | 38 ms a token (26 tok/s) |
 | drafted decoding, short context | 76-86 tok/s (4.4 tokens a round) |
 | drafted, 9,000-token context | 61 tok/s |
+| prompt, 20 / 128 / 300 tokens | 48 / 98 / 245 ms |
 | prompt, 2,000 tokens | 1,810 tok/s |
 | prompt, 4,000 / 9,000 / 14,000 tokens | 1,751 / 1,635 / 1,530 tok/s |
 
@@ -77,6 +78,10 @@ activation outliers.
   to exactly 16 rows (one class, the weights read once); prompt calls use block sizes whose bits are the same for every
   size of a set (512 and 1,024 rows for the wide shapes; 1,024 for k/v), and the MLP's down projection a grid of
   absolute positions. `tests/xpu/test_gptq.py` states each property on the real shapes.
+- A prompt of 384 tokens or fewer runs its wide projections in blocks of 64 or 128 rows instead of 512 or 1,024 (a 20-token
+  prompt takes 48 ms, not 250). Those sizes give a row one class of bits, which differs from the large blocks', so a state
+  kept by the prompt cache resumes only a prompt of the same kind: a short prompt never resumes a long one's state, nor the
+  reverse (the prefix is then computed again).
 - Triton kernels that must agree with each other run without fused multiply-add (`enable_fp_fusion=False`): the three
   tree-attention kernels, the gated delta rule.
 - The dense projections of the gates and the head use a Triton kernel with one fixed order of sums (`F.linear` is not

@@ -26,18 +26,34 @@ PROMPT_BLOCKS = {(17408, 5120): (512, 1024), (10240, 5120): (512, 1024), (6144, 
                  (5120, 6144): (512, 1024), (12288, 5120): (512, 1024), (1024, 5120): (1024,)}
 
 
+# A short prompt (``short``) runs its wide projections in blocks of 64 or 128 rows, which on these shapes are one class of bits (as is every size from 56 to 128)
+# (tests/xpu/test_gptq.py): it does not fill a block of 512 or 1,024 rows. The kernel is slower per row there, so a longer
+# prompt keeps the large blocks. The class follows the whole prompt's length, and a cached prompt state resumes only a prompt
+# of its own class (``compat``), so a resumed prompt equals a fresh one.
+SHORT_PROMPT = 384
+SMALL_SIZES = (64, 128)       # the sizes between are as slow as 128 rows, or slower
+
 _anchor = [0]
+_short = [False]
+
+
+def short(length: int) -> bool:
+    """Whether a prompt of ``length`` tokens takes the small blocks."""
+
+    return length <= SHORT_PROMPT
 
 
 @contextmanager
-def anchor(position: int):
-    """The absolute position of the first row of the prompt calls made inside: where an anchored shape's grid starts."""
+def anchor(position: int, small: bool = False):
+    """The absolute position of the first row of the prompt calls made inside, where an anchored shape's grid starts; ``small``:
+    the prompt is a short one."""
 
     before, _anchor[0] = _anchor[0], int(position)
+    small_before, _short[0] = _short[0], small
     try:
         yield
     finally:
-        _anchor[0] = before
+        _anchor[0], _short[0] = before, small_before
 
 
 def set_decode_rows(streams: int) -> None:
@@ -155,6 +171,8 @@ class Int4:
 
         if a8.runs(self.n, self.k):
             return self._prefill8(x)
+        if _short[0] and ((self.n, self.k) in PROMPT_BLOCKS or (self.n, self.k) in ANCHORED):
+            return self._blocks(x, SMALL_SIZES, self.out)
         cell = ANCHORED.get((self.n, self.k))
         if cell:
             return self._on_grid(x, cell)

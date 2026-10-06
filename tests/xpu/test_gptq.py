@@ -238,3 +238,51 @@ def test_the_decode_class_follows_the_stream_count_and_refuses_an_untested_one()
             gptq.set_decode_rows(5)
     finally:
         gptq.set_decode_rows(1)
+
+
+def _prompt_layer(shape, seed):
+    n, k = shape
+    g = torch.Generator().manual_seed(seed + n + k)
+    words = torch.randint(-2 ** 31, 2 ** 31 - 1, (n, k // 8), dtype=torch.int32, generator=g).to("xpu")
+    scales = (torch.rand(k // 128, n, generator=g) * 0.02).half().to("xpu")
+    zero = torch.tensor([gptq.ZERO_POINT], dtype=torch.int8, device="xpu")
+    return gptq.Int4(words, scales, zero, 128), g
+
+
+@pytest.mark.parametrize("shape", sorted(gptq.PROMPT_BLOCKS) + sorted(gptq.ANCHORED))
+def test_every_size_of_the_small_class_gives_a_row_the_same_bits(shape):
+    """Blocks of 56 to 128 rows: a short prompt pads to the least of them, whatever the padding or the place."""
+
+    _xpu()
+    layer, g = _prompt_layer(shape, 3)
+    x = torch.randn(128, layer.k, generator=g).half().to("xpu")
+    whole = layer._blocks(x, (128,), torch.float16).view(torch.int16)
+    for size in range(56, 129, 8):
+        part = torch.full((size, layer.k), float("nan"), dtype=torch.float16, device="xpu")
+        part[:size] = x[:size]
+        assert torch.equal(layer._blocks(part, (size,), torch.float16).view(torch.int16), whole[:size]), size
+        assert torch.equal(layer._blocks(x[:size - 3].contiguous(), gptq.SMALL_SIZES, torch.float16).view(torch.int16),
+                           whole[:size - 3]), f"{size - 3} rows padded to a size of the plan"
+
+
+@pytest.mark.parametrize("shape", sorted(gptq.PROMPT_BLOCKS) + sorted(gptq.ANCHORED))
+def test_a_short_prompts_rows_have_the_same_bits_whatever_the_chunking(shape):
+    """A short prompt in chunks cut anywhere, or resumed mid-way, gives every row the bits of the whole prompt."""
+
+    _xpu()
+    layer, g = _prompt_layer(shape, 5)
+    rows = gptq.SHORT_PROMPT
+    x = torch.randn(rows, layer.k, generator=g).half().to("xpu")
+    with gptq.anchor(0, True):
+        whole = layer.prefill(x).view(torch.int16)
+    for cuts in ((37,), (1, 55, 64, 200), (128, 256), (300,)):
+        edges = (0, *cuts, rows)
+        parts = []
+        for a, b in zip(edges, edges[1:]):
+            with gptq.anchor(a, True):
+                parts.append(layer.prefill(x[a:b].contiguous()))
+        assert torch.equal(torch.cat(parts).view(torch.int16), whole), f"chunks cut at {cuts}"
+
+
+def test_short_prompts_are_those_of_at_most_the_threshold():
+    assert gptq.short(1) and gptq.short(gptq.SHORT_PROMPT) and not gptq.short(gptq.SHORT_PROMPT + 1)
