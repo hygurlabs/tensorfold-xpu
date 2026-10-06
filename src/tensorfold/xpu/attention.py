@@ -7,7 +7,7 @@ import triton
 import triton.language as tl
 
 from tensorfold.cuda.kernels.attention import _fold, _merge as _cuda_merge, _tail as cuda_tail, _tile  # noqa: F401  (cuda_tail: the bits' reference)
-from tensorfold.cuda.kernels.prefill_attention import _check, _tile as _prompt_tile
+from tensorfold.cuda.kernels.prefill_attention import _check
 
 ROWS = 16     # query rows a program holds (the CUDA kernel's tile)
 TAIL_TILE = 32
@@ -16,9 +16,9 @@ TAIL_SPLIT = 4      # programs that share a tail tile's output columns
 SHARED_TILE = 32
 SHARED_SPLIT = 4    # programs that share a shared-chunk tile's output columns
 WARPS = 2     # a tile costs 20 us on two warps and 36 on four (measured, one program, 4,096 keys)
-PROMPT_ROWS = 128   # prompt rows a program holds; the bits do not depend on it
+PROMPT_ROWS = 256   # prompt rows a program holds; the bits do not depend on it
 PROMPT_KEYS = 16    # keys a prompt tile folds at once, by absolute position: the bits' definition on this backend
-PROMPT_WARPS = 16
+PROMPT_WARPS = 32
 
 
 @triton.jit(do_not_specialize=["W"])
@@ -241,7 +241,8 @@ tail = _TailLauncher()
 @triton.jit(do_not_specialize=["p0", "W", "L"])
 def _prompt(Q, K, V, OUT, p0, W, L, H: tl.constexpr, HK: tl.constexpr, D: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr,
             SCALE: tl.constexpr):
-    """The CUDA prompt kernel's fold (keys in tiles of BN by absolute position), its tiles moved as 2D blocks."""
+    """The CUDA prompt kernel's fold (keys in tiles of BN by absolute position), its tiles moved as 2D blocks and the
+    accumulator's correction folded into the second product."""
 
     block = tl.program_id(0)
     head = tl.program_id(1)
@@ -255,12 +256,17 @@ def _prompt(Q, K, V, OUT, p0, W, L, H: tl.constexpr, HK: tl.constexpr, D: tl.con
     m = tl.full((BM,), float("-inf"), tl.float32)
     l = tl.zeros((BM,), tl.float32)
     o = tl.zeros((BM, D), tl.float32)
-    full = (p0 + block * BM + 1) // BN                  # tiles every row of the block sees whole
-    last_pos = p0 + tl.minimum(block * BM + BM, W) - 1
-    for t in range(0, full):
-        m, l, o = _prompt_tile(q, dk.load([t * BN, 0]), dv.load([t * BN, 0]), m, l, o, (t * BN + tl.arange(0, BN))[None, :] <= pos[:, None], SCALE)
-    for t in range(full, last_pos // BN + 1):
-        m, l, o = _prompt_tile(q, dk.load([t * BN, 0]), dv.load([t * BN, 0]), m, l, o, (t * BN + tl.arange(0, BN))[None, :] <= pos[:, None], SCALE)
+    for t in range(0, (p0 + tl.minimum(block * BM + BM, W) - 1) // BN + 1):
+        valid = (t * BN + tl.arange(0, BN))[None, :] <= pos[:, None]
+        scores = tl.where(valid, tl.dot(q, tl.trans(dk.load([t * BN, 0]))).to(tl.float32) * SCALE, float("-inf"))
+        tile_m = tl.max(scores, 1)
+        active = tile_m != float("-inf")
+        next_m = tl.where(active, tl.maximum(m, tile_m), m)
+        alpha = tl.where(active, tl.where(m == float("-inf"), 0.0, tl.exp(m - next_m)), 1.0)
+        p = tl.where(valid & active[:, None], tl.exp(scores - next_m[:, None]), 0.0)
+        o = tl.dot(p.to(tl.bfloat16), dv.load([t * BN, 0]), o * alpha[:, None])
+        l = l * alpha + tl.sum(p, 1)
+        m = next_m
     do.store([block * BM, 0], (o / l[:, None]).to(tl.bfloat16))
 
 
