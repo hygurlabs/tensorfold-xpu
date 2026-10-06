@@ -11,7 +11,7 @@ Measured on one Arc Pro B70 (32 GB). One stream, no vision, no MTP head.
 
     vllm/vllm-openai-xpu image (torch 2.13.0+xpu, Triton 3.7.2, vllm-xpu-kernels 0.1.12.3)
 
-    tensorfold serve <GPTQ Qwen3.8-27B dir> --backend xpu --draft-model <DFlash2 dir>
+    tensorfold serve <GPTQ Qwen3.8-27B dir> --backend xpu --drafter <DFlash2 dir>
 
 Keep two directories across restarts, or each start recompiles (the warm-up below takes 15 s instead of 4): Triton's (`~/.triton`) and the
 driver's (`~/.cache/neo_compiler_cache`). The server warms up before it listens (`tensorfold.xpu.warm`: a prompt past one

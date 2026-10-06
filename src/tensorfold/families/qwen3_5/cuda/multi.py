@@ -122,7 +122,7 @@ class MultiDecoder:
         self.layer_bytes = 2 * getattr(c, "kv_heads", 0) * getattr(c, "head_dim", 0) * 2     # a row of one layer
         self.row_bytes = att * self.layer_bytes
         self.memory_gate = (MemoryGate(1 << 62, reserve=2 * GIB, live=torch_live(torch, available_bytes))
-                     if world == 1 and cuda else None)
+                     if world == 1 and torch.device(self.device).type in ("cuda", "xpu") else None)
 
     def live(self) -> int:
         return len(self.streams) + len(self.filling)
