@@ -23,7 +23,8 @@ The drafter can be quantised to the same 4-bit pack (GPTQ, calibrated on its own
     python -m tensorfold.xpu.quantize_drafter <DFlash2 dir> <calibration dir> <out dir>
 
 Over eight prompts the drafter takes 4.66 tokens a round in bf16 and 4.66 in GPTQ, 4.59 in round-to-nearest; the round's
-draft stage drops from 11.8 to 8.4 ms.
+draft stage drops from 11.8 to 8.4 ms. Its vocabulary head, the target's rows it reads, is rounded to the same 4-bit pack at
+load (0.7 s): proposals only, the target still verifies every token.
 
 ## Speed
 
@@ -31,7 +32,7 @@ draft stage drops from 11.8 to 8.4 ms.
 |---|---|
 | serial decoding | 38 ms a token (26 tok/s) |
 | drafted decoding, short context | 76-86 tok/s (4.4 tokens a round) |
-| drafted, 9,000-token context | 61 tok/s |
+| drafted, 9,000-token context | 67 tok/s |
 | prompt, 20 / 128 / 300 tokens | 48 / 98 / 245 ms |
 | prompt, 2,000 tokens | 1,810 tok/s |
 | prompt, 4,000 / 9,000 / 14,000 tokens | 1,751 / 1,635 / 1,530 tok/s |
@@ -48,7 +49,7 @@ Aggregate decode speed, drafted, 192 tokens a stream:
 
 | streams | 1 | 2 | 3 | 4 |
 |---|---|---|---|---|
-| tok/s | 74 | 100 | 104 | 119 |
+| tok/s | 83 | 119 | 125 | 146 |
 
 Over HTTP, `bench_concurrent.py` with the code and chat prompts at four streams gives 113 to 157 tok/s. Four streams of
 60,000-token prompts run to the end and equal their solo runs.

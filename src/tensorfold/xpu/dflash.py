@@ -67,13 +67,16 @@ class DFlash2(cuda_dflash2.DFlash2):
         self.vocab_spans = tuple((a, min(b, vocab)) for a, b in ((0, 98304), (248032, 248320)) if a < vocab)
         self.head_ids = torch.cat([torch.arange(a, b, device=self.device) for a, b in self.vocab_spans])
         self.head_cols = self.sub_rows = self.sub_parts = None
-        self.head_rows = [target.head.weight[a:b] for a, b in self.vocab_spans]      # views of the target's head: no copy
+        from .gptq import Int4, ZERO_POINT
+        from .quantize_drafter import GROUP, gptq as quantise
+
+        zero = torch.tensor([ZERO_POINT], dtype=torch.int8, device=self.device)
+        self.head_q4 = []        # the target's head rows the drafter reads, rounded to the 4-bit pack: proposals only
+        for a, b in self.vocab_spans:
+            words, scales = quantise(target.head.weight[a:b], None)
+            self.head_q4.append(Int4(words.t().contiguous(), scales.contiguous(), zero, GROUP))
         self.q4: dict = {}
         if packed:
-            from .gptq import Int4, ZERO_POINT
-            from .quantize_drafter import GROUP
-
-            zero = torch.tensor([ZERO_POINT], dtype=torch.int8, device=self.device)
             for name in [n for n in packed if n.endswith(".qweight")]:
                 base = name[:-len(".qweight")]
                 self.q4[base + ".weight"] = Int4(packed.pop(name).t().contiguous(), packed.pop(base + ".scales").contiguous(),
@@ -196,16 +199,10 @@ class DFlash2(cuda_dflash2.DFlash2):
         h = cuda_dflash2._norm(x.view(len(live), length, -1)[:, 1:].reshape(-1, self.hidden),
                                self.weights["norm.weight"], self.eps)
         projected = self._lin(h, "candidate_selector.hidden_projection.weight").float()
-        logits = torch.cat([self._head(h, rows) for rows in self.head_rows], dim=1)
+        logits = torch.cat([q(h) if len(h) <= gptq.DECODE_ROWS else q.prefill(h) for q in self.head_q4], dim=1)
         values, local_ids = torch.topk(logits.float(), k=16, dim=-1, sorted=False)
         global_ids = self.head_ids[local_ids]
         shared = [global_ids, torch.cat((values, projected), dim=1), None]
         for j, i in enumerate(live):
             out[i] = (shared, j * (length - 1), length - 1, int(pendings[i]))
         return out
-
-    @staticmethod
-    def _head(h: torch.Tensor, rows: torch.Tensor) -> torch.Tensor:
-        from .dense import matmul
-
-        return matmul(h.contiguous(), rows)
