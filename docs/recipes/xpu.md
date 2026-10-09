@@ -54,6 +54,25 @@ Aggregate decode speed, drafted, 192 tokens a stream:
 Over HTTP, `bench_concurrent.py` with the code and chat prompts at four streams gives 113 to 157 tok/s. Four streams of
 60,000-token prompts run to the end and equal their solo runs.
 
+## Against vLLM
+
+Same card, same GPTQ checkpoint, `tools/xpu-bench/bench_openai.py` over HTTP (192 tokens a stream, code and chat prompts,
+temperature 0 and 1), and `tools/xpu-bench/workflow_sim.py` for an office workload. Raw results and the commit each run
+was measured at are in `tools/xpu-bench/refs/`.
+
+| | TensorFold XPU | vLLM v0.31.0 + MTP4 | vLLM, no drafts |
+|---|---|---|---|
+| decode, 1 stream | 78-119 tok/s | 55-63 tok/s | 33 tok/s |
+| decode, 4 streams, aggregate | 154-220 tok/s | 137-202 tok/s | 119-121 tok/s |
+| one 20-page file, 4 questions at once | 7.8 s | 11.7 s | |
+| 4 different files at once (cold) | 54.9 s | 54.5 s | |
+
+Every TensorFold cell also checks that each stream equals its solo and serial run: no difference in any cell.
+
+## Upstream base
+
+This backend is built on TensorFold 0.6.5. It merges into 0.6.6 without conflicts; that merge has not been run on the card.
+
 ## Prompt precision
 
 `--prefill-int8 off|mlp|all` (default off) runs the prompt matmuls on the 4-bit weights' int8 kernel, one scale a row.

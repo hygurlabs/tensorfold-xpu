@@ -1,5 +1,10 @@
 # TensorFold
 
+> **Unofficial Intel Arc (XPU) port.** This repository is TensorFold 0.6.5 with an XPU backend added by Hygur Labs
+> (`--backend xpu`, Qwen3.8-27B GPTQ with the DFlash2 drafter). It is not part of upstream TensorFold and has not been
+> proposed there yet. Setup, speed and measurements: [docs/recipes/xpu.md](docs/recipes/xpu.md). Upstream:
+> [ashhart/TensorFold](https://github.com/ashhart/TensorFold).
+
 TensorFold serves language models on Apple Silicon and NVIDIA GPUs through an OpenAI-compatible API.
 Each model family supplies its own kernels and draft verification.
 

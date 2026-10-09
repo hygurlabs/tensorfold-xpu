@@ -1,0 +1,137 @@
+[
+ {
+  "rep": 0,
+  "scenario": "cold",
+  "colleagues": {
+   "wall_s": 54.52,
+   "requests": [
+    {
+     "ttft_s": 36.27,
+     "total_s": 50.18,
+     "tokens": 102,
+     "prompt_tokens": 18771,
+     "decode_tps": 7.3,
+     "facts_ok": true,
+     "answer_head": "D'après le dossier comptable n° 5000, les échéances de TVA et leurs montants sont les suivants :\n\n*   **Échéance TVA du "
+    },
+    {
+     "ttft_s": 16.71,
+     "total_s": 36.43,
+     "tokens": 30,
+     "prompt_tokens": 18791,
+     "decode_tps": 1.5,
+     "facts_ok": true,
+     "answer_head": "Le montant hors taxes de la facture F-5001120 est de **1 526,72 euros**."
+    },
+    {
+     "ttft_s": 29.93,
+     "total_s": 49.46,
+     "tokens": 64,
+     "prompt_tokens": 18836,
+     "decode_tps": 3.2,
+     "facts_ok": true,
+     "answer_head": "La seule facture restée impayée dans ce dossier est la **F-5002108**, émise par le fournisseur **Atelier Nordique**.\n\nSo"
+    },
+    {
+     "ttft_s": 48.97,
+     "total_s": 54.51,
+     "tokens": 270,
+     "prompt_tokens": 18840,
+     "decode_tps": 48.5,
+     "facts_ok": true,
+     "answer_head": "Objet : Relance facture F-5003180 – Société Exemple 5003 SARL\n\nMadame, Monsieur,\n\nNous nous permettons de revenir vers v"
+    }
+   ]
+  }
+ },
+ {
+  "rep": 1,
+  "scenario": "cold",
+  "colleagues": {
+   "wall_s": 54.38,
+   "requests": [
+    {
+     "ttft_s": 16.76,
+     "total_s": 49.93,
+     "tokens": 102,
+     "prompt_tokens": 18781,
+     "decode_tps": 3.0,
+     "facts_ok": true,
+     "answer_head": "D'après le dossier comptable n° 5100, les échéances de TVA et leurs montants sont les suivants :\n\n*   **Échéance TVA du "
+    },
+    {
+     "ttft_s": 36.3,
+     "total_s": 36.8,
+     "tokens": 30,
+     "prompt_tokens": 18847,
+     "decode_tps": 58.6,
+     "facts_ok": true,
+     "answer_head": "Le montant hors taxes de la facture F-5101182 est de **4 245,63 euros**."
+    },
+    {
+     "ttft_s": 29.93,
+     "total_s": 51.93,
+     "tokens": 180,
+     "prompt_tokens": 18776,
+     "decode_tps": 8.1,
+     "facts_ok": true,
+     "answer_head": "D'après le dossier comptable fourni, la seule facture qui n'est pas au statut « payée » est la **Facture F-5102127**.\n\nV"
+    },
+    {
+     "ttft_s": 49.44,
+     "total_s": 54.32,
+     "tokens": 232,
+     "prompt_tokens": 18873,
+     "decode_tps": 47.3,
+     "facts_ok": true,
+     "answer_head": "Objet : Relance amiable – Facture F-5103185 impayée\n\nBonjour,\n\nNous nous permettons de revenir vers vous concernant la f"
+    }
+   ]
+  }
+ },
+ {
+  "rep": 2,
+  "scenario": "cold",
+  "colleagues": {
+   "wall_s": 53.6,
+   "requests": [
+    {
+     "ttft_s": 16.77,
+     "total_s": 49.86,
+     "tokens": 102,
+     "prompt_tokens": 18804,
+     "decode_tps": 3.1,
+     "facts_ok": true,
+     "answer_head": "D'après le dossier comptable n° 5200, les échéances de TVA et leurs montants sont les suivants :\n\n*   **Échéance TVA du "
+    },
+    {
+     "ttft_s": 36.31,
+     "total_s": 36.89,
+     "tokens": 30,
+     "prompt_tokens": 18849,
+     "decode_tps": 50.4,
+     "facts_ok": true,
+     "answer_head": "Le montant hors taxes de la facture F-5201164 est de **5 349,86 euros**."
+    },
+    {
+     "ttft_s": 49.37,
+     "total_s": 52.78,
+     "tokens": 181,
+     "prompt_tokens": 18719,
+     "decode_tps": 52.8,
+     "facts_ok": false,
+     "answer_head": "D'après le dossier comptable fourni, la seule facture qui n'est pas au statut « payée » est la **facture F-5202119**.\n\nV"
+    },
+    {
+     "ttft_s": 29.94,
+     "total_s": 53.6,
+     "tokens": 247,
+     "prompt_tokens": 18742,
+     "decode_tps": 10.4,
+     "facts_ok": true,
+     "answer_head": "Objet : Relance amiable – Facture F-5203117 impayée\n\nBonjour,\n\nNous nous permettons de revenir vers vous concernant la f"
+    }
+   ]
+  }
+ }
+]

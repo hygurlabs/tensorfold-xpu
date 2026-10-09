@@ -1,0 +1,179 @@
+[
+ {
+  "rep": 0,
+  "scenario": "warm",
+  "read": {
+   "wall_s": 19.58,
+   "requests": [
+    {
+     "ttft_s": 12.42,
+     "total_s": 19.58,
+     "tokens": 400,
+     "prompt_tokens": 18752,
+     "decode_tps": 55.8,
+     "facts_ok": true,
+     "answer_head": "Voici le résumé du dossier comptable N° 3000 en cinq points clés :\n\n1.  **Identification et obligations fiscales** : Le "
+    }
+   ]
+  },
+  "colleagues": {
+   "wall_s": 11.65,
+   "requests": [
+    {
+     "ttft_s": 1.81,
+     "total_s": 8.4,
+     "tokens": 102,
+     "prompt_tokens": 18759,
+     "decode_tps": 15.3,
+     "facts_ok": true,
+     "answer_head": "D'après le dossier comptable n° 3000, les échéances de TVA et leurs montants sont les suivants :\n\n*   **Échéance TVA du "
+    },
+    {
+     "ttft_s": 5.03,
+     "total_s": 7.12,
+     "tokens": 30,
+     "prompt_tokens": 18764,
+     "decode_tps": 13.9,
+     "facts_ok": true,
+     "answer_head": "Le montant hors taxes de la facture F-3000215 est de **9 439,06 euros**."
+    },
+    {
+     "ttft_s": 5.03,
+     "total_s": 9.88,
+     "tokens": 158,
+     "prompt_tokens": 18758,
+     "decode_tps": 32.3,
+     "facts_ok": false,
+     "answer_head": "D'après le dossier comptable fourni, la seule facture qui n'est pas au statut « payée » est la **Facture F-3000148**.\n\nV"
+    },
+    {
+     "ttft_s": 6.68,
+     "total_s": 11.64,
+     "tokens": 224,
+     "prompt_tokens": 18761,
+     "decode_tps": 45.0,
+     "facts_ok": true,
+     "answer_head": "Objet : Relance amiable – Facture F-3000148 impayée\n\nBonjour,\n\nNous nous permettons de revenir vers vous concernant la f"
+    }
+   ]
+  }
+ },
+ {
+  "rep": 1,
+  "scenario": "warm",
+  "read": {
+   "wall_s": 18.96,
+   "requests": [
+    {
+     "ttft_s": 11.94,
+     "total_s": 18.89,
+     "tokens": 394,
+     "prompt_tokens": 18756,
+     "decode_tps": 56.5,
+     "facts_ok": true,
+     "answer_head": "Voici le résumé du dossier comptable N° 3100 en cinq points clés :\n\n1.  **Identification et périmètre** : Le dossier con"
+    }
+   ]
+  },
+  "colleagues": {
+   "wall_s": 12.46,
+   "requests": [
+    {
+     "ttft_s": 3.2,
+     "total_s": 8.19,
+     "tokens": 102,
+     "prompt_tokens": 18763,
+     "decode_tps": 20.2,
+     "facts_ok": true,
+     "answer_head": "D'après le dossier comptable n° 3100, les échéances de TVA et leurs montants sont les suivants :\n\n*   **Échéance TVA du "
+    },
+    {
+     "ttft_s": 3.2,
+     "total_s": 6.86,
+     "tokens": 30,
+     "prompt_tokens": 18768,
+     "decode_tps": 7.9,
+     "facts_ok": true,
+     "answer_head": "Le montant hors taxes de la facture F-3100107 est de **4 440,90 euros**."
+    },
+    {
+     "ttft_s": 6.43,
+     "total_s": 7.82,
+     "tokens": 62,
+     "prompt_tokens": 18762,
+     "decode_tps": 43.7,
+     "facts_ok": true,
+     "answer_head": "La seule facture restée impayée dans ce dossier est la **F-3100047**, émise par le fournisseur **Services Horizon**.\n\nSo"
+    },
+    {
+     "ttft_s": 6.43,
+     "total_s": 12.39,
+     "tokens": 275,
+     "prompt_tokens": 18765,
+     "decode_tps": 45.9,
+     "facts_ok": true,
+     "answer_head": "Objet : Relance amiable – Facture F-3100047 impayée\n\nMadame, Monsieur,\n\nNous nous permettons de revenir vers vous concer"
+    }
+   ]
+  }
+ },
+ {
+  "rep": 2,
+  "scenario": "warm",
+  "read": {
+   "wall_s": 18.97,
+   "requests": [
+    {
+     "ttft_s": 12.01,
+     "total_s": 18.97,
+     "tokens": 400,
+     "prompt_tokens": 18864,
+     "decode_tps": 57.3,
+     "facts_ok": true,
+     "answer_head": "Voici le résumé du dossier comptable N° 3200 en cinq points clés :\n\n1.  **Identification et obligations fiscales** : Le "
+    }
+   ]
+  },
+  "colleagues": {
+   "wall_s": 10.89,
+   "requests": [
+    {
+     "ttft_s": 3.31,
+     "total_s": 8.43,
+     "tokens": 102,
+     "prompt_tokens": 18871,
+     "decode_tps": 19.7,
+     "facts_ok": true,
+     "answer_head": "D'après le dossier comptable n° 3200, les échéances de TVA et leurs montants sont les suivants :\n\n*   **Échéance TVA du "
+    },
+    {
+     "ttft_s": 3.31,
+     "total_s": 7.06,
+     "tokens": 30,
+     "prompt_tokens": 18876,
+     "decode_tps": 7.7,
+     "facts_ok": true,
+     "answer_head": "Le montant hors taxes de la facture F-3200110 est de **3 042,53 euros**."
+    },
+    {
+     "ttft_s": 6.63,
+     "total_s": 8.35,
+     "tokens": 78,
+     "prompt_tokens": 18870,
+     "decode_tps": 44.7,
+     "facts_ok": true,
+     "answer_head": "En examinant le dossier comptable, la seule facture dont le statut est indiqué comme **IMPAYÉE** est la **Facture F-3200"
+    },
+    {
+     "ttft_s": 6.63,
+     "total_s": 10.89,
+     "tokens": 206,
+     "prompt_tokens": 18873,
+     "decode_tps": 48.2,
+     "facts_ok": true,
+     "answer_head": "Objet : Relance amiable – Facture F-3200132 impayée\n\nBonjour,\n\nNous nous permettons de revenir vers vous concernant la f"
+    }
+   ]
+  }
+ }
+]
