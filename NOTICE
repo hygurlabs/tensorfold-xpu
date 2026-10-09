@@ -9,4 +9,4 @@ THIRD_PARTY_NOTICES.md.
 
 The Intel Arc (XPU) backend (src/tensorfold/xpu/, tests/xpu/, tools/xpu-bench/, docs/recipes/xpu.md) and the
 changes it makes to TensorFold's files are by Hygur Labs, 2026, under the same Apache License, Version 2.0. The
-changed upstream files are listed by `git diff v0.6.5 xpu-backend`.
+changed upstream files are listed by `git diff v0.6.5 main`.
