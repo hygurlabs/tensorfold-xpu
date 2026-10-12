@@ -22,6 +22,15 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         const dir = c.addOutputDirectoryArg(b.fmt("ocloc-{s}", .{k[0]}));
         _ = files.addCopyFile(dir.path(b, b.fmt("{s}.bin", .{k[0]})), b.fmt("{s}.bin", .{k[0]}));
     }
+    // Prompt attention: the Python port's Triton kernel (tensorfold/xpu/attention.py `_prompt`), captured as SPIR-V
+    // and compiled here to the device; its bits are the port's.
+    {
+        const c = b.addSystemCommand(&.{ ocloc, "compile", "-q", "-spirv_input", "-file" });
+        c.addFileArg(b.path("zig/kernels/xpu/qwen27/triton/prompt_attention.spv"));
+        c.addArgs(&.{ "-device", device, "-options", "-cl-intel-256-GRF-per-thread", "-output_no_suffix", "-output", "prompt_attention", "-out_dir" });
+        const dir = c.addOutputDirectoryArg("ocloc-prompt-attention");
+        _ = files.addCopyFile(dir.path(b, "prompt_attention.bin"), "prompt_attention.bin");
+    }
     // nGEN generator, built for the host and run at build time for the two prompt GEMM families (group 64).
     const gen = b.addSystemCommand(&.{ "c++", "-std=c++17", "-O1", "-fno-operator-names", b.fmt("-I{s}", .{ngen_include}), "-o" });
     const gen_bin = gen.addOutputFileArg("w4_ngen");
@@ -44,6 +53,7 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         \\pub const gdn align(8) = @embedFile("gdn.bin").*;
         \\pub const ngen_wide align(8) = @embedFile("ngen_wide.zebin").*;
         \\pub const ngen_narrow align(8) = @embedFile("ngen_narrow.zebin").*;
+        \\pub const prompt_attention align(8) = @embedFile("prompt_attention.bin").*;
         \\
     ) });
     const module = b.createModule(.{ .root_source_file = b.path("zig/src/xpu/qwen27_main.zig"), .target = target, .optimize = optimize, .link_libc = true });

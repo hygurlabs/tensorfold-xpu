@@ -49,7 +49,7 @@ KERNEL(16) void gdn_step(global const ushort *Q, global const ushort *K, global 
 // Attention de décodage, par tranches de clés. Q bf16 [T, 24, 256] ; caches KC, VC bf16 [L, 4, 256] ; la ligne t voit
 // les clés 0 … p0 + t. Un sous-groupe par (tranche, tête K/V, ligne t) traite les 6 têtes de requête de la tête K/V
 // (le couloir tient 16 dimensions). Partiels : PM, PL [T, 24, NS], PO [T, 24, NS, 256] fp32.
-#define SPLIT 256
+#define SPLIT 32
 KERNEL(16) void attn_decode(global const ushort *Q, global const ushort *KC, global const ushort *VC, global float *PM,
                             global float *PL, global float *PO, int p0, int NS, float scale) {
   const int sp = get_group_id(0), hk = get_group_id(1), t = get_group_id(2), lane = get_sub_group_local_id();

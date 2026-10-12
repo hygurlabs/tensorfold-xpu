@@ -1,7 +1,8 @@
 //! Qwen3.8-27B forward on an Intel Xe2 GPU (Arc Pro B70) over Level Zero: MLX affine 4-bit g64 checkpoint, prompt in
 //! chunks of up to 128 rows, then greedy serial decode. A development runner: it prints the greedy tokens and the
 //! timings, to be checked against the fp32 torch reference of the Python port (tools/xpu-bench/integ/oracle.py).
-//!   xpu-qwen27 MODEL_DIR IDS_FILE [STEPS]      IDS_FILE: prompt token ids separated by spaces
+//!   xpu-qwen27 MODEL_DIR IDS_FILE [STEPS]      IDS_FILE: prompt token ids separated by spaces, or --bench=N for
+//!                                              N synthetic prompt tokens
 const std = @import("std");
 const ze = @import("ze.zig");
 const kb = @import("xpu_qwen27_kernels");
@@ -16,9 +17,9 @@ const VOCAB = 248320;
 const GS = 64;
 const GDN_IN = 16640; // qkv 10240 | z 6144 | a 48 | b 48 = 16480, padded to the GEMM tile (256)
 const ATT_IN = 14336; // (q 256 | gate 256) × 24 | k 1024 | v 1024
-const CHUNK = 128; // prompt rows per forward
-const MAX_CTX = 4096;
-const SPLIT = 256; // keys per attention split (decode.cl)
+var CHUNK: u32 = 128; // prompt rows per forward (XPU_CHUNK, a multiple of 64)
+var MAX_CTX: u32 = 4096; // KV cache rows (XPU_CTX)
+const SPLIT = 32; // keys per attention split (decode.cl)
 const EPS: f32 = 1e-6;
 
 fn isAttention(i: usize) bool {
@@ -76,10 +77,10 @@ const Dev = struct {
     list: ze.H,
     staging: []u8 = &.{}, // USM host memory: the driver cannot copy from file-backed mmap pages directly
     k: struct {
-        embed: ze.H, add_rmsnorm: ze.H, gdn_pre: ze.H, gated_norm: ze.H, attn_prep: ze.H, attn_gate: ze.H,
-        swiglu: ze.H, argmax: ze.H, repack: ze.H, gdn_step: ze.H, attn_decode: ze.H, attn_merge: ze.H,
-        dec_wide: ze.H, dec_narrow: ze.H, gdn_prep: ze.H, gdn_state: ze.H, gdn_out: ze.H, ngen_wide: ze.H,
-        ngen_narrow: ze.H,
+        embed: ze.H, add_rmsnorm: ze.H, gdn_pre: ze.H, gdn_pre_rows: ze.H, gated_norm: ze.H, attn_prep: ze.H, attn_gate: ze.H,
+        swiglu: ze.H, argmax: ze.H, argmax_part: ze.H, repack: ze.H, gdn_step: ze.H, attn_decode: ze.H, attn_merge: ze.H,
+        dec_wide: ze.H, dec_wide64: ze.H, dec_narrow: ze.H, gdn_prep: ze.H, gdn_state: ze.H, gdn_out: ze.H, ngen_wide: ze.H,
+        ngen_narrow: ze.H, prompt_attn: ze.H,
     },
 
     fn kernel(d: *Dev, m: ze.H, name: [*:0]const u8, local: u32) !ze.H {
@@ -113,11 +114,31 @@ const Dev = struct {
 
     fn launch(d: *Dev, k: ze.H, groups: ze.GroupCount, args: anytype) !void {
         inline for (args, 0..) |a, i| try d.g.arg(k, i, a);
-        try ze.check(d.g.api.zeCommandListAppendLaunchKernel(d.list, k, &groups, null, 0, null));
+        var ev: ze.H = null;
+        if (prof.on) {
+            if (prof.used == prof.events.len) try d.sync();
+            ev = prof.events[prof.used];
+            prof.kernel[prof.used] = k;
+            prof.used += 1;
+        }
+        try ze.check(d.g.api.zeCommandListAppendLaunchKernel(d.list, k, &groups, ev, 0, null));
     }
 
     fn sync(d: *Dev) !void {
         try ze.check(d.g.api.zeCommandListHostSynchronize(d.list, std.math.maxInt(u64)));
+        if (prof.on) {
+            for (prof.events[0..prof.used], prof.kernel[0..prof.used]) |e, k| {
+                const t = try d.g.seconds(e);
+                try ze.check(d.g.api.zeEventHostReset(e));
+                for (&prof.names, &prof.total) |n, *tot| {
+                    if (n.k == k) {
+                        tot.* += t;
+                        break;
+                    }
+                }
+            }
+            prof.used = 0;
+        }
     }
 
     fn fill(d: *Dev, p: *anyopaque, pattern: anytype, bytes: usize) !void {
@@ -131,6 +152,28 @@ const Dev = struct {
 
 fn off(p: *anyopaque, bytes: usize) *anyopaque {
     return @ptrFromInt(@intFromPtr(p) + bytes);
+}
+
+/// XPU_PROFILE=1: GPU time per kernel, summed over the run.
+const Prof = struct {
+    on: bool = false,
+    events: [4096]ze.H = @splat(null),
+    kernel: [4096]ze.H = @splat(null),
+    used: usize = 0,
+    names: [23]struct { k: ze.H = null, name: []const u8 = "" } = @splat(.{}),
+    total: [23]f64 = @splat(0),
+};
+var prof: Prof = .{};
+
+fn profReport(label: []const u8) void {
+    if (!prof.on) return;
+    var sum: f64 = 0;
+    for (prof.total) |t| sum += t;
+    std.debug.print("GPU time, {s}: {d:.1} ms\n", .{ label, sum * 1e3 });
+    for (prof.names, &prof.total) |n, *t| {
+        if (t.* > 0) std.debug.print("  {s:<14} {d:8.2} ms {d:5.1} %\n", .{ n.name, t.* * 1e3, t.* / sum * 100 });
+        t.* = 0;
+    }
 }
 
 /// An int4 projection in the GEMM layout: words [K/8, N] (nibble pairs interleaved), scales and biases × 64 [K/64, N]
@@ -286,6 +329,8 @@ const Acts = struct {
     pscr: *anyopaque, // fp32 [CHUNK, D] (slice totals of the narrow prompt GEMM)
     logits: *anyopaque, // fp16 [VOCAB]
     tok: *anyopaque, // i32
+    pv: *anyopaque, // argmax partials: f32 [256], i32 [256]
+    pi: *anyopaque,
     ids: *anyopaque, // i32 [CHUNK]
     zeros: *anyopaque, // padding rows of the GDN chunks: k = v = 0, β = 0 …
     ones: *anyopaque, // … and g = 1
@@ -300,8 +345,9 @@ const Acts = struct {
             .g = try d.alloc_(CHUNK * 48 * 4), .beta = try d.alloc_(CHUNK * 48 * 4), .y = try d.alloc_(CHUNK * 6144 * 2),
             .la = try d.alloc_(48 * nc * 64 * 4), .wb = try d.alloc_(nc * 48 * 64 * 128 * 2), .u0 = try d.alloc_(nc * 48 * 64 * 128 * 4),
             .hs = try d.alloc_(nc * 48 * 128 * 128 * 2), .vn = try d.alloc_(nc * 48 * 128 * 64 * 2),
-            .pm = try d.alloc_(CHUNK * 24 * ns * 4), .pl = try d.alloc_(CHUNK * 24 * ns * 4), .po = try d.alloc_(CHUNK * 24 * ns * 256 * 4),
-            .pscr = try d.alloc_(CHUNK * D * 4), .logits = try d.alloc_(VOCAB * 2), .tok = try d.alloc_(4), .ids = try d.alloc_(CHUNK * 4),
+            // decode attention partials: at most 16 rows (the prompt kernel needs none)
+            .pm = try d.alloc_(16 * 24 * ns * 4), .pl = try d.alloc_(16 * 24 * ns * 4), .po = try d.alloc_(16 * 24 * ns * 256 * 4),
+            .pscr = try d.alloc_(CHUNK * D * 4), .logits = try d.alloc_(VOCAB * 2), .tok = try d.alloc_(4), .pv = try d.alloc_(1024), .pi = try d.alloc_(1024), .ids = try d.alloc_(CHUNK * 4),
             .zeros = try d.alloc_(CHUNK * 48 * 128 * 2), .ones = try d.alloc_(CHUNK * 48 * 4),
         };
     }
@@ -316,7 +362,11 @@ fn gemm(d: *Dev, a: *Acts, h: *anyopaque, ahi: *anyopaque, alo: *anyopaque, w: P
     const mp: i32 = @intCast((m + 7) / 8 * 8);
     if (m <= 16) {
         if (w.wide)
-            try d.launch(d.k.dec_wide, .{ .x = 1, .y = w.n / 128 }, .{ h, w.w, w.s, w.bg, out, M, N, K, ahi, alo, mp, G })
+            // 64 columns per subgroup for the widest shapes (gate|up, head), 32 below (measured end to end)
+            if (w.n >= 30000)
+                try d.launch(d.k.dec_wide64, .{ .x = 1, .y = w.n / 256 }, .{ h, w.w, w.s, w.bg, out, M, N, K, ahi, alo, mp, G })
+            else
+                try d.launch(d.k.dec_wide, .{ .x = 1, .y = w.n / 128 }, .{ h, w.w, w.s, w.bg, out, M, N, K, ahi, alo, mp, G })
         else
             try d.launch(d.k.dec_narrow, .{ .x = 1, .y = w.n / 32 }, .{ h, w.w, w.s, w.bg, out, M, N, K, ahi, alo, mp, G });
     } else {
@@ -395,14 +445,22 @@ fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, want: bool) 
             const ctx = p0 + T;
             const ns = (ctx + SPLIT - 1) / SPLIT;
             try d.launch(d.k.attn_prep, .{ .x = T }, .{ a.p, l.qn.?, l.kn.?, m.invf, a.q, l.kc.?, l.vc.?, @as(i32, @intCast(p0)), EPS });
-            try d.launch(d.k.attn_decode, .{ .x = ns, .y = 4, .z = T }, .{ a.q, l.kc.?, l.vc.?, a.pm, a.pl, a.po, @as(i32, @intCast(p0)), @as(i32, @intCast(ns)), @as(f32, 1.0 / 16.0) });
-            try d.launch(d.k.attn_merge, .{ .x = 24, .y = T }, .{ a.pm, a.pl, a.po, a.y, @as(i32, @intCast(p0)), @as(i32, @intCast(ns)) });
+            if (T > 16) {                                // the port's Triton prompt kernel: 256 rows a program
+                const nul: ?*anyopaque = null;
+                try d.launch(d.k.prompt_attn, .{ .x = (T + 255) / 256, .y = 24 }, .{ a.q, l.kc.?, l.vc.?, a.y, @as(i32, @intCast(p0)), t32, @as(i32, @intCast(ctx)), nul, nul });
+            } else {
+                try d.launch(d.k.attn_decode, .{ .x = ns, .y = 4, .z = T }, .{ a.q, l.kc.?, l.vc.?, a.pm, a.pl, a.po, @as(i32, @intCast(p0)), @as(i32, @intCast(ns)), @as(f32, 1.0 / 16.0) });
+                try d.launch(d.k.attn_merge, .{ .x = 24, .y = T }, .{ a.pm, a.pl, a.po, a.y, @as(i32, @intCast(p0)), @as(i32, @intCast(ns)) });
+            }
             try d.launch(d.k.attn_gate, .{ .x = T }, .{ a.y, a.p, a.h, a.ahi, a.alo });
         } else {
             const cin = l.conv[l.conv_cur].?;
             const cout = l.conv[1 - l.conv_cur].?;
             l.conv_cur = 1 - l.conv_cur;
-            try d.launch(d.k.gdn_pre, .{ .x = T }, .{ a.p, cin, cout, l.conv_w.?, l.alog.?, l.dt.?, a.q, a.k, a.v, a.g, a.beta, t32 });
+            if (T > 16)
+                try d.launch(d.k.gdn_pre_rows, .{ .x = T }, .{ a.p, cin, cout, l.conv_w.?, l.alog.?, l.dt.?, a.q, a.k, a.v, a.g, a.beta, t32 })
+            else
+                try d.launch(d.k.gdn_pre, .{ .x = T, .y = 40 }, .{ a.p, cin, cout, l.conv_w.?, l.alog.?, l.dt.?, a.q, a.k, a.v, a.g, a.beta, t32 });
             if (T > 1 and tp > T) {                      // neutral padding rows: the state does not move
                 const pad = tp - T;
                 const cp = struct {
@@ -441,7 +499,7 @@ fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, want: bool) 
         if (probe) try dumpBuf(d, "r0", a.r, T * D, .f16);
         try d.launch(d.k.add_rmsnorm, .{ .x = T }, .{ a.x, a.r, l.post_norm, a.h, a.ahi, a.alo, @as(i32, D), EPS, @as(i32, 1) });
         try gemm(d, a, a.h, a.ahi, a.alo, l.gu, a.p, T);
-        try d.launch(d.k.swiglu, .{ .x = T }, .{ a.p, a.h, a.ahi, a.alo });
+        try d.launch(d.k.swiglu, .{ .x = T, .y = 17 }, .{ a.p, a.h, a.ahi, a.alo });
         try gemm(d, a, a.h, a.ahi, a.alo, l.down, a.r, T);
         if (p0 == 0 and i < 4) try dump(d, a, T, try std.fmt.allocPrint(alloc, "{d}", .{i}), true);
     }
@@ -452,7 +510,8 @@ fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, want: bool) 
     try d.launch(d.k.add_rmsnorm, .{ .x = T }, .{ a.x, a.r, m.norm, a.h, a.ahi, a.alo, @as(i32, D), EPS, @as(i32, 1) });
     const last = T - 1;
     try gemm(d, a, off(a.h, last * D * 2), off(a.ahi, last * (D / GS) * 2), off(a.alo, last * (D / GS) * 2), m.head, a.logits, 1);
-    try d.launch(d.k.argmax, .{ .x = 1 }, .{ a.logits, @as(i32, VOCAB), a.tok });
+    try d.launch(d.k.argmax_part, .{ .x = 256 }, .{ a.logits, @as(i32, VOCAB), a.pv, a.pi });
+    try d.launch(d.k.argmax, .{ .x = 1 }, .{ a.pv, a.pi, a.tok });
     var tok: i32 = 0;
     try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, &tok, a.tok, 4, null, 0, null));
     try d.sync();
@@ -475,10 +534,15 @@ pub fn main(init: std.process.Init) !void {
     const dir = argv[1];
     const steps: usize = if (argv.len > 3) try std.fmt.parseInt(usize, argv[3], 10) else 32;
     if (std.c.getenv("XPU_DUMP")) |v| dump_dir = std.mem.span(v);
+    if (std.c.getenv("XPU_CHUNK")) |v| CHUNK = try std.fmt.parseInt(u32, std.mem.span(v), 10);
+    if (std.c.getenv("XPU_CTX")) |v| MAX_CTX = try std.fmt.parseInt(u32, std.mem.span(v), 10);
 
     // prompt ids
     var ids: std.ArrayList(i32) = .empty;
-    {
+    if (std.mem.startsWith(u8, argv[2], "--bench=")) {
+        const n = try std.fmt.parseInt(usize, argv[2][8..], 10);
+        for (0..n) |i| try ids.append(alloc, @intCast((i * 7919 + 13) % 200000));
+    } else {
         const path = try std.fmt.allocPrintSentinel(alloc, "{s}", .{argv[2]}, 0);
         const fd = open(path.ptr, 0);
         if (fd < 0) return error.FileNotFound;
@@ -519,25 +583,35 @@ pub fn main(init: std.process.Init) !void {
     const mgd = try d.g.module(&kb.gdn);
     const mw = try d.g.module(&kb.ngen_wide);
     const mn = try d.g.module(&kb.ngen_narrow);
+    const mpa = try d.g.module(&kb.prompt_attention);
     d.k = .{
-        .embed = try d.kernel(mg, "embed", 256), .add_rmsnorm = try d.kernel(mg, "add_rmsnorm", 256),
-        .gdn_pre = try d.kernel(mg, "gdn_pre", 256), .gated_norm = try d.kernel(mg, "gated_norm", 256),
+        .embed = try d.kernel(mg, "embed", 256), .add_rmsnorm = try d.kernel(mg, "add_rmsnorm", 512),
+        .gdn_pre = try d.kernel(mg, "gdn_pre", 256), .gdn_pre_rows = try d.kernel(mg, "gdn_pre_rows", 256), .gated_norm = try d.kernel(mg, "gated_norm", 256),
         .attn_prep = try d.kernel(mg, "attn_prep", 256), .attn_gate = try d.kernel(mg, "attn_gate", 256),
-        .swiglu = try d.kernel(mg, "swiglu", 256), .argmax = try d.kernel(mg, "argmax", 256),
+        .swiglu = try d.kernel(mg, "swiglu", 256), .argmax = try d.kernel(mg, "argmax", 256), .argmax_part = try d.kernel(mg, "argmax_part", 256),
         .repack = try d.kernel(mg, "repack", 16), .gdn_step = try d.kernel(md, "gdn_step", 16),
         .attn_decode = try d.kernel(md, "attn_decode", 16), .attn_merge = try d.kernel(md, "attn_merge", 16),
-        .dec_wide = try d.kernel(mm, "w4k1_decode", 64), .dec_narrow = try d.kernel(mm, "w4k_dsplit", 64),
+        .dec_wide = try d.kernel(mm, "w4k1_decode", 64), .dec_wide64 = try d.kernel(mm, "w4k1_d64", 64), .dec_narrow = try d.kernel(mm, "w4k_dsplit", 64),
         .gdn_prep = try d.kernel(mgd, "gdn_prep", 64), .gdn_state = try d.kernel(mgd, "gdn_state", 256),
         .gdn_out = try d.kernel(mgd, "gdn_out", 128), .ngen_wide = try d.kernel(mw, "w4g_dpb", 256),
-        .ngen_narrow = try d.kernel(mn, "w4g_s4dpb", 256),
+        .ngen_narrow = try d.kernel(mn, "w4g_s4dpb", 256), .prompt_attn = try d.kernel(mpa, "_prompt", 512),
     };
     std.debug.print("kernels ready\n", .{});
+    if (std.c.getenv("XPU_PROFILE") != null) {
+        prof.on = true;
+        const pool = try d.g.events(4096);
+        prof.events = pool;
+        inline for (@typeInfo(@TypeOf(d.k)).@"struct".field_names, 0..) |name, i| prof.names[i] = .{ .k = @field(d.k, name), .name = name };
+    }
     // repack is a 2D launch with a 1D group: (16 columns) × 1 word row
     try ze.check(d.g.api.zeKernelSetGroupSize(d.k.repack, 16, 1, 1));
 
     const t_load = now();
     std.debug.print("checkpoint: {d} tensors\n", .{ckpt.tensors.items.len});
+    const prof_on = prof.on;
+    prof.on = false; // not during the load
     var model = try load(&d, &ckpt);
+    prof.on = prof_on;
     std.debug.print("loaded in {d:.1} s\n", .{now() - t_load});
     var acts = try Acts.init(&d);
     try d.fill(acts.zeros, @as(u16, 0), CHUNK * 48 * 128 * 2);
@@ -554,6 +628,7 @@ pub fn main(init: std.process.Init) !void {
         p0 = @intCast(end);
     }
     const t1 = now();
+    profReport("prompt");
     var out: std.ArrayList(i32) = .empty;
     try out.append(alloc, tok);
     for (1..steps) |_| {
@@ -562,6 +637,7 @@ pub fn main(init: std.process.Init) !void {
         try out.append(alloc, tok);
     }
     const t2 = now();
+    profReport("decode");
     std.debug.print("prompt: {d} tokens in {d:.3} s ({d:.0} tok/s)\n", .{ ids.items.len, t1 - t0, @as(f64, @floatFromInt(ids.items.len)) / (t1 - t0) });
     std.debug.print("decode: {d} tokens in {d:.3} s ({d:.1} tok/s)\n", .{ steps - 1, t2 - t1, @as(f64, @floatFromInt(steps - 1)) / (t2 - t1) });
     std.debug.print("tokens:", .{});

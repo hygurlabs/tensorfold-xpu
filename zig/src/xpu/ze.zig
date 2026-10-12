@@ -210,6 +210,7 @@ pub const Gpu = struct {
 
     /// Host-visible timestamped events (GPU time of each kernel).
     pub fn events(g: *Gpu, comptime n: usize) Error![n]H {
+        @setEvalBranchQuota(100000);
         var pool: H = null;
         try check(g.api.zeEventPoolCreate(g.context, &.{ .flags = pool_host_visible | pool_kernel_timestamp, .count = n }, 1, @ptrCast(&g.device), &pool));
         var out: [n]H = @splat(null);

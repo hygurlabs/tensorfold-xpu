@@ -30,15 +30,19 @@ static float wg_sum256(float v, local float *red) {
   return t;
 }
 
-// Sommes de ligne d'une ligne fp16 rangée en mémoire locale (K valeurs), écrites en [row, K / 64].
+// Sommes de ligne d'une ligne fp16 rangée en mémoire locale (K valeurs), écrites en [row, K / 64] : un sous-groupe par
+// groupe de 64, 4 valeurs par couloir (k croissant), puis la somme du sous-groupe ; ordre fixe.
 static void rowsums(local const half *hl, int K, global half *AHI, global half *ALO, long row) {
-  for (int g = get_local_id(0); g < K / GS; g += get_local_size(0)) {
+  const int lane = get_sub_group_local_id(), nsg = get_num_sub_groups();
+  for (int g = get_sub_group_id(); g < K / GS; g += nsg) {
     float s = 0.0f;
-    for (int k = 0; k < GS; k++) s += (float)hl[g * GS + k];
-    s *= 1.0f / GS;
-    const half hi = convert_half_rte(s);
-    AHI[row * (K / GS) + g] = hi;
-    ALO[row * (K / GS) + g] = convert_half_rte(s - (float)hi);
+    for (int k = 0; k < 4; k++) s += (float)hl[g * GS + lane * 4 + k];
+    s = sub_group_reduce_add(s) * (1.0f / GS);
+    if (lane == 0) {
+      const half hi = convert_half_rte(s);
+      AHI[row * (K / GS) + g] = hi;
+      ALO[row * (K / GS) + g] = convert_half_rte(s - (float)hi);
+    }
   }
 }
 
@@ -55,24 +59,35 @@ KERNEL(256) void embed(global const int *IDS, global const uint *W, global const
   }
 }
 
-// x ← bf16(x + r) (si R), h = fp16(bf16(rms(x)·w)), et ses sommes de ligne. Un groupe de 256 par ligne, D ≤ 5 120.
-KERNEL(256) void add_rmsnorm(global float *X, global const half *R, global const ushort *WN, global half *H,
-                             global half *AHI, global half *ALO, int D, float eps, int has_r) {
-  local float red[16];
+// x ← bf16(x + r) (si R), h = fp16(bf16(rms(x)·w)), et ses sommes de ligne. Un groupe de 512 par ligne (10 valeurs
+// par fil pour D = 5 120 ; 512 est le plafond en mode 256 registres) ; somme des carrés : sous-groupes, puis les 32
+// sommes partielles dans l'ordre.
+KERNEL(512) void add_rmsnorm(global float *X, global const half *R, global const ushort *WN, global half *H,
+                              global half *AHI, global half *ALO, int D, float eps, int has_r) {
+  local float red[32];
   local half hl[5120];
   const int t = get_group_id(0), lid = get_local_id(0);
-  float ss = 0.0f;
-  for (int e = lid; e < D; e += 256) {
-    float x = X[(long)t * D + e];
-    if (has_r) {
+  float xv[10], ss = 0.0f;
+  for (int i = 0; i < 10; i++) {
+    const int e = lid + i * 512;
+    float x = e < D ? X[(long)t * D + e] : 0.0f;
+    if (has_r && e < D) {
       x = rbf(x + (float)R[(long)t * D + e]);
       X[(long)t * D + e] = x;
     }
+    xv[i] = x;
     ss += x * x;
   }
-  const float inv = rsqrt(wg_sum256(ss, red) / D + eps);
-  for (int e = lid; e < D; e += 256) {
-    const half v = convert_half_rte(rbf(X[(long)t * D + e] * inv * bf2f(WN[e])));
+  const float s = sub_group_reduce_add(ss);
+  if (get_sub_group_local_id() == 0) red[get_sub_group_id()] = s;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  float tot = 0.0f;
+  for (int i = 0; i < 32; i++) tot += red[i];
+  const float inv = rsqrt(tot / D + eps);
+  for (int i = 0; i < 10; i++) {
+    const int e = lid + i * 512;
+    if (e >= D) continue;
+    const half v = convert_half_rte(rbf(xv[i] * inv * bf2f(WN[e])));
     H[(long)t * D + e] = v;
     hl[e] = v;
   }
@@ -87,26 +102,67 @@ KERNEL(256) void add_rmsnorm(global float *X, global const half *R, global const
 // Un groupe de 256 par jeton.
 #define NQK 2048                                        // 16 têtes × 128
 #define NCONV 10240
+// Grille (T, 40) : un groupe de 256 par bloc de 256 canaux (deux têtes de 128) ; le bloc 0 calcule aussi g et β.
 KERNEL(256) void gdn_pre(global const half *P, global const half *CIN, global half *COUT, global const ushort *CW,
                          global const ushort *ALOG, global const ushort *DT, global ushort *Q, global ushort *K,
                          global ushort *V, global float *G, global float *BETA, int T) {
+  local float cv[256];
+  const int t = get_group_id(0), blk = get_group_id(1), lid = get_local_id(0), sg = get_sub_group_id();
+  const int lane = get_sub_group_local_id(), c = blk * 256 + lid;
+  float s = 0.0f;
+  for (int j = 0; j < 4; j++) {
+    const int i = t + j;                              // ligne de concat(état, qkv)
+    const float x = i < 3 ? (float)CIN[i * NCONV + c] : (float)P[(long)(i - 3) * 16640 + c];
+    s += x * bf2f(CW[c * 4 + j]);
+  }
+  cv[lid] = rbf(silu(s));
+  if (t >= T - 3) COUT[(t - (T - 3)) * NCONV + c] = P[(long)t * 16640 + c];
+  if (T < 3 && t == 0)                                  // l'état garde une partie de l'ancien
+    for (int r = 0; r < 3 - T; r++) COUT[r * NCONV + c] = CIN[(r + T) * NCONV + c];
+  barrier(CLK_LOCAL_MEM_FENCE);
+  if (c < NQK * 2) {                                    // têtes q (0-15) et k (16-31) : deux par bloc
+    if (sg < 2) {
+      const int hh = blk * 2 + sg;
+      float v[8], ss = 0.0f;
+      for (int i = 0; i < 8; i++) {
+        v[i] = cv[sg * 128 + i * 16 + lane];
+        ss += v[i] * v[i];
+      }
+      const float inv = rsqrt(sub_group_reduce_add(ss) / 128.0f + 1e-6f);
+      const float scale = hh < 16 ? 1.0f / 128.0f : rsqrt(128.0f);
+      global ushort *dst = hh < 16 ? Q + ((long)t * 16 + hh) * 128 : K + ((long)t * 16 + hh - 16) * 128;
+      for (int i = 0; i < 8; i++) dst[i * 16 + lane] = f2bf(v[i] * inv * scale);
+    }
+  } else
+    V[(long)t * 6144 + c - NQK * 2] = f2bf(cv[lid]);
+  if (blk == 0 && lid < 48) {
+    const float a = (float)P[(long)t * 16640 + 16384 + lid], b = (float)P[(long)t * 16640 + 16432 + lid];
+    const float sp = a + bf2f(DT[lid]);
+    const float soft = sp > 20.0f ? sp : log1p(exp(sp));
+    BETA[(long)t * 48 + lid] = sigmoid_f(b);
+    G[(long)t * 48 + lid] = exp(-exp(bf2f(ALOG[lid])) * soft);
+  }
+}
+
+// Même calcul, une ligne par groupe de 256 (tous les canaux du jeton) : meilleur pour les longs morceaux de prompt.
+KERNEL(256) void gdn_pre_rows(global const half *P, global const half *CIN, global half *COUT, global const ushort *CW,
+                              global const ushort *ALOG, global const ushort *DT, global ushort *Q, global ushort *K,
+                              global ushort *V, global float *G, global float *BETA, int T) {
   local float cv[NCONV];
   const int t = get_group_id(0), lid = get_local_id(0), sg = get_sub_group_id(), lane = get_sub_group_local_id();
   for (int c = lid; c < NCONV; c += 256) {
     float s = 0.0f;
     for (int j = 0; j < 4; j++) {
-      const int i = t + j;                              // ligne de concat(état, qkv)
+      const int i = t + j;
       const float x = i < 3 ? (float)CIN[i * NCONV + c] : (float)P[(long)(i - 3) * 16640 + c];
       s += x * bf2f(CW[c * 4 + j]);
     }
     cv[c] = rbf(silu(s));
     if (t >= T - 3) COUT[(t - (T - 3)) * NCONV + c] = P[(long)t * 16640 + c];
-  }
-  if (T < 3)                                            // l'état garde une partie de l'ancien
-    for (int c = lid; c < NCONV && t == 0; c += 256)
+    if (T < 3 && t == 0)
       for (int r = 0; r < 3 - T; r++) COUT[r * NCONV + c] = CIN[(r + T) * NCONV + c];
+  }
   barrier(CLK_LOCAL_MEM_FENCE);
-  // q (têtes 0-15) et k (16-31) : RMS sur 128, un sous-groupe par tête, deux têtes par sous-groupe.
   for (int hh = sg; hh < 32; hh += 16) {
     float v[8], ss = 0.0f;
     for (int i = 0; i < 8; i++) {
@@ -206,26 +262,39 @@ KERNEL(256) void attn_gate(global const ushort *O, global const half *P, global 
 }
 
 // SwiGLU : GU fp16 [T, 34 816] = gate (17 408) | up (17 408) ; act = fp16(bf16(SiLU(g)·u)) et ses sommes de ligne.
+// Grille (T, 17) : un groupe de 256 par bloc de 1 024 colonnes (16 groupes de 64).
 KERNEL(256) void swiglu(global const half *GU, global half *H, global half *AHI, global half *ALO) {
-  local half hl[17408];
-  const int t = get_group_id(0);
-  for (int e = get_local_id(0); e < 17408; e += 256) {
-    const half o = convert_half_rte(rbf(silu((float)GU[(long)t * 34816 + e]) * (float)GU[(long)t * 34816 + 17408 + e]));
-    H[(long)t * 17408 + e] = o;
+  local half hl[1024];
+  const int t = get_group_id(0), blk = get_group_id(1), lid = get_local_id(0);
+  for (int e = lid; e < 1024; e += 256) {
+    const int c = blk * 1024 + e;
+    const half o = convert_half_rte(rbf(silu((float)GU[(long)t * 34816 + c]) * (float)GU[(long)t * 34816 + 17408 + c]));
+    H[(long)t * 17408 + c] = o;
     hl[e] = o;
   }
   barrier(CLK_LOCAL_MEM_FENCE);
-  rowsums(hl, 17408, AHI, ALO, t);
+  const int lane = get_sub_group_local_id();
+  for (int g = get_sub_group_id(); g < 16; g += 16) {
+    float s = 0.0f;
+    for (int k = 0; k < 4; k++) s += (float)hl[g * GS + lane * 4 + k];
+    s = sub_group_reduce_add(s) * (1.0f / GS);
+    if (lane == 0) {
+      const half hi = convert_half_rte(s);
+      AHI[(long)t * 272 + blk * 16 + g] = hi;
+      ALO[(long)t * 272 + blk * 16 + g] = convert_half_rte(s - (float)hi);
+    }
+  }
 }
 
-// Arg max d'une ligne de logits fp16 [V] (le premier indice en cas d'égalité). Un groupe de 256.
-KERNEL(256) void argmax(global const half *L, int V, global int *OUT) {
+// Arg max d'une ligne de logits fp16 [V] (le premier indice en cas d'égalité), en deux noyaux : maxima partiels de
+// 256 groupes (PART [256] : valeur, indice), puis le maximum des partiels.
+KERNEL(256) void argmax_part(global const half *L, int V, global float *PV, global int *PI) {
   local float bv[256];
   local int bi[256];
-  const int lid = get_local_id(0);
+  const int lid = get_local_id(0), gid = get_group_id(0), per = (V + 255) / 256;
   float best = -INFINITY;
-  int idx = 0;
-  for (int i = lid; i < V; i += 256) {
+  int idx = 0x7fffffff;
+  for (int i = gid * per + lid; i < min(V, (gid + 1) * per); i += 256) {
     const float v = (float)L[i];
     if (v > best) { best = v; idx = i; }
   }
@@ -233,6 +302,22 @@ KERNEL(256) void argmax(global const half *L, int V, global int *OUT) {
   bi[lid] = idx;
   barrier(CLK_LOCAL_MEM_FENCE);
   if (lid == 0) {
+    for (int i = 1; i < 256; i++)
+      if (bv[i] > best || (bv[i] == best && bi[i] < idx)) { best = bv[i]; idx = bi[i]; }
+    PV[gid] = best;
+    PI[gid] = idx;
+  }
+}
+KERNEL(256) void argmax(global const float *PV, global const int *PI, global int *OUT) {
+  local float bv[256];
+  local int bi[256];
+  const int lid = get_local_id(0);
+  bv[lid] = PV[lid];
+  bi[lid] = PI[lid];
+  barrier(CLK_LOCAL_MEM_FENCE);
+  if (lid == 0) {
+    float best = bv[0];
+    int idx = bi[0];
     for (int i = 1; i < 256; i++)
       if (bv[i] > best || (bv[i] == best && bi[i] < idx)) { best = bv[i]; idx = bi[i]; }
     OUT[0] = idx;
