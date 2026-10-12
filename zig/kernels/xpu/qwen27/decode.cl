@@ -266,11 +266,10 @@ kernel void attn_prompt(global const ushort *Q, global const ushort *KC, global 
         s[i] = intel_sub_group_bf16_bf16_matrix_mad_k16(qa, as_int8(kw), s[i]);
       }
     }
-    barrier(CLK_LOCAL_MEM_FENCE);                      // le bloc précédent a fini de lire P
     __attribute__((opencl_unroll_hint))
     for (int i = 0; i < 3; i++)
       __attribute__((opencl_unroll_hint))
-      for (int r = 0; r < 8; r++) S[((rh * 3 + i) * 8 + r) * 64 + kt * 16 + lane] = s[i][r] * scale;
+      for (int r = 0; r < 8; r++) S[((rh * 3 + i) * 8 + r) * 64 + kt * 16 + lane] = s[i][r] * (scale * M_LOG2E_F);
     barrier(CLK_LOCAL_MEM_FENCE);
     __attribute__((opencl_unroll_hint))
     for (int j = 0; j < 6; j++) {
@@ -283,10 +282,10 @@ kernel void attn_prompt(global const ushort *Q, global const ushort *KC, global 
       }
       mx = sub_group_reduce_max(mx);
       const float mn = fmax(m[j], mx);
-      const float alpha = mn == -INFINITY ? 1.0f : exp(m[j] - mn);
+      const float alpha = mn == -INFINITY ? 1.0f : native_exp2(m[j] - mn);
       float sum = 0.0f;
       for (int c = 0; c < 4; c++) {
-        const float p = mn == -INFINITY ? 0.0f : exp(x[c] - mn);
+        const float p = mn == -INFINITY ? 0.0f : native_exp2(x[c] - mn);
         P[((R / 8) * 4 + c) * 128 + (R % 8) * 16 + lane] = f2bf(p);
         sum += p;
       }
