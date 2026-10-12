@@ -52,6 +52,7 @@ pub fn main(init: std.process.Init) !void {
     if (std.c.getenv("XPU_OVERLAP_PROBE") != null) try overlapProbe(r);
     if (std.c.getenv("XPU_ROWS_PROBE") != null) try rowsProbe(r);
     if (std.c.getenv("XPU_EXL3_PROBE") != null) try exl3Probe(r);
+    if (std.c.getenv("XPU_DPAS_DIR")) |dir| try dpasTypes(r, std.mem.span(dir));
     if (std.c.getenv("XPU_MULTI_TEST")) |v| try multiTest(r, ids.items, try std.fmt.parseInt(u32, std.mem.span(v), 10));
     if (std.c.getenv("XPU_GEMM_ZEBIN")) |path| try gemmLoop(r, std.mem.span(path));
     if (std.c.getenv("XPU_A8_ZEBIN")) |path| try a8Loop(r, std.mem.span(path));
@@ -383,6 +384,39 @@ fn multiTest(r: *q.Runner, prompt: []const u32, n: u32) !void {
 
 /// EXL3 speed probe (no weights: random trellis bits): the mul1 decode GEMV at 4, 3 and 2 bits against our int4
 /// decode GEMM on the same shapes (layer 0 gate|up and down), 1 and 8 rows; ms a call and weight GB/s.
+/// DPAS throughput by type (tools/xpu/dpas_types.cpp's zebins in dir): 8 192 threads of `iters` × 8 DPAS 8×8, TOPS.
+fn dpasTypes(r: *q.Runner, dir: []const u8) !void {
+    const d = &r.d;
+    for ([_]struct { []const u8, f64 }{ .{ "hf", 16 }, .{ "bf", 16 }, .{ "b", 32 }, .{ "s4", 64 }, .{ "s2", 128 } }) |t| {
+        const path = try std.fmt.allocPrintSentinel(alloc, "{s}/dpas_{s}.zebin", .{ dir, t[0] }, 0);
+        const fd = open(path, 0);
+        if (fd < 0) return error.FileNotFound;
+        const size: usize = @intCast(lseek(fd, 0, 2));
+        const bin: [*]const u8 = @ptrCast(mmap(null, size, 1, 2, fd, 0) orelse return error.MmapFailed);
+        const copy = try alloc.alignedAlloc(u8, .@"8", size);
+        @memcpy(copy, bin[0..size]);
+        const k = try d.kernel(try d.g.module(copy), "dpas_loop", 16);
+        const groups: u32 = 8192;
+        const iters: i32 = 4000;
+        try d.launch(k, .{ .x = groups }, .{ r.acts.pscr, iters });
+        try d.sync();
+        var best: f64 = 1e9;
+        for (0..5) |_| {
+            const t0 = q.now();
+            try d.launch(k, .{ .x = groups }, .{ r.acts.pscr, iters });
+            try d.sync();
+            best = @min(best, q.now() - t0);
+        }
+        const ops = @as(f64, groups) * @as(f64, @floatFromInt(iters)) * 8.0 * 2.0 * 8.0 * 16.0 * t[1];
+        var res: [16]u32 = undefined;
+        try q.ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, &res, r.acts.pscr, 64, null, 0, null));
+        try d.sync();
+        const got: f64 = if (t[0][1] == 'f') @as(f32, @bitCast(res[0])) else @floatFromInt(@as(i32, @bitCast(res[0])));
+        const want = @as(f64, @floatFromInt(iters)) * t[1] * (if (t[0][1] == 'f') @as(f64, 1) else -1);
+        std.debug.print("dpas {s:2} (K {d:3}): {d:6.1} TOPS, contrôle {d} (attendu {d}){s}\n", .{ t[0], t[1], ops / best / 1e12, got, want, if (got == want) "" else "  FAUX" });
+    }
+}
+
 fn exl3Probe(r: *q.Runner) !void {
     const d = &r.d;
     const a = &r.acts;
