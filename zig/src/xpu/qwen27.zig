@@ -5,20 +5,20 @@ const std = @import("std");
 const ze = @import("ze.zig");
 const kb = @import("xpu_qwen27_kernels");
 
-const alloc = std.heap.c_allocator;
+pub const alloc = std.heap.c_allocator;
 
 // Qwen3.8-27B shape (checked against config.json at load).
-const D = 5120;
+pub const D = 5120;
 const FF = 17408;
 const LAYERS = 64;
-const VOCAB = 248320;
-const GS = 64;
+pub const VOCAB = 248320;
+pub const GS = 64;
 const GDN_IN = 16640; // qkv 10240 | z 6144 | a 48 | b 48 = 16480, padded to the GEMM tile (256)
 const ATT_IN = 14336; // (q 256 | gate 256) × 24 | k 1024 | v 1024
-var CHUNK: u32 = 1024; // prompt rows per forward (XPU_CHUNK, a multiple of 64)
+pub var CHUNK: u32 = 1024; // prompt rows per forward (XPU_CHUNK, a multiple of 64)
 var MAX_CTX: u32 = 4096; // KV cache rows (XPU_CTX)
 const SPLIT = 32; // keys per attention split (decode.cl)
-const EPS: f32 = 1e-6;
+pub const EPS: f32 = 1e-6;
 
 // Layout of a GDN layer's stash (bytes): q, k, v, g, β, then the qkv rows of P.
 const ST_Q = 0;
@@ -42,12 +42,12 @@ extern "c" fn close(fd: c_int) c_int;
 extern "c" fn lseek(fd: c_int, off: i64, whence: c_int) i64;
 extern "c" fn mmap(addr: ?*anyopaque, len: usize, prot: c_int, flags: c_int, fd: c_int, off: i64) ?*anyopaque;
 
-const Tensor = struct { name: []const u8, dtype: []const u8, shape: [4]u64, rank: usize, bytes: []const u8 };
+pub const Tensor = struct { name: []const u8, dtype: []const u8, shape: [4]u64, rank: usize, bytes: []const u8 };
 
-const Checkpoint = struct {
+pub const Checkpoint = struct {
     tensors: std.ArrayList(Tensor) = .empty,
 
-    fn addShard(c: *Checkpoint, path: [:0]const u8) !void {
+    pub fn addShard(c: *Checkpoint, path: [:0]const u8) !void {
         const fd = open(path.ptr, 0);
         if (fd < 0) return error.FileNotFound;
         defer _ = close(fd);
@@ -71,7 +71,7 @@ const Checkpoint = struct {
         }
     }
 
-    fn get(c: *const Checkpoint, name: []const u8) !Tensor {
+    pub fn get(c: *const Checkpoint, name: []const u8) !Tensor {
         for (c.tensors.items) |t| if (std.mem.endsWith(u8, t.name, name) and
             (t.name.len == name.len or std.mem.startsWith(u8, t.name, "language_model."))) return t;
         std.debug.print("missing tensor: {s}\n", .{name});
@@ -81,7 +81,7 @@ const Checkpoint = struct {
 
 // ---------------------------------------------------------------- device
 
-const Dev = struct {
+pub const Dev = struct {
     g: ze.Gpu,
     list: ze.H,
     staging: []u8 = &.{}, // USM host memory: the driver cannot copy from file-backed mmap pages directly
@@ -92,24 +92,24 @@ const Dev = struct {
         ngen_narrow: ze.H, prompt_attn: ze.H,
     },
 
-    fn kernel(d: *Dev, m: ze.H, name: [*:0]const u8, local: u32) !ze.H {
+    pub fn kernel(d: *Dev, m: ze.H, name: [*:0]const u8, local: u32) !ze.H {
         const k = try d.g.kernel(m, name);
         try ze.check(d.g.api.zeKernelSetGroupSize(k, local, 1, 1));
         return k;
     }
 
-    fn alloc_(d: *Dev, bytes: usize) !*anyopaque {
+    pub fn alloc_(d: *Dev, bytes: usize) !*anyopaque {
         return d.g.deviceAlloc(@max(bytes, 64));
     }
 
-    fn upload(d: *Dev, bytes: []const u8) !*anyopaque {
+    pub fn upload(d: *Dev, bytes: []const u8) !*anyopaque {
         const p = try d.alloc_(bytes.len);
         try d.copyIn(p, bytes);
         return p;
     }
 
     /// Host bytes (any memory, mmap included) to the device, through the USM staging buffer.
-    fn copyIn(d: *Dev, dst: *anyopaque, bytes: []const u8) !void {
+    pub fn copyIn(d: *Dev, dst: *anyopaque, bytes: []const u8) !void {
         if (d.staging.len == 0) d.staging = @as([*]u8, @ptrCast(try d.g.hostAlloc(256 << 20)))[0 .. 256 << 20];
         var done: usize = 0;
         while (done < bytes.len) {
@@ -121,7 +121,7 @@ const Dev = struct {
         }
     }
 
-    fn launch(d: *Dev, k: ze.H, groups: ze.GroupCount, args: anytype) !void {
+    pub fn launch(d: *Dev, k: ze.H, groups: ze.GroupCount, args: anytype) !void {
         inline for (args, 0..) |a, i| try d.g.arg(k, i, a);
         var ev: ze.H = null;
         if (prof.on) {
@@ -133,7 +133,7 @@ const Dev = struct {
         try ze.check(d.g.api.zeCommandListAppendLaunchKernel(d.list, k, &groups, ev, 0, null));
     }
 
-    fn sync(d: *Dev) !void {
+    pub fn sync(d: *Dev) !void {
         try ze.check(d.g.api.zeCommandListHostSynchronize(d.list, std.math.maxInt(u64)));
         if (prof.on) {
             for (prof.events[0..prof.used], prof.kernel[0..prof.used]) |e, k| {
@@ -150,7 +150,7 @@ const Dev = struct {
         }
     }
 
-    fn fill(d: *Dev, p: *anyopaque, pattern: anytype, bytes: usize) !void {
+    pub fn fill(d: *Dev, p: *anyopaque, pattern: anytype, bytes: usize) !void {
         const T = @TypeOf(pattern);
         const host = try alloc.alloc(T, bytes / @sizeOf(T));
         defer alloc.free(host);
@@ -159,11 +159,11 @@ const Dev = struct {
     }
 };
 
-fn copy(d: *Dev, dst: *anyopaque, src: *anyopaque, n: usize) !void {
+pub fn copy(d: *Dev, dst: *anyopaque, src: *anyopaque, n: usize) !void {
     try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, dst, src, n, null, 0, null));
 }
 
-fn off(p: *anyopaque, bytes: usize) *anyopaque {
+pub fn off(p: *anyopaque, bytes: usize) *anyopaque {
     return @ptrFromInt(@intFromPtr(p) + bytes);
 }
 
@@ -191,7 +191,7 @@ pub fn profReport(label: []const u8) void {
 
 /// An int4 projection in the GEMM layout: words [K/8, N] (nibble pairs interleaved), scales and biases × 64 [K/64, N]
 /// fp16. `wide`: no K slices (family dpb), else 4 slices (family s4dpb, narrow shapes).
-const Proj = struct { w: *anyopaque, s: *anyopaque, bg: *anyopaque, n: u32, k: u32, wide: bool };
+pub const Proj = struct { w: *anyopaque, s: *anyopaque, bg: *anyopaque, n: u32, k: u32, wide: bool };
 
 const Layer = struct {
     in_norm: *anyopaque,
@@ -236,7 +236,7 @@ fn bf16Tensor(d: *Dev, c: *const Checkpoint, name: []const u8) !*anyopaque {
 }
 
 /// Fused projection from MLX parts stacked on N, repacked on the GPU through a raw staging area.
-fn projection(d: *Dev, c: *const Checkpoint, prefix: []const u8, parts: []const []const u8, wide: bool, stage: *anyopaque) !Proj {
+pub fn projection(d: *Dev, c: *const Checkpoint, prefix: []const u8, parts: []const []const u8, wide: bool, stage: *anyopaque) !Proj {
     var n_total: u32 = 0;
     var k: u32 = 0;
     for (parts) |p| {
@@ -373,7 +373,7 @@ const Acts = struct {
 };
 
 /// out[M, N] fp16 = h[M, K] · Wᵀ : decode kernels up to 16 rows, the nGEN prompt GEMMs above.
-fn gemm(d: *Dev, a: *Acts, h: *anyopaque, ahi: *anyopaque, alo: *anyopaque, w: Proj, out: *anyopaque, m: u32) !void {
+pub fn gemm(d: *Dev, pscr: *anyopaque, h: *anyopaque, ahi: *anyopaque, alo: *anyopaque, w: Proj, out: *anyopaque, m: u32) !void {
     const M: i32 = @intCast(m);
     const N: i32 = @intCast(w.n);
     const K: i32 = @intCast(w.k);
@@ -394,7 +394,7 @@ fn gemm(d: *Dev, a: *Acts, h: *anyopaque, ahi: *anyopaque, alo: *anyopaque, w: P
         if (w.wide)
             try d.launch(d.k.ngen_wide, groups, .{ h, w.w, w.s, w.bg, out, M, N, K, ahi, alo, mp, G })
         else
-            try d.launch(d.k.ngen_narrow, groups, .{ h, w.w, w.s, w.bg, out, M, N, K, ahi, alo, mp, G, a.pscr });
+            try d.launch(d.k.ngen_narrow, groups, .{ h, w.w, w.s, w.bg, out, M, N, K, ahi, alo, mp, G, pscr });
     }
 }
 
@@ -465,7 +465,7 @@ fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mode) 
         try d.launch(d.k.add_rmsnorm, .{ .x = T }, .{ a.x, a.r, l.in_norm, a.h, a.ahi, a.alo, @as(i32, D), EPS, @as(i32, if (i == 0) 0 else 1) });
         const probe = p0 == 0 and i == 0;
         if (probe) try dumpBuf(d, "h0", a.h, T * D, .f16);
-        try gemm(d, a, a.h, a.ahi, a.alo, l.mixer_in, a.p, T);
+        try gemm(d, a.pscr, a.h, a.ahi, a.alo, l.mixer_in, a.p, T);
         if (probe) try dumpBuf(d, "p0", a.p, T * GDN_IN, .f16);
         if (l.attn) {
             const ctx = p0 + T;
@@ -531,12 +531,12 @@ fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mode) 
             try d.launch(d.k.gated_norm, .{ .x = T }, .{ a.y, a.p, l.gnorm.?, a.h, a.ahi, a.alo, EPS });
             if (probe) try dumpBuf(d, "o0", a.h, T * 6144, .f16);
         }
-        try gemm(d, a, a.h, a.ahi, a.alo, l.mixer_out, a.r, T);
+        try gemm(d, a.pscr, a.h, a.ahi, a.alo, l.mixer_out, a.r, T);
         if (probe) try dumpBuf(d, "r0", a.r, T * D, .f16);
         try d.launch(d.k.add_rmsnorm, .{ .x = T }, .{ a.x, a.r, l.post_norm, a.h, a.ahi, a.alo, @as(i32, D), EPS, @as(i32, 1) });
-        try gemm(d, a, a.h, a.ahi, a.alo, l.gu, a.p, T);
+        try gemm(d, a.pscr, a.h, a.ahi, a.alo, l.gu, a.p, T);
         try d.launch(d.k.swiglu, .{ .x = T, .y = 17 }, .{ a.p, a.h, a.ahi, a.alo });
-        try gemm(d, a, a.h, a.ahi, a.alo, l.down, a.r, T);
+        try gemm(d, a.pscr, a.h, a.ahi, a.alo, l.down, a.r, T);
         if (p0 == 0 and i < 4) try dump(d, a, T, try std.fmt.allocPrint(alloc, "{d}", .{i}), true);
         if (mode.taps) for (TAP_LAYERS, 0..) |tl, slot| if (tl == i)
             try d.launch(d.k.tap, .{ .x = D / 256, .y = T }, .{ a.x, a.r, a.taps, @as(i32, D), @as(i32, @intCast(slot)) });
@@ -548,7 +548,7 @@ fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mode) 
     try d.launch(d.k.add_rmsnorm, .{ .x = T }, .{ a.x, a.r, m.norm, a.h, a.ahi, a.alo, @as(i32, D), EPS, @as(i32, 1) });
     const first = if (mode.want == .rows) 0 else T - 1;
     const rows = T - first;
-    try gemm(d, a, off(a.h, first * D * 2), off(a.ahi, first * (D / GS) * 2), off(a.alo, first * (D / GS) * 2), m.head, a.logits, rows);
+    try gemm(d, a.pscr, off(a.h, first * D * 2), off(a.ahi, first * (D / GS) * 2), off(a.alo, first * (D / GS) * 2), m.head, a.logits, rows);
     try d.launch(d.k.argmax_part, .{ .x = 256, .y = rows }, .{ a.logits, @as(i32, VOCAB), a.pv, a.pi });
     try d.launch(d.k.argmax, .{ .x = rows }, .{ a.pv, a.pi, a.tok });
     var toks: [16]i32 = undefined;
@@ -572,6 +572,7 @@ pub const Runner = struct {
     pos: u32 = 0,
     last: u32 = 0, // greedy next token of the last forward
     context: u32,
+    ckpt: Checkpoint = .{},
     host_logits: []f32 = &.{},
     block: [16]u32 = @splat(0), // the last verified block's greedy tokens
     block_rows: u32 = 0,
@@ -605,7 +606,7 @@ pub const Runner = struct {
             }
         }
         const r = try alloc.create(Runner);
-        r.* = .{ .d = .{ .g = try ze.Gpu.open(0xe223), .list = undefined, .k = undefined }, .model = undefined, .acts = undefined, .context = context };
+        r.* = .{ .d = .{ .g = try ze.Gpu.open(0xe223), .list = undefined, .k = undefined }, .model = undefined, .acts = undefined, .context = context, .ckpt = ckpt };
         const d = &r.d;
         d.list = try d.g.immediate(0, 0);
         const mg = try d.g.module(&kb.glue);

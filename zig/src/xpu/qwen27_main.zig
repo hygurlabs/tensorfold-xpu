@@ -4,6 +4,7 @@
 //!                                              N synthetic prompt tokens ; XPU_CTX: context (4 096)
 const std = @import("std");
 const q = @import("qwen27.zig");
+const Drafter = @import("drafter.zig").Drafter;
 
 const alloc = std.heap.c_allocator;
 extern "c" fn open(path: [*:0]const u8, flags: c_int, ...) c_int;
@@ -48,6 +49,7 @@ pub fn main(init: std.process.Init) !void {
     const t2 = q.now();
     q.profReport("decode");
     if (std.c.getenv("XPU_VERIFY_TEST") != null) try verifyTest(r, ids.items, out.items);
+    if (std.c.getenv("XPU_DRAFTER")) |dir| try drafted(r, std.mem.span(dir), ids.items, out.items);
     std.debug.print("prompt: {d} tokens in {d:.3} s ({d:.0} tok/s)\n", .{ ids.items.len, t1 - t0, @as(f64, @floatFromInt(ids.items.len)) / (t1 - t0) });
     std.debug.print("decode: {d} tokens in {d:.3} s ({d:.1} tok/s)\n", .{ steps - 1, t2 - t1, @as(f64, @floatFromInt(steps - 1)) / (t2 - t1) });
     std.debug.print("tokens:", .{});
@@ -86,4 +88,48 @@ fn verifyTest(r: *q.Runner, prompt: []const u32, serial: []const u32) !void {
             std.debug.print("\n", .{});
         }
     }
+}
+
+fn onTaps(ctx: *anyopaque, taps: *anyopaque, n: u32) !void {
+    const dr: *Drafter = @ptrCast(@alignCast(ctx));
+    try dr.addTaps(taps, n);
+}
+
+/// Greedy decode with DFlash2 drafts (blocks of XPU_BLOCK rows, 8 by default): must equal the serial reply.
+fn drafted(r: *q.Runner, dir: []const u8, prompt: []const u32, serial: []const u32) !void {
+    const t_load = q.now();
+    const dr = try Drafter.init(r, dir);
+    std.debug.print("drafter loaded in {d:.1} s\n", .{q.now() - t_load});
+    const L: u32 = if (std.c.getenv("XPU_BLOCK")) |v| try std.fmt.parseInt(u32, std.mem.span(v), 10) else 8;
+    try r.reset();
+    dr.reset();
+    r.taps_on = true;
+    r.on_taps = .{ .ctx = dr, .f = onTaps };
+    try r.prompt(prompt, true);
+    var got: std.ArrayList(u32) = .empty;
+    try got.append(alloc, r.last);
+    var rounds: usize = 0;
+    var t_draft: f64 = 0;
+    var t_verify: f64 = 0;
+    const t0 = q.now();
+    while (got.items.len < serial.len) {
+        var block: [16]u32 = undefined;
+        block[0] = r.last;
+        const a = q.now();
+        try dr.propose(r.last, L - 1, block[1..L]);
+        const b = q.now();
+        const greedy = try r.verify(block[0..L]);
+        var n: u32 = 0;
+        while (n + 1 < L and greedy[n] == block[n + 1]) n += 1;
+        try r.commit(n + 1);
+        try dr.addTaps(r.acts.taps, n + 1);
+        t_verify += q.now() - b;
+        t_draft += b - a;
+        for (greedy[0 .. n + 1]) |t| try got.append(alloc, t);
+        rounds += 1;
+    }
+    const dt = q.now() - t0;
+    const len = @min(got.items.len, serial.len);
+    const same = std.mem.eql(u32, got.items[0..len], serial[0..len]);
+    std.debug.print("drafted: {d} tokens in {d} rounds ({d:.2} a round), {d:.1} tok/s, draft {d:.1} ms + verify {d:.1} ms a round, equal to serial: {}\n", .{ got.items.len - 1, rounds, @as(f64, @floatFromInt(got.items.len - 1)) / @as(f64, @floatFromInt(rounds)), @as(f64, @floatFromInt(got.items.len - 1)) / dt, t_draft * 1e3 / @as(f64, @floatFromInt(rounds)), t_verify * 1e3 / @as(f64, @floatFromInt(rounds)), same });
 }

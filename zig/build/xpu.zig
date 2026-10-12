@@ -15,6 +15,7 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         .{ "decode", "zig/kernels/xpu/qwen27/decode.cl", "" },
         .{ "gemm", "zig/kernels/xpu/qwen27/gemm.cl", " -DGSZ=64" },
         .{ "gdn", "zig/kernels/xpu/qwen27/gdn_chunk.cl", "" },
+        .{ "drafter", "zig/kernels/xpu/qwen27/drafter.cl", "" },
     }) |k| {
         const c = b.addSystemCommand(&.{ ocloc, "compile", "-q", "-file" });
         c.addFileArg(b.path(k[1]));
@@ -51,6 +52,7 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         \\pub const decode align(8) = @embedFile("decode.bin").*;
         \\pub const gemm align(8) = @embedFile("gemm.bin").*;
         \\pub const gdn align(8) = @embedFile("gdn.bin").*;
+        \\pub const drafter align(8) = @embedFile("drafter.bin").*;
         \\pub const ngen_wide align(8) = @embedFile("ngen_wide.zebin").*;
         \\pub const ngen_narrow align(8) = @embedFile("ngen_narrow.zebin").*;
         \\pub const prompt_attention align(8) = @embedFile("prompt_attention.bin").*;
