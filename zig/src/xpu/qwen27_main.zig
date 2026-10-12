@@ -109,6 +109,7 @@ fn drafted(r: *q.Runner, dir: []const u8, prompt: []const u32, serial: []const u
     var got: std.ArrayList(u32) = .empty;
     try got.append(alloc, r.last);
     var rounds: usize = 0;
+    q.profReport("drafter prompt (discarded)");
     var t_draft: f64 = 0;
     var t_verify: f64 = 0;
     const t0 = q.now();
@@ -129,6 +130,7 @@ fn drafted(r: *q.Runner, dir: []const u8, prompt: []const u32, serial: []const u
         rounds += 1;
     }
     const dt = q.now() - t0;
+    q.profReport("drafted rounds");
     const len = @min(got.items.len, serial.len);
     const same = std.mem.eql(u32, got.items[0..len], serial[0..len]);
     std.debug.print("drafted: {d} tokens in {d} rounds ({d:.2} a round), {d:.1} tok/s, draft {d:.1} ms + verify {d:.1} ms a round, equal to serial: {}\n", .{ got.items.len - 1, rounds, @as(f64, @floatFromInt(got.items.len - 1)) / @as(f64, @floatFromInt(rounds)), @as(f64, @floatFromInt(got.items.len - 1)) / dt, t_draft * 1e3 / @as(f64, @floatFromInt(rounds)), t_verify * 1e3 / @as(f64, @floatFromInt(rounds)), same });

@@ -255,8 +255,7 @@ pub const Drafter = struct {
             }
             done += rows;
         }
-        dr.end += n;
-        try d.sync();
+        dr.end += n; // no wait: the next block queues behind on the in-order list
     }
 
     /// Proposes `count` (≤ MAXL − 1) drafts after `pending`, the token at position `end`.

@@ -500,9 +500,8 @@ fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mode) 
                 try cp(d, off(a.g, T * 48 * 4), a.ones, pad * 48 * 4);
             }
             if (T <= 16) {
-                if (mode.stash) {                        // entry state and inputs, for Runner.commit's replay
+                if (mode.stash) {                        // inputs, for Runner.commit's replay
                     const st = l.stash.?;
-                    try copy(d, l.rec_save.?, l.rec.?, 48 * 128 * 128 * 4);
                     try copy(d, off(st, ST_Q), a.q, T * 16 * 128 * 2);
                     try copy(d, off(st, ST_K), a.k, T * 16 * 128 * 2);
                     try copy(d, off(st, ST_V), a.v, T * 48 * 128 * 2);
@@ -510,7 +509,8 @@ fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mode) 
                     try copy(d, off(st, ST_B), a.beta, T * 48 * 4);
                     try copy(d, off(st, ST_P), a.p, T * GDN_IN * 2);
                 }
-                try d.launch(d.k.gdn_step, .{ .x = 16, .y = 48 }, .{ a.q, a.k, a.v, a.g, a.beta, l.rec.?, a.y, t32 });
+                // verification: the state after the block goes to rec_save, rec keeps the entry for the replay
+                try d.launch(d.k.gdn_step, .{ .x = 16, .y = 48 }, .{ a.q, a.k, a.v, a.g, a.beta, l.rec.?, if (mode.stash) l.rec_save.? else l.rec.?, a.y, t32 });
             } else {
                 const nc: i32 = @intCast(tp / 64);
                 const ncu: u32 = tp / 64;
@@ -695,17 +695,19 @@ pub const Runner = struct {
     /// block's entry by replaying those rows (the attention caches need nothing: later positions overwrite them).
     pub fn commit(r: *Runner, keep: u32) !void {
         if (keep == 0 or keep > r.block_rows) return error.BadCommit;
-        if (keep < r.block_rows) for (&r.model.layers) |*l| if (!l.attn) {
+        for (&r.model.layers) |*l| if (!l.attn) {
+            if (keep == r.block_rows) { // every row kept: the block's final state is the state
+                std.mem.swap(?*anyopaque, &l.rec, &l.rec_save);
+                continue;
+            }
             const st = l.stash.?;
-            try copy(&r.d, l.rec.?, l.rec_save.?, 48 * 128 * 128 * 4);
-            try r.d.launch(r.d.k.gdn_step, .{ .x = 16, .y = 48 }, .{ off(st, ST_Q), off(st, ST_K), off(st, ST_V), off(st, ST_G), off(st, ST_B), l.rec.?, r.acts.y, @as(i32, @intCast(keep)) });
+            try r.d.launch(r.d.k.gdn_step, .{ .x = 16, .y = 48 }, .{ off(st, ST_Q), off(st, ST_K), off(st, ST_V), off(st, ST_G), off(st, ST_B), l.rec.?, l.rec.?, r.acts.y, @as(i32, @intCast(keep)) });
             // the block's forward flipped conv_cur: conv[cur] is the state after all rows, conv[1 - cur] the entry
             try r.d.launch(r.d.k.conv_commit, .{ .x = 40 }, .{ l.conv[1 - l.conv_cur].?, off(st, ST_P), l.conv[l.conv_cur].?, @as(i32, @intCast(keep)) });
         };
         r.pos += keep;
         r.last = r.block[keep - 1];
-        r.block_rows = 0;
-        try r.d.sync();
+        r.block_rows = 0; // no wait: the next commands queue behind these on the in-order list
     }
 
     /// The logits of row `row` of the last verified block (or of the last forward's row, row 0), fp32 on the host.

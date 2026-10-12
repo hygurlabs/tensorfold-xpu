@@ -11,9 +11,10 @@ static inline ushort f2bf(float f) {
 
 // GDN en série, T jetons (décodage, vérification) : S ← g·S ; u = β·(v − S·k) ; S ← S + u·kᵀ ; y = S·q.
 // Un sous-groupe par (bloc de 8 rangées v, tête V) ; le couloir tient 8 colonnes k (k = 16 i + couloir).
-// Q, K bf16 [T, 16, 128] ; V, Y bf16 [T, 48, 128] ; G, BETA fp32 [T, 48] ; S fp32 [48, 128 (v), 128 (k)], en place.
+// Q, K bf16 [T, 16, 128] ; V, Y bf16 [T, 48, 128] ; G, BETA fp32 [T, 48] ; état fp32 [48, 128 (v), 128 (k)] lu
+// dans S, écrit dans SO (en place si S = SO ; la vérification écrit ailleurs et garde l'état d'entrée).
 KERNEL(16) void gdn_step(global const ushort *Q, global const ushort *K, global const ushort *V, global const float *G,
-                         global const float *BETA, global float *S, global ushort *Y, int T) {
+                         global const float *BETA, global const float *S, global float *SO, global ushort *Y, int T) {
   const int vb = get_group_id(0), h = get_group_id(1), lane = get_sub_group_local_id(), kh = h / 3;
   float s[8][8];
   for (int r = 0; r < 8; r++)
@@ -43,7 +44,7 @@ KERNEL(16) void gdn_step(global const ushort *Q, global const ushort *K, global 
     }
   }
   for (int r = 0; r < 8; r++)
-    for (int i = 0; i < 8; i++) S[((long)h * 128 + vb * 8 + r) * 128 + i * 16 + lane] = s[r][i];
+    for (int i = 0; i < 8; i++) SO[((long)h * 128 + vb * 8 + r) * 128 + i * 16 + lane] = s[r][i];
 }
 
 // Attention de décodage, par tranches de clés. Q bf16 [T, 24, 256] ; caches KC, VC bf16 [L, 4, 256] ; la ligne t voit
