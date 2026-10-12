@@ -218,81 +218,85 @@ KERNEL(16) void exl3_gemv(global const ushort *TR, global const half *X, global 
 
 // Attention du prompt (FlashAttention-2 sur DPAS bf16), causale, têtes de 256, 6 têtes de requête par tête K/V.
 // Q bf16 [T, 24, 256] (ligne t à la position p0 + t) ; caches KC, VC bf16 [L, 4, 256] (clés 0 … p0 + T − 1 écrites) ;
-// O bf16 [T, 24, 256]. Un groupe de travail : une tête K/V et 8 jetons, soit 48 lignes (6 tuiles de 8, une par tête de
-// requête), 8 sous-groupes ; grille (⌈T/8⌉, 4). Q est copié une fois en mémoire locale. Par bloc de 64 clés :
-// - S = Q·Kᵀ : le sous-groupe sg prend les clés 16 (sg % 4) … + 15 de 3 tuiles de lignes (sg / 4) : chaque tuile K sert
-//   3 fois ; S en mémoire locale ;
-// - softmax en ligne : 6 lignes par sous-groupe (max, somme, facteur de rattrapage), P en bf16 en mémoire locale, dans la
-//   disposition des DPAS ;
-// - O += P·V : le sous-groupe sg tient les dimensions 32 sg … + 31 des 48 lignes : chaque tuile V sert 6 fois.
+// O bf16 [T, 24, 256]. Un groupe de travail : une tête K/V et 8 jetons, soit 48 requêtes (requête q : tête 6 hk + q / 8,
+// jeton t0 + q % 8), 8 sous-groupes ; grille (⌈T/8⌉, 4). Par bloc de 128 clés :
+// - Sᵀ = K·Qᵀ, dans le sens de oneDNN : les sous-groupes 0-5 prennent 16 requêtes (une par couloir, groupe g = sg / 2)
+//   et 64 clés (moitié sg % 2) ; K est lu tel quel (8 clés par ligne de DPAS), Q en paires de dimensions. Le max et la
+//   somme d'une requête se font dans les registres de son couloir, puis entre les deux moitiés par la mémoire locale ;
+// - O += P·V : P en bf16 en mémoire locale, dans la disposition A des DPAS ; le sous-groupe sg tient les dimensions
+//   32 sg … + 31 des 48 requêtes.
 // L'ordre des clés est fixe : une ligne a les mêmes bits quel que soit T ou son morceau.
 #pragma OPENCL EXTENSION cl_intel_subgroup_matrix_multiply_accumulate : enable
 __attribute__((intel_reqd_sub_group_size(16))) __attribute__((reqd_work_group_size(128, 1, 1)))
 kernel void attn_prompt(global const ushort *Q, global const ushort *KC, global const ushort *VC, global ushort *O,
                         int p0, int T, float scale) {
-  local float S[48 * 64];
-  local ushort P[6 * 4 * 128];                         // tuiles A des DPAS : (tuile de lignes, 16 clés), r × 16 + couloir
-  local ushort QL[6 * 16 * 128];                       // Q des 48 lignes, même disposition par (tuile, 16 dimensions)
-  local float A[48];
+  local ushort P[6 * 8 * 128];                         // tuiles A : (tuile de 8 requêtes, 16 clés), r × 16 + couloir
+  local float MX[3][2][16], SM[3][2][16], A[48];
   const int t0 = get_group_id(0) * 8, hk = get_group_id(1), sg = get_sub_group_id(), lane = get_sub_group_local_id();
   const int nkeys = p0 + min(t0 + 7, T - 1) + 1;
-  const int kt = sg % 4, rh = sg / 4;
+  const bool qk = sg < 6;
+  const int g = sg / 2, kh = sg % 2;
+  const int tq = lane % 8, hq = 2 * g + lane / 8;      // la requête du couloir : jeton t0 + tq, tête 6 hk + hq
+  const int qpos = p0 + t0 + tq;
+  const bool qok = t0 + tq < T;
+  global const uint *qrow = (global const uint *)(Q + ((long)(t0 + tq) * 24 + hk * 6 + hq) * 256);
+  const float sl = scale * M_LOG2E_F;
   float8 o[6][2];
   for (int i = 0; i < 6; i++) o[i][0] = o[i][1] = 0.0f;
-  float m[6], l[6];
-  for (int j = 0; j < 6; j++) {
-    m[j] = -INFINITY;
-    l[j] = 0.0f;
-  }
-  for (int e = sg; e < 96; e += 8) {                   // Q lu une fois : 96 tuiles de 8 lignes × 16 dimensions
-    const int i = e / 16, ds = e % 16;
-    short8 qa;
-    intel_sub_group_2d_block_read_16b_8r16x1c((global void *)(Q + (hk * 6 + i) * 256), 256 * 2, T, 24 * 256 * 2,
-                                              (int2)(ds * 16, t0), (private ushort *)&qa);
-    intel_sub_group_block_write_us8(QL + e * 128, as_ushort8(qa));
-  }
-  barrier(CLK_LOCAL_MEM_FENCE);
-  for (int k0 = 0; k0 < nkeys; k0 += 64) {
-    float8 s[3] = {0.0f, 0.0f, 0.0f};
-    for (int ds = 0; ds < 16; ds++) {
-      // 16 clés × 16 dimensions, transposées par paires de bf16 : le couloir reçoit sa clé (hors des clés écrites : 0)
-      uint8 kw;
-      intel_sub_group_2d_block_read_transpose_32b_16r8x1c((global void *)(KC + hk * 256), 256 * 2, nkeys, 4 * 256 * 2,
-                                                          (int2)(ds * 8, k0 + kt * 16), (private uint *)&kw);
-      __attribute__((opencl_unroll_hint))
-      for (int i = 0; i < 3; i++) {
-        const short8 qa = as_short8(intel_sub_group_block_read_us8(QL + ((rh * 3 + i) * 16 + ds) * 128));
-        s[i] = intel_sub_group_bf16_bf16_matrix_mad_k16(qa, as_int8(kw), s[i]);
+  float m = -INFINITY, l = 0.0f;
+  for (int k0 = 0; k0 < nkeys; k0 += 128) {
+    if (qk) {
+      const int kb = k0 + kh * 64;                   // les 64 clés de ce sous-groupe
+      float8 s[8];
+      for (int b = 0; b < 8; b++) s[b] = 0.0f;
+      for (int ds = 0; ds < 16; ds++) {
+        const int8 qb = qok ? as_int8(vload8(0, qrow + ds * 8)) : (int8)(0);
+        __attribute__((opencl_unroll_hint))
+        for (int h2 = 0; h2 < 2; h2++) {
+          ushort ka[32];                               // 32 clés × 16 dimensions : 4 tuiles A de 8 clés
+          intel_sub_group_2d_block_read_16b_32r16x1c((global void *)(KC + hk * 256), 256 * 2, nkeys, 4 * 256 * 2,
+                                                     (int2)(ds * 16, kb + h2 * 32), ka);
+          __attribute__((opencl_unroll_hint))
+          for (int b = 0; b < 4; b++) {
+            short8 a;
+            for (int r = 0; r < 8; r++) a[r] = (short)ka[b * 8 + r];
+            s[h2 * 4 + b] = intel_sub_group_bf16_bf16_matrix_mad_k16(a, qb, s[h2 * 4 + b]);
+          }
+        }
       }
-    }
-    __attribute__((opencl_unroll_hint))
-    for (int i = 0; i < 3; i++)
+      float mx = -INFINITY;
       __attribute__((opencl_unroll_hint))
-      for (int r = 0; r < 8; r++) S[((rh * 3 + i) * 8 + r) * 64 + kt * 16 + lane] = s[i][r] * (scale * M_LOG2E_F);
-    barrier(CLK_LOCAL_MEM_FENCE);
-    __attribute__((opencl_unroll_hint))
-    for (int j = 0; j < 6; j++) {
-      const int R = sg * 6 + j, qpos = p0 + t0 + R % 8;
-      float x[4], mx = -INFINITY;
-      for (int c = 0; c < 4; c++) {
-        const int key = k0 + c * 16 + lane;
-        x[c] = key > qpos ? -INFINITY : S[R * 64 + c * 16 + lane];
-        mx = fmax(mx, x[c]);
-      }
-      mx = sub_group_reduce_max(mx);
-      const float mn = fmax(m[j], mx);
-      const float alpha = mn == -INFINITY ? 1.0f : native_exp2(m[j] - mn);
+      for (int b = 0; b < 8; b++)
+        __attribute__((opencl_unroll_hint))
+        for (int r = 0; r < 8; r++) {
+          const float x = kb + b * 8 + r > qpos ? -INFINITY : s[b][r] * sl;
+          s[b][r] = x;
+          mx = fmax(mx, x);
+        }
+      MX[g][kh][lane] = mx;
+      barrier(CLK_LOCAL_MEM_FENCE);
+      const float mn = fmax(m, fmax(mx, MX[g][kh ^ 1][lane]));
+      const float alpha = mn == -INFINITY ? 1.0f : native_exp2(m - mn);
       float sum = 0.0f;
-      for (int c = 0; c < 4; c++) {
-        const float p = mn == -INFINITY ? 0.0f : native_exp2(x[c] - mn);
-        P[((R / 8) * 4 + c) * 128 + (R % 8) * 16 + lane] = f2bf(p);
-        sum += p;
-      }
-      l[j] = l[j] * alpha + sub_group_reduce_add(sum);
-      m[j] = mn;
-      if (lane == 0) A[R] = alpha;
+      local ushort *pt = P + (hq * 8) * 128 + tq * 16;
+      __attribute__((opencl_unroll_hint))
+      for (int b = 0; b < 8; b++)
+        __attribute__((opencl_unroll_hint))
+        for (int r = 0; r < 8; r++) {
+          const float p = mn == -INFINITY ? 0.0f : native_exp2(s[b][r] - mn);
+          sum += p;
+          const int key = kh * 64 + b * 8 + r;      // dans le bloc
+          pt[(key / 16) * 128 + key % 16] = f2bf(p);
+        }
+      SM[g][kh][lane] = sum;
+      if (kh == 0) A[hq * 8 + tq] = alpha;
+      m = mn;
+      barrier(CLK_LOCAL_MEM_FENCE);
+      l = l * alpha + SM[g][0][lane] + SM[g][1][lane];
+    } else {
+      barrier(CLK_LOCAL_MEM_FENCE);
+      barrier(CLK_LOCAL_MEM_FENCE);
     }
-    barrier(CLK_LOCAL_MEM_FENCE);
     __attribute__((opencl_unroll_hint))
     for (int i = 0; i < 6; i++)
       __attribute__((opencl_unroll_hint))
@@ -301,10 +305,11 @@ kernel void attn_prompt(global const ushort *Q, global const ushort *KC, global 
         o[i][0][r] *= al;
         o[i][1][r] *= al;
       }
-    for (int c = 0; c < 4; c++) {
+    for (int c = 0; c < 8; c++) {
+      if (k0 + c * 16 >= nkeys) break;
       short8 pa[6];
       __attribute__((opencl_unroll_hint))
-      for (int i = 0; i < 6; i++) pa[i] = as_short8(intel_sub_group_block_read_us8(P + (i * 4 + c) * 128));
+      for (int i = 0; i < 6; i++) pa[i] = as_short8(intel_sub_group_block_read_us8(P + (i * 8 + c) * 128));
       __attribute__((opencl_unroll_hint))
       for (int dt = 0; dt < 2; dt++) {
         uint8 vw;
@@ -317,8 +322,7 @@ kernel void attn_prompt(global const ushort *Q, global const ushort *KC, global 
     }
   }
   barrier(CLK_LOCAL_MEM_FENCE);
-  if (lane == 0)
-    for (int j = 0; j < 6; j++) A[sg * 6 + j] = 1.0f / l[j];
+  if (qk && kh == 0) A[hq * 8 + tq] = 1.0f / l;
   barrier(CLK_LOCAL_MEM_FENCE);
   __attribute__((opencl_unroll_hint))
   for (int i = 0; i < 6; i++)
