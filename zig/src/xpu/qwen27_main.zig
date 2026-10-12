@@ -50,6 +50,7 @@ pub fn main(init: std.process.Init) !void {
     const t2 = q.now();
     q.profReport("decode");
     if (std.c.getenv("XPU_OVERLAP_PROBE") != null) try overlapProbe(r);
+    if (std.c.getenv("XPU_GEMM_ZEBIN")) |path| try gemmLoop(r, std.mem.span(path));
     if (std.c.getenv("XPU_VERIFY_TEST") != null) try verifyTest(r, ids.items, out.items);
     if (std.c.getenv("XPU_DRAFTER")) |dir| try drafted(r, std.mem.span(dir), ids.items, out.items);
     std.debug.print("prompt: {d} tokens in {d:.3} s ({d:.0} tok/s)\n", .{ ids.items.len, t1 - t0, @as(f64, @floatFromInt(ids.items.len)) / (t1 - t0) });
@@ -197,4 +198,30 @@ fn overlapProbe(r: *q.Runner) !void {
     }
     d.list = ordered;
     std.debug.print("overlap probe ({d} rows): GEMM gate|up {d:.2} ms, GDN chunk {d:.2} ms, chained {d:.2} ms, unordered A,B {d:.2} ms, unordered B,A {d:.2} ms\n", .{ T, best[0] * 1e3, best[1] * 1e3, best[2] * 1e3, best[3] * 1e3, best[4] * 1e3 });
+}
+
+/// Power study: the gate|up prompt GEMM of a zebin given by path (w4g_dpb, possibly an ablation whose bits are wrong)
+/// in a loop of 4 000 calls of CHUNK rows, long enough to sit at the card's power cap; ms a call and TFLOPS.
+fn gemmLoop(r: *q.Runner, path: []const u8) !void {
+    const d = &r.d;
+    const a = &r.acts;
+    const fd = open(try std.fmt.allocPrintSentinel(alloc, "{s}", .{path}, 0), 0);
+    if (fd < 0) return error.FileNotFound;
+    const size: usize = @intCast(lseek(fd, 0, 2));
+    const bin: [*]const u8 = @ptrCast(mmap(null, size, 1, 2, fd, 0) orelse return error.MmapFailed);
+    const copy = try alloc.alignedAlloc(u8, .@"8", size);
+    @memcpy(copy, bin[0..size]);
+    const k = try d.kernel(try d.g.module(copy), "w4g_dpb", 256);
+    const w = r.model.layers[0].gu;
+    const T = q.CHUNK;
+    const tiles = (T + 63) / 64;
+    const args = .{ a.h, w.w, w.s, w.bg, a.p, @as(i32, @intCast(T)), @as(i32, @intCast(w.n)), @as(i32, @intCast(w.k)), a.ahi, a.alo, @as(i32, @intCast((T + 7) / 8 * 8)), @as(i32, @intCast(w.k / w.gs)) };
+    for (0..20) |_| try d.launch(k, .{ .x = 8, .y = w.n / 256, .z = (tiles + 7) / 8 }, args);
+    try d.sync();
+    const t0 = q.now();
+    for (0..4000) |_| try d.launch(k, .{ .x = 8, .y = w.n / 256, .z = (tiles + 7) / 8 }, args);
+    try d.sync();
+    const dt = (q.now() - t0) / 4000;
+    const flops = 2.0 * @as(f64, @floatFromInt(T)) * @as(f64, @floatFromInt(w.n)) * @as(f64, @floatFromInt(w.k));
+    std.debug.print("gemm loop {s}: {d:.3} ms a call, {d:.1} TFLOPS\n", .{ path, dt * 1e3, flops / dt / 1e12 });
 }
