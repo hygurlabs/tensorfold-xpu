@@ -12,8 +12,7 @@
 
 static inline float bf2f(ushort h) { return as_float((uint)h << 16); }
 static inline ushort f2bf(float f) {                   // au plus proche pair
-  const uint u = as_uint(f);
-  return (ushort)((u + 0x7FFFu + ((u >> 16) & 1u)) >> 16);
+  return intel_convert_bfloat16_as_ushort(f); // conversion matérielle (au plus proche pair)
 }
 static inline float rbf(float f) { return bf2f(f2bf(f)); }
 static inline float silu(float x) { return x / (1.0f + exp(-x)); }

@@ -5,8 +5,7 @@
 
 static inline float bf2f(ushort h) { return as_float((uint)h << 16); }
 static inline ushort f2bf(float f) {
-  const uint u = as_uint(f);
-  return (ushort)((u + 0x7FFFu + ((u >> 16) & 1u)) >> 16);
+  return intel_convert_bfloat16_as_ushort(f); // conversion matérielle (au plus proche pair)
 }
 
 // Table d'arbre d'un bloc vérifié (≤ 16 lignes) : TREE[t·17] = profondeur de la ligne t (bits 0-7), plus SAVE (son
