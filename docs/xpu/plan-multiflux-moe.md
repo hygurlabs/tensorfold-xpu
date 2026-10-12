@@ -170,3 +170,18 @@ code / français :
 Sans rotation, l'int4 des activations est inutilisable ; avec, la perte tombe à 1,5-4 %, portée surtout par gate|up.
 Les poids RTN tournés battent le GPTQ calibré, dès le W4A8. L'int4 sur down seul (ou sur les sorties de mixer) reste au
 niveau du GPTQ actuel.
+
+**Intégration (2026-10-13)** : checkpoint tourné détecté par le fichier `hadamard128` ; chaque entrée de GEMM est tournée là
+où elle est produite (normes, portes d'attention et de GDN, SwiGLU ; portes a/b tournées dans le checkpoint), le flux
+résiduel et la tête non. Chemin réel, perplexité face au GPTQ W4A16 (doc / code / français) et préremplissage à 6,7 k :
+
+| | perplexité | préremplissage |
+|---|---|---|
+| GPTQ + W4A8 | +0,17 / +0,11 / +0,15 % | 2 552 tok/s |
+| tourné + W4A8 | −0,25 / −0,61 / −0,46 % | 2 517 tok/s |
+| tourné + W4A8, int4 sur down (`XPU_PREFILL_INT4=1`) | 0,00 / −0,32 / +0,57 % | 2 753 tok/s |
+| tourné + W4A8, int4 sur down et sorties de mixer | +1,09 / +0,02 / +1,06 % | 2 813 tok/s |
+
+Le GEMM W4A4 (`W4A8Prompt` avec `a4`, `ngen_a4`) prend les mots de poids tels quels comme opérande u4 (8 valeurs de K
+par mot, ordre des quartets de `repack_gptq`, reproduit par `quant_a4`) : down et sorties de mixer passent de 635 à
+385 ms. Le brouillonneur DFlash2 accepte un peu moins sur les poids tournés (4,1 jetons par tour contre 4,7).
