@@ -274,9 +274,51 @@ KERNEL(256) void gated_norm(global const ushort *Y, global const half *P, global
 // Attention, avant le noyau : P = sortie du GEMM attn.qkv fp16 [T, 14 336] = (q 256 | porte 256) × 24 | k 4 × 256 |
 // v 4 × 256. q et k : RMS par tête avec poids, arrondi bf16, RoPE sur les 64 premières dimensions (moitiés de 32,
 // θ^(−i/32)), arrondi bf16. Q [T, 24, 256] ; K, V écrits au cache [L, 4, 256] à la position p0 + t.
+// Rotation de Hadamard d'une tête de 256 (Sylvester, normée par 1/16), répartie sur le sous-groupe : le couloir tient
+// les dimensions 16 i + couloir. Quatre étages entre couloirs (shuffle), quatre dans le couloir. Orthogonale et
+// symétrique : elle est sa propre inverse, et (qH)·(kH) = q·k.
+static void fwht256(float v[16]) {
+  const int lane = get_sub_group_local_id();
+  for (int m = 1; m < 16; m <<= 1)
+    for (int i = 0; i < 16; i++) {
+      const float o = sub_group_shuffle_xor(v[i], m);
+      v[i] = (lane & m) ? o - v[i] : v[i] + o;
+    }
+  for (int m = 1; m < 16; m <<= 1)
+    for (int i = 0; i < 16; i++)
+      if (!(i & m)) {
+        const float a = v[i], b = v[i | m];
+        v[i] = a + b;
+        v[i | m] = a - b;
+      }
+  for (int i = 0; i < 16; i++) v[i] *= 1.0f / 16.0f;
+}
+
+// Étude du cache K/V : une tête quantifiée en entiers symétriques de `levels` pas de chaque côté (127 : int8, 7 : int4,
+// échelle max |x| / levels) puis remise en float.
+static void quant8_head(float v[16], float levels) {
+  float m = 0.0f;
+  for (int i = 0; i < 16; i++) m = fmax(m, fabs(v[i]));
+  m = sub_group_reduce_max(m);
+  const float s = m > 0.0f ? m / levels : 1.0f;
+  for (int i = 0; i < 16; i++) v[i] = rint(v[i] / s) * s;
+}
+
+// Sortie de l'attention ramenée de la base tournée (KV8 & 1) : O bf16 [T, 24, 256], grille (T, 24).
+KERNEL(16) void rot_heads(global ushort *O) {
+  const int t = get_group_id(0), hh = get_group_id(1), lane = get_sub_group_local_id();
+  global ushort *o = O + ((long)t * 24 + hh) * 256;
+  float v[16];
+  for (int i = 0; i < 16; i++) v[i] = bf2f(o[i * 16 + lane]);
+  fwht256(v);
+  for (int i = 0; i < 16; i++) o[i * 16 + lane] = f2bf(v[i]);
+}
+
 KERNEL(256) void attn_prep(global const half *P, global const ushort *QN, global const ushort *KN,
                            global const float *INVF, global ushort *Q, global ushort *KC, global ushort *VC, int p0,
-                           float eps, global const int *TREE, global const ulong *MT, global const int *POS) {
+                           float eps, global const int *TREE, global const ulong *MT, global const int *POS, int kv8) {
+  // kv8 (étude du cache K/V) : & 1 q, k, v tournés par Hadamard ; & 2 k, v quantifiés par (jeton, tête), en int8, ou
+  // en int4 avec & 4
   // TREE (si non nul) : la position de la ligne t est p0 + sa profondeur ; ses K, V restent rangés à p0 + t.
   // MT (si non nul) : plusieurs flux, une ligne chacun : caches MT[8t], MT[8t + 1], position POS[t], où K, V vont.
   const int t = get_group_id(0), sg = get_sub_group_id(), lane = get_sub_group_local_id();
@@ -288,8 +330,11 @@ KERNEL(256) void attn_prep(global const half *P, global const ushort *QN, global
   }
   for (int hh = sg; hh < 32; hh += 16) {               // 0-23 : q, 24-27 : k, 28-31 : v
     if (hh >= 28) {
-      for (int i = 0; i < 16; i++)
-        VC[(krow * 4 + hh - 28) * 256 + i * 16 + lane] = f2bf((float)P[(long)t * 14336 + 13312 + (hh - 28) * 256 + i * 16 + lane]);
+      float vv[16];
+      for (int i = 0; i < 16; i++) vv[i] = (float)P[(long)t * 14336 + 13312 + (hh - 28) * 256 + i * 16 + lane];
+      if (kv8 & 1) fwht256(vv);
+      if (kv8 & 2) quant8_head(vv, (kv8 & 4) ? 7.0f : 127.0f);
+      for (int i = 0; i < 16; i++) VC[(krow * 4 + hh - 28) * 256 + i * 16 + lane] = f2bf(vv[i]);
       continue;
     }
     const bool isq = hh < 24;
@@ -308,6 +353,8 @@ KERNEL(256) void attn_prep(global const half *P, global const ushort *QN, global
       v[i] = x1 * c - x2 * s;
       v[i + 2] = x2 * c + x1 * s;
     }
+    if (kv8 & 1) fwht256(v);
+    if ((kv8 & 2) && !isq) quant8_head(v, (kv8 & 4) ? 7.0f : 127.0f);
     global ushort *dst = isq ? Q + ((long)t * 24 + hh) * 256 : KC + (krow * 4 + hh - 24) * 256;
     for (int i = 0; i < 16; i++) dst[i * 16 + lane] = f2bf(v[i]);
   }

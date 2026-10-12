@@ -117,3 +117,21 @@ mémoire. Même parfait (~15 opérations par poids, `dp4a` pour la somme des oct
 1,6 fois notre int4, quelle que soit la largeur. Au prompt, son décodage par tuile est 10 à 15 fois plus coûteux que
 notre dépliage int4, sans voie int8 possible (valeurs fp16 non uniformes). **Pas de gain de vitesse sur cette
 carte** ; seul intérêt restant : la capacité (un 70B dense en 3 bits ≈ 26 Go) et la justesse aux bas débits.
+
+## 5. Cache K/V en 8 et 4 bits, rotation de Hadamard (étudié le 2026-10-12)
+
+Mode d'étude `XPU_KV8` (`attn_prep`, `rot_heads`) : q, k, v tournés par Hadamard (256 par tête, la sortie ramenée avant
+o_proj : (qH)·(kH) = q·k), k et v quantifiés par (jeton, tête) puis remis en bf16. Perplexité sur les trois textes bruts
+de l'étude W4A8 (GPTQ), écart au cache bf16 :
+
+| | doc | code | français |
+|---|---|---|---|
+| rotation seule (bruit d'arrondi) | +0,00 %, KL 2,9e-4 | +0,03 %, 3,7e-4 | +0,01 %, 3,7e-4 |
+| int8 | −0,05 %, 4,4e-4 | +0,02 %, 5,1e-4 | +0,06 %, 4,9e-4 |
+| rotation + int8 | −0,02 %, 3,4e-4 | +0,04 %, 4,6e-4 | +0,00 %, 4,2e-4 |
+| int4 | +1,10 %, 2,0e-2 | +0,58 %, 1,9e-2 | +1,90 %, 2,9e-2 |
+| rotation + int4 | +0,30 %, 8,1e-3 | +0,00 %, 8,4e-3 | +0,90 %, 1,2e-2 |
+
+Le cache int8 est sans perte mesurable, rotation ou non ; la rotation divise par 2,4 l'erreur de l'int4, qui reste
+au-dessus du W4A8. Pour l'écrire vraiment en int8 il faut que l'attention du prompt lise l'int8 : le noyau Triton
+capturé ne le sait pas, d'où une attention de prompt maison.
