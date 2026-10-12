@@ -306,11 +306,13 @@ KERNEL(256) void attn_gate(global const ushort *O, global const half *P, global 
 KERNEL(256) void swiglu(global const half *GU, global half *H, global half *AHI, global half *ALO, int gs) {
   local half hl[1024];
   const int t = get_group_id(0), blk = get_group_id(1), lid = get_local_id(0);
-  for (int e = lid; e < 1024; e += 256) {
-    const int c = blk * 1024 + e;
-    const half o = convert_half_rte(rbf(silu((float)GU[(long)t * 34816 + c]) * (float)GU[(long)t * 34816 + 17408 + c]));
-    H[(long)t * 17408 + c] = o;
-    hl[e] = o;
+  {                                                   // 4 colonnes consécutives par fil, lectures et écriture vectorielles
+    const int e = lid * 4, c = blk * 1024 + e;
+    const half4 gv = vload4(0, GU + (long)t * 34816 + c), uv = vload4(0, GU + (long)t * 34816 + 17408 + c);
+    half4 o;
+    for (int i = 0; i < 4; i++) o[i] = convert_half_rte(rbf(silu((float)gv[i]) * (float)uv[i]));
+    vstore4(o, 0, H + (long)t * 17408 + c);
+    vstore4(o, 0, hl + e);
   }
   barrier(CLK_LOCAL_MEM_FENCE);
   const int lane = get_sub_group_local_id(), per = gs / 16, ng = 1024 / gs;
