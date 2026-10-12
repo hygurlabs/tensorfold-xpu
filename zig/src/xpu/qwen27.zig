@@ -93,7 +93,7 @@ pub const Dev = struct {
     staging: []u8 = &.{}, // USM host memory: the driver cannot copy from file-backed mmap pages directly
     allocated: usize = 0, // device bytes allocated (frees not counted: buffers live as long as the runner)
     k: struct {
-        embed: ze.H, add_rmsnorm: ze.H, gdn_pre: ze.H, gdn_pre_rows: ze.H, gated_norm: ze.H, attn_prep: ze.H, attn_gate: ze.H,
+        embed: ze.H, add_rmsnorm_dec: ze.H, add_rmsnorm: ze.H, gdn_pre: ze.H, gdn_pre_rows: ze.H, gated_norm: ze.H, attn_prep: ze.H, attn_gate: ze.H,
         swiglu: ze.H, argmax: ze.H, argmax_part: ze.H, tap: ze.H, conv_commit: ze.H, repack: ze.H, gdn_step: ze.H, attn_decode: ze.H, attn_merge: ze.H, kv_move: ze.H, exl3_gemv: ze.H, rot_heads: ze.H, attn_prompt: ze.H, attn_prompt8: ze.H,
         embed_dense: ze.H, dense_rows: ze.H, repack_gptq: ze.H, quantize_mlx: ze.H,
         dec_wide_g128: ze.H, dec_wide64_g128: ze.H, dec_narrow_g128: ze.H, ngen_wide_g128: ze.H, ngen_narrow_g128: ze.H,
@@ -750,7 +750,7 @@ fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mode) 
     try embedRows(d, m, a.ids, a.x, T);
     if (p0 == 0) try dump(d, a, T, "embed", false);
     for (&m.layers, 0..) |*l, i| {
-        try d.launch(d.k.add_rmsnorm, .{ .x = T }, .{ a.x, a.r, l.in_norm, a.h, a.ahi, a.alo, @as(i32, D), EPS, @as(i32, if (i == 0) 0 else 1), gs, q8a, q8s, q8ms });
+        try d.launch(if (T > 16) d.k.add_rmsnorm else d.k.add_rmsnorm_dec, .{ .x = T }, .{ a.x, a.r, l.in_norm, a.h, a.ahi, a.alo, @as(i32, D), EPS, @as(i32, if (i == 0) 0 else 1), gs, q8a, q8s, q8ms });
         const probe = p0 == 0 and i == 0;
         if (probe) try dumpBuf(d, "h0", a.h, T * D, .f16);
         // W4A8 study: the GEMM reads a quantized copy (in r, free until mixer_out); the dense a/b gates read h as is
@@ -834,7 +834,7 @@ fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mode) 
         try a8(d, a, a.h, 6144, T, 2);
         try pgemm(d, a, a.h, l.mixer_out, a.r, T, false);
         if (probe) try dumpBuf(d, "r0", a.r, T * D, .f16);
-        try d.launch(d.k.add_rmsnorm, .{ .x = T }, .{ a.x, a.r, l.post_norm, a.h, a.ahi, a.alo, @as(i32, D), EPS, @as(i32, 1), gs, q8a, q8s, q8ms });
+        try d.launch(if (T > 16) d.k.add_rmsnorm else d.k.add_rmsnorm_dec, .{ .x = T }, .{ a.x, a.r, l.post_norm, a.h, a.ahi, a.alo, @as(i32, D), EPS, @as(i32, 1), gs, q8a, q8s, q8ms });
         try a8(d, a, a.h, D, T, 4);
         const act = try mlpIn(d, a, l.gu, T, gs, q8on);
         try a8(d, a, act, 17408, T, 8);
@@ -848,7 +848,7 @@ fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mode) 
         return null;
     }
     const hgs: i32 = @intCast(m.head.gs);
-    try d.launch(d.k.add_rmsnorm, .{ .x = T }, .{ a.x, a.r, m.norm, a.h, a.ahi, a.alo, @as(i32, D), EPS, @as(i32, 1), hgs, no_q8, no_q8, @as(i32, 0) });
+    try d.launch(if (T > 16) d.k.add_rmsnorm else d.k.add_rmsnorm_dec, .{ .x = T }, .{ a.x, a.r, m.norm, a.h, a.ahi, a.alo, @as(i32, D), EPS, @as(i32, 1), hgs, no_q8, no_q8, @as(i32, 0) });
     if (dump_h) |fd| {                               // XPU_DUMP_H: every row's final normed hidden state, appended
         const host = try alloc.alloc(u16, T * D);
         defer alloc.free(host);
@@ -949,7 +949,7 @@ pub const Runner = struct {
         const mn128 = try d.g.module(&kb.ngen_narrow128);
         const mpa = try d.g.module(&kb.prompt_attention);
         d.k = .{
-            .embed = try d.kernel(mg, "embed", 256), .add_rmsnorm = try d.kernel(mg, "add_rmsnorm", 512),
+            .embed = try d.kernel(mg, "embed", 256), .add_rmsnorm = try d.kernel(mg, "add_rmsnorm", 128), .add_rmsnorm_dec = try d.kernel(mg, "add_rmsnorm_dec", 512),
             .gdn_pre = try d.kernel(mg, "gdn_pre", 256), .gdn_pre_rows = try d.kernel(mg, "gdn_pre_rows", 256), .gated_norm = try d.kernel(mg, "gated_norm", 256),
             .attn_prep = try d.kernel(mg, "attn_prep", 256), .attn_gate = try d.kernel(mg, "attn_gate", 256),
             .swiglu = try d.kernel(mg, "swiglu", 256), .argmax = try d.kernel(mg, "argmax", 256), .argmax_part = try d.kernel(mg, "argmax_part", 256), .tap = try d.kernel(mg, "tap", 256), .conv_commit = try d.kernel(mg, "conv_commit", 256),

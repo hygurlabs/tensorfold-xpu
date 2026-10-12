@@ -101,9 +101,53 @@ KERNEL(256) void dense_rows(global const half *H, global const half *W, global h
 // x ← bf16(x + r) (si R), h = fp16(bf16(rms(x)·w)), et ses sommes de ligne. Un groupe de 512 par ligne (10 valeurs
 // par fil pour D = 5 120 ; 512 est le plafond en mode 256 registres) ; somme des carrés : sous-groupes, puis les 32
 // sommes partielles dans l'ordre.
-KERNEL(512) void add_rmsnorm(global float *X, global const half *R, global const ushort *WN, global half *H,
+KERNEL(128) void add_rmsnorm(global float *X, global const half *R, global const ushort *WN, global half *H,
                               global half *AHI, global half *ALO, int D, float eps, int has_r, int gs,
                               global char *A8, global float *SA, int MS) {
+  // 128 fils par ligne (plusieurs groupes par cœur Xe en mode 256 registres), 4 éléments consécutifs par lecture :
+  // le fil prend les éléments 4 (128 i + fil) … + 3 ; D multiple de 512, au plus 5 120.
+  local float red[8];
+  local half hl[5120];
+  const int t = get_group_id(0), lid = get_local_id(0);
+  float4 xv[10];
+  float ss = 0.0f;
+  for (int i = 0; i < D / 512; i++) {
+    const int e = (i * 128 + lid) * 4;
+    float4 x = vload4(0, X + (long)t * D + e);
+    if (has_r) {
+      const float4 r = convert_float4(vload4(0, R + (long)t * D + e));
+      x = (float4)(rbf(x.s0 + r.s0), rbf(x.s1 + r.s1), rbf(x.s2 + r.s2), rbf(x.s3 + r.s3));
+      vstore4(x, 0, X + (long)t * D + e);
+    }
+    xv[i] = x;
+    ss += x.s0 * x.s0 + x.s1 * x.s1 + x.s2 * x.s2 + x.s3 * x.s3;
+  }
+  const float s = sub_group_reduce_add(ss);
+  if (get_sub_group_local_id() == 0) red[get_sub_group_id()] = s;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  float tot = 0.0f;
+  for (int i = 0; i < 8; i++) tot += red[i];
+  const float inv = rsqrt(tot / D + eps);
+  for (int i = 0; i < D / 512; i++) {
+    const int e = (i * 128 + lid) * 4;
+    const ushort4 w = vload4(0, WN + e);
+    const half4 v = (half4)(convert_half_rte(rbf(xv[i].s0 * inv * bf2f(w.s0))), convert_half_rte(rbf(xv[i].s1 * inv * bf2f(w.s1))),
+                            convert_half_rte(rbf(xv[i].s2 * inv * bf2f(w.s2))), convert_half_rte(rbf(xv[i].s3 * inv * bf2f(w.s3))));
+    vstore4(v, 0, H + (long)t * D + e);
+    vstore4(v, 0, hl + e);
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  if (A8)                                             // W4A8 : h quantifié pour la projection suivante
+    quant_row(hl, D, A8, SA, MS, AHI, ALO, t);
+  else
+    rowsums(hl, D, AHI, ALO, t, gs);
+}
+
+// Même calcul, 512 fils par ligne : pour le décodage et la vérification (16 lignes au plus), où la ligne doit occuper
+// plus de fils.
+KERNEL(512) void add_rmsnorm_dec(global float *X, global const half *R, global const ushort *WN, global half *H,
+                                  global half *AHI, global half *ALO, int D, float eps, int has_r, int gs,
+                                  global char *A8, global float *SA, int MS) {
   local float red[32];
   local half hl[5120];
   const int t = get_group_id(0), lid = get_local_id(0);
