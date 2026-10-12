@@ -96,6 +96,7 @@ pub const Dev = struct {
         embed_dense: ze.H, dense_rows: ze.H, repack_gptq: ze.H, quantize_mlx: ze.H,
         dec_wide_g128: ze.H, dec_wide64_g128: ze.H, dec_narrow_g128: ze.H, ngen_wide_g128: ze.H, ngen_narrow_g128: ze.H,
         ngen_swiglu: ze.H, ngen_swiglu_g128: ze.H, rowsums_ff: ze.H, fakequant_rows: ze.H,
+        a8: ze.H, a8_swiglu: ze.H, quant_a8: ze.H,
         dec_wide: ze.H, dec_wide64: ze.H, dec_narrow: ze.H, gdn_prep: ze.H, gdn_state: ze.H, gdn_out: ze.H, ngen_wide: ze.H,
         ngen_narrow: ze.H, prompt_attn: ze.H,
     },
@@ -181,8 +182,8 @@ const Prof = struct {
     events: [4096]ze.H = @splat(null),
     kernel: [4096]ze.H = @splat(null),
     used: usize = 0,
-    names: [40]struct { k: ze.H = null, name: []const u8 = "" } = @splat(.{}),
-    total: [40]f64 = @splat(0),
+    names: [64]struct { k: ze.H = null, name: []const u8 = "" } = @splat(.{}),
+    total: [64]f64 = @splat(0),
 };
 pub var prof: Prof = .{};
 
@@ -513,6 +514,8 @@ pub const Acts = struct {
     tree: *anyopaque, // i32 [16, 17]: the verified block's tree table (decode.cl, DEPTH and ANC)
     path: *anyopaque, // i32 [16]: the rows of the kept path
     sl: *anyopaque, // fp32 [16, 48, 128, 128]: GDN state after each row of a verified tree
+    a8: *anyopaque, // W4A8 prompt: activations int8 [CHUNK, FF] (permuted by blocks of 8) …
+    sa: *anyopaque, // … and their scales fp32 [FF / 128, CHUNK + 32]
 
     fn init(d: *Dev) !Acts {
         const nc = CHUNK / 64;
@@ -530,6 +533,7 @@ pub const Acts = struct {
             .zeros = try d.alloc_(CHUNK * 48 * 128 * 2), .ones = try d.alloc_(CHUNK * 48 * 4),
             .chain = try d.upload(std.mem.sliceAsBytes(&chainTable())), .tree = try d.alloc_(16 * 17 * 4), .path = try d.alloc_(16 * 4),
             .sl = try d.alloc_(16 * 48 * 128 * 128 * 4),
+            .a8 = try d.alloc_(CHUNK * FF), .sa = try d.alloc_((FF / 128) * (CHUNK + 32) * 4),
         };
     }
 };
@@ -547,6 +551,11 @@ fn chainTable() [16 * 17]i32 {
 /// gate|up and SwiGLU: the activation (fp16 [T, 17 408]) and its row sums; returns the buffer holding it. Prompt rows:
 /// the GEMM's SwiGLU epilogue writes it into P; decode rows: the GEMM into P, then `swiglu` into H.
 fn mlpIn(d: *Dev, a: *Acts, w: Proj, T: u32, gs: i32) !*anyopaque {
+    if (prefill_int8 and T > 16 and w.ilv and w.gs == 128) { // W4A8: SwiGLU epilogue; down quantizes its own input
+        try quantA8(d, a, a.h, w.k, T);
+        try d.launch(d.k.a8_swiglu, a8Groups(w, T), a8Args(a, w, a.p, T));
+        return a.p;
+    }
     if (T > 16 and w.ilv) {
         const M: i32 = @intCast(T);
         const tiles = (T + 63) / 64;
@@ -656,6 +665,25 @@ var dump_h: ?c_int = null;
 /// W4A8 study (XPU_A8 = 128: int8 activations by groups of 128; "token": one scale a row): prompt GEMM inputs quantized
 /// and dequantized in place before each projection. 0: off.
 var a8_group: u32 = 0;
+/// W4A8 prompt GEMMs (XPU_PREFILL_INT8, local option, GPTQ g128 only): int8 activations by (row, group of 128).
+pub var prefill_int8 = false;
+
+/// Prompt GEMM: W4A8 when the option is on and the rows are prompt rows, else the fp16 GEMM.
+fn pgemm(d: *Dev, a: *Acts, x: *anyopaque, w: Proj, out: *anyopaque, T: u32) !void {
+    if (!prefill_int8 or T <= 16 or w.gs != 128) return gemm(d, a.pscr, x, a.ahi, a.alo, w, out, T);
+    try quantA8(d, a, x, w.k, T);
+    try d.launch(d.k.a8, a8Groups(w, T), a8Args(a, w, out, T));
+}
+fn quantA8(d: *Dev, a: *Acts, x: *anyopaque, K: u32, T: u32) !void {
+    try d.launch(d.k.quant_a8, .{ .x = T }, .{ x, a.a8, a.sa, a.ahi, a.alo, @as(i32, @intCast(K)), @as(i32, @intCast(CHUNK + 32)) });
+}
+fn a8Groups(w: Proj, T: u32) ze.GroupCount {
+    const tiles = (T + 63) / 64;
+    return .{ .x = 8, .y = w.n / 256, .z = (tiles + 7) / 8 };
+}
+fn a8Args(a: *Acts, w: Proj, out: *anyopaque, T: u32) struct { *anyopaque, *anyopaque, *anyopaque, *anyopaque, *anyopaque, i32, i32, i32, *anyopaque, *anyopaque, i32, i32, *anyopaque } {
+    return .{ a.a8, w.w, w.s, w.bg, out, @intCast(T), @intCast(w.n), @intCast(w.k), a.ahi, a.alo, @intCast(CHUNK + 32), @intCast(w.k / 128), a.sa };
+}
 var a8_sites: u32 = 15; // XPU_A8_SITES: 1 mixer in, 2 mixer out, 4 gate|up, 8 down
 
 fn a8(d: *Dev, a: *Acts, x: *anyopaque, K: u32, T: u32, site: u32) !void {
@@ -688,7 +716,7 @@ fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mode) 
         const min_in = if (a8_group != 0 and T > 16 and a8_sites & 1 != 0) a.r else a.h;
         if (min_in != a.h) try copy(d, a.r, a.h, T * D * 2);
         try a8(d, a, min_in, D, T, 1);
-        try gemm(d, a.pscr, min_in, a.ahi, a.alo, l.mixer_in, a.p, T);
+        try pgemm(d, a, min_in, l.mixer_in, a.p, T);
         if (l.ab) |ab| try d.launch(d.k.dense_rows, .{ .x = (T + 15) / 16, .y = 96 / 16 }, .{ a.h, ab, a.p, t32, @as(i32, GDN_IN), @as(i32, 16384) });
         if (probe) try dumpBuf(d, "p0", a.p, T * GDN_IN, .f16);
         if (l.attn) {
@@ -756,13 +784,13 @@ fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mode) 
             if (probe) try dumpBuf(d, "o0", a.h, T * 6144, .f16);
         }
         try a8(d, a, a.h, 6144, T, 2);
-        try gemm(d, a.pscr, a.h, a.ahi, a.alo, l.mixer_out, a.r, T);
+        try pgemm(d, a, a.h, l.mixer_out, a.r, T);
         if (probe) try dumpBuf(d, "r0", a.r, T * D, .f16);
         try d.launch(d.k.add_rmsnorm, .{ .x = T }, .{ a.x, a.r, l.post_norm, a.h, a.ahi, a.alo, @as(i32, D), EPS, @as(i32, 1), gs });
         try a8(d, a, a.h, D, T, 4);
         const act = try mlpIn(d, a, l.gu, T, gs);
         try a8(d, a, act, 17408, T, 8);
-        try gemm(d, a.pscr, act, a.ahi, a.alo, l.down, a.r, T);
+        try pgemm(d, a, act, l.down, a.r, T);
         if (p0 == 0 and i < 4) try dump(d, a, T, try std.fmt.allocPrint(alloc, "{d}", .{i}), true);
         if (mode.taps) for (TAP_LAYERS, 0..) |tl, slot| if (tl == i)
             try d.launch(d.k.tap, .{ .x = D / 256, .y = T }, .{ a.x, a.r, a.taps, @as(i32, D), @as(i32, @intCast(slot)) });
@@ -821,6 +849,7 @@ pub const Runner = struct {
     /// Loads `dir` (MLX affine 4/64) onto the first B70 with room for `context` positions.
     pub fn init(dir: []const u8, context: u32) !*Runner {
         if (std.c.getenv("XPU_DUMP")) |v| dump_dir = std.mem.span(v);
+        if (std.c.getenv("XPU_PREFILL_INT8") != null) prefill_int8 = true;
         if (std.c.getenv("XPU_A8_SITES")) |v| a8_sites = try std.fmt.parseInt(u32, std.mem.span(v), 10);
         if (std.c.getenv("XPU_A8")) |v| a8_group = if (std.mem.eql(u8, std.mem.span(v), "token")) std.math.maxInt(u32) else try std.fmt.parseInt(u32, std.mem.span(v), 10);
         if (std.c.getenv("XPU_DUMP_H")) |v| dump_h = open(v, 0o2101, @as(c_uint, 0o644)); // O_WRONLY | O_CREAT | O_APPEND
@@ -874,6 +903,8 @@ pub const Runner = struct {
             .ngen_swiglu = try d.kernel(try d.g.module(&kb.ngen_swiglu), "w4g_dpb_swiglu", 256),
             .ngen_swiglu_g128 = try d.kernel(try d.g.module(&kb.ngen_swiglu128), "w4g_dpb_swiglu", 256),
             .rowsums_ff = try d.kernel(mg, "rowsums_ff", 256), .fakequant_rows = try d.kernel(mg, "fakequant_rows", 256),
+            .a8 = try d.kernel(try d.g.module(&kb.ngen_a8), "w4a8", 256), .a8_swiglu = try d.kernel(try d.g.module(&kb.ngen_a8_swiglu), "w4a8_swiglu", 256),
+            .quant_a8 = try d.kernel(mg, "quant_a8", 256),
             .dec_wide = try d.kernel(mm, "w4k1_decode", 64), .dec_wide64 = try d.kernel(mm, "w4k1_d64", 64), .dec_narrow = try d.kernel(mm, "w4k_dsplit", 64),
             .gdn_prep = try d.kernel(mgd, "gdn_prep", 64), .gdn_state = try d.kernel(mgd, "gdn_state", 256),
             .gdn_out = try d.kernel(mgd, "gdn_out", 128), .ngen_wide = try d.kernel(mw, "w4g_dpb", 256),

@@ -361,6 +361,38 @@ KERNEL(256) void fakequant_rows(global half *X, global half *AHI, global half *A
   rowsums(hl, K, AHI, ALO, t, gs);
 }
 
+// W4A8 du prompt : quantification des activations. Ligne t de X fp16 [T, K] en int8 symétrique par groupe de 128
+// (échelle s = max |x| / 127 dans SA [K/128, MS] fp32), rangée dans A8 [T, K] par blocs de 8 dans l'ordre
+// [k0, k4, k1, k5, k2, k6, k3, k7] (celui du dépliage des mots dans w4a8) ; AHI, ALO : Σ (s·q) / 128 en hi/lo fp16,
+// la somme des activations déquantifiées (terme de biais). Un groupe de 256 par ligne ; le couloir tient 8 K.
+KERNEL(256) void quant_a8(global const half *X, global char *A8, global float *SA, global half *AHI, global half *ALO,
+                          int K, int MS) {
+  const int t = get_group_id(0), lane = get_sub_group_local_id();
+  for (int g = get_sub_group_id(); g < K / 128; g += get_num_sub_groups()) {
+    const half8 xv = vload8(0, X + (long)t * K + g * 128 + lane * 8);
+    float m = 0.0f;
+    for (int j = 0; j < 8; j++) m = fmax(m, fabs((float)xv[j]));
+    m = sub_group_reduce_max(m);
+    const float s = m > 0.0f ? m / 127.0f : 1.0f;
+    char8 q;
+    int qs = 0;
+    for (int j = 0; j < 8; j++) {
+      const int v = (int)clamp(rint((float)xv[j] / s), -127.0f, 127.0f);
+      q[(j % 4) * 2 + j / 4] = (char)v;
+      qs += v;
+    }
+    vstore8(q, 0, A8 + (long)t * K + g * 128 + lane * 8);
+    qs = sub_group_reduce_add(qs);
+    if (lane == 0) {
+      SA[(long)g * MS + t] = s;
+      const float a = s * (float)qs * (1.0f / 128.0f);
+      const half hi = convert_half_rte(a);
+      AHI[(long)t * (K / 128) + g] = hi;
+      ALO[(long)t * (K / 128) + g] = convert_half_rte(a - (float)hi);
+    }
+  }
+}
+
 // Arg max de chaque ligne de logits fp16 [T, V] (le premier indice en cas d'égalité), en deux noyaux : maxima
 // partiels de 256 groupes par ligne (grille (256, T) ; PV, PI [T, 256]), puis le maximum des partiels (grille T).
 KERNEL(256) void argmax_part(global const half *L, int V, global float *PV, global int *PI) {
