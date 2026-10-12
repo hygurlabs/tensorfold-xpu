@@ -286,16 +286,16 @@ KERNEL(256) void swiglu(global const half *GU, global half *H, global half *AHI,
   }
 }
 
-// Arg max d'une ligne de logits fp16 [V] (le premier indice en cas d'égalité), en deux noyaux : maxima partiels de
-// 256 groupes (PART [256] : valeur, indice), puis le maximum des partiels.
+// Arg max de chaque ligne de logits fp16 [T, V] (le premier indice en cas d'égalité), en deux noyaux : maxima
+// partiels de 256 groupes par ligne (grille (256, T) ; PV, PI [T, 256]), puis le maximum des partiels (grille T).
 KERNEL(256) void argmax_part(global const half *L, int V, global float *PV, global int *PI) {
   local float bv[256];
   local int bi[256];
-  const int lid = get_local_id(0), gid = get_group_id(0), per = (V + 255) / 256;
+  const int lid = get_local_id(0), gid = get_group_id(0), row = get_group_id(1), per = (V + 255) / 256;
   float best = -INFINITY;
   int idx = 0x7fffffff;
   for (int i = gid * per + lid; i < min(V, (gid + 1) * per); i += 256) {
-    const float v = (float)L[i];
+    const float v = (float)L[(long)row * V + i];
     if (v > best) { best = v; idx = i; }
   }
   bv[lid] = best;
@@ -304,23 +304,39 @@ KERNEL(256) void argmax_part(global const half *L, int V, global float *PV, glob
   if (lid == 0) {
     for (int i = 1; i < 256; i++)
       if (bv[i] > best || (bv[i] == best && bi[i] < idx)) { best = bv[i]; idx = bi[i]; }
-    PV[gid] = best;
-    PI[gid] = idx;
+    PV[row * 256 + gid] = best;
+    PI[row * 256 + gid] = idx;
   }
 }
 KERNEL(256) void argmax(global const float *PV, global const int *PI, global int *OUT) {
   local float bv[256];
   local int bi[256];
-  const int lid = get_local_id(0);
-  bv[lid] = PV[lid];
-  bi[lid] = PI[lid];
+  const int lid = get_local_id(0), row = get_group_id(0);
+  bv[lid] = PV[row * 256 + lid];
+  bi[lid] = PI[row * 256 + lid];
   barrier(CLK_LOCAL_MEM_FENCE);
   if (lid == 0) {
     float best = bv[0];
     int idx = bi[0];
     for (int i = 1; i < 256; i++)
       if (bv[i] > best || (bv[i] == best && bi[i] < idx)) { best = bv[i]; idx = bi[i]; }
-    OUT[0] = idx;
+    OUT[row] = idx;
+  }
+}
+
+// Prises pour le brouillonneur : TAPS[t][slot·D + e] = bf16(x + r) (l'état caché complet après la couche), [T, 5 D].
+KERNEL(256) void tap(global const float *X, global const half *R, global ushort *TAPS, int D, int slot) {
+  const int t = get_group_id(1), e = get_global_id(0);
+  if (e < D) TAPS[(long)t * 5 * D + slot * D + e] = f2bf(rbf(X[(long)t * D + e] + (float)R[(long)t * D + e]));
+}
+
+// État de convolution après les KEEP premières lignes d'un bloc : COUT = 3 dernières lignes de concat(CIN, qkv[0..KEEP)),
+// qkv lu dans P (pas 16 640). Grille 40 groupes de 256 canaux.
+KERNEL(256) void conv_commit(global const half *CIN, global const half *P, global half *COUT, int keep) {
+  const int c = get_global_id(0);
+  for (int r = 0; r < 3; r++) {
+    const int i = keep + r;                           // ligne de concat(état, qkv), 3 + keep lignes
+    COUT[r * NCONV + c] = i < 3 ? CIN[i * NCONV + c] : P[(long)(i - 3) * 16640 + c];
   }
 }
 

@@ -20,6 +20,17 @@ var MAX_CTX: u32 = 4096; // KV cache rows (XPU_CTX)
 const SPLIT = 32; // keys per attention split (decode.cl)
 const EPS: f32 = 1e-6;
 
+// Layout of a GDN layer's stash (bytes): q, k, v, g, β, then the qkv rows of P.
+const ST_Q = 0;
+const ST_K = ST_Q + 16 * 16 * 128 * 2;
+const ST_V = ST_K + 16 * 16 * 128 * 2;
+const ST_G = ST_V + 16 * 48 * 128 * 2;
+const ST_B = ST_G + 16 * 48 * 4;
+const ST_P = ST_B + 16 * 48 * 4;
+const STASH = ST_P + 16 * GDN_IN * 2;
+/// Target layers whose hidden states feed the DFlash2 drafter (its config's target_layer_ids).
+const TAP_LAYERS = [5]usize{ 5, 19, 33, 47, 61 };
+
 fn isAttention(i: usize) bool {
     return (i + 1) % 4 == 0;
 }
@@ -76,7 +87,7 @@ const Dev = struct {
     staging: []u8 = &.{}, // USM host memory: the driver cannot copy from file-backed mmap pages directly
     k: struct {
         embed: ze.H, add_rmsnorm: ze.H, gdn_pre: ze.H, gdn_pre_rows: ze.H, gated_norm: ze.H, attn_prep: ze.H, attn_gate: ze.H,
-        swiglu: ze.H, argmax: ze.H, argmax_part: ze.H, repack: ze.H, gdn_step: ze.H, attn_decode: ze.H, attn_merge: ze.H,
+        swiglu: ze.H, argmax: ze.H, argmax_part: ze.H, tap: ze.H, conv_commit: ze.H, repack: ze.H, gdn_step: ze.H, attn_decode: ze.H, attn_merge: ze.H,
         dec_wide: ze.H, dec_wide64: ze.H, dec_narrow: ze.H, gdn_prep: ze.H, gdn_state: ze.H, gdn_out: ze.H, ngen_wide: ze.H,
         ngen_narrow: ze.H, prompt_attn: ze.H,
     },
@@ -148,6 +159,10 @@ const Dev = struct {
     }
 };
 
+fn copy(d: *Dev, dst: *anyopaque, src: *anyopaque, n: usize) !void {
+    try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, dst, src, n, null, 0, null));
+}
+
 fn off(p: *anyopaque, bytes: usize) *anyopaque {
     return @ptrFromInt(@intFromPtr(p) + bytes);
 }
@@ -158,8 +173,8 @@ const Prof = struct {
     events: [4096]ze.H = @splat(null),
     kernel: [4096]ze.H = @splat(null),
     used: usize = 0,
-    names: [23]struct { k: ze.H = null, name: []const u8 = "" } = @splat(.{}),
-    total: [23]f64 = @splat(0),
+    names: [25]struct { k: ze.H = null, name: []const u8 = "" } = @splat(.{}),
+    total: [25]f64 = @splat(0),
 };
 pub var prof: Prof = .{};
 
@@ -194,6 +209,9 @@ const Layer = struct {
     rec: ?*anyopaque = null, // fp32 [48, 128, 128]
     conv: [2]?*anyopaque = .{ null, null }, // fp16 [3, 10240], ping-pong
     conv_cur: u1 = 0,
+    // a verified block's GDN inputs and its entry state, to replay the kept rows (Runner.commit)
+    rec_save: ?*anyopaque = null,
+    stash: ?*anyopaque = null, // q, k [16, 16, 128] bf16 | v [16, 48, 128] bf16 | g, β [16, 48] fp32 | qkv rows [16, 16 640] fp16
     // attention
     qn: ?*anyopaque = null,
     kn: ?*anyopaque = null,
@@ -288,6 +306,8 @@ fn load(d: *Dev, c: *const Checkpoint) !Model {
             l.dt = try bf16Tensor(d, c, f(p, "linear_attn.dt_bias"));
             l.gnorm = try bf16Tensor(d, c, f(p, "linear_attn.norm.weight"));
             l.rec = try d.alloc_(48 * 128 * 128 * 4);
+            l.rec_save = try d.alloc_(48 * 128 * 128 * 4);
+            l.stash = try d.alloc_(STASH);
             try d.fill(l.rec.?, @as(u32, 0), 48 * 128 * 128 * 4);
             for (&l.conv) |*cv| {
                 cv.* = try d.alloc_(3 * 10240 * 2);
@@ -325,7 +345,8 @@ const Acts = struct {
     pl: *anyopaque,
     po: *anyopaque,
     pscr: *anyopaque, // fp32 [CHUNK, D] (slice totals of the narrow prompt GEMM)
-    logits: *anyopaque, // fp16 [VOCAB]
+    logits: *anyopaque, // fp16 [16, VOCAB]
+    taps: *anyopaque, // bf16 [CHUNK, 5 D]: hidden states after TAP_LAYERS, when Mode.taps
     tok: *anyopaque, // i32
     pv: *anyopaque, // argmax partials: f32 [256], i32 [256]
     pi: *anyopaque,
@@ -345,7 +366,7 @@ const Acts = struct {
             .hs = try d.alloc_(nc * 48 * 128 * 128 * 2), .vn = try d.alloc_(nc * 48 * 128 * 64 * 2),
             // decode attention partials: at most 16 rows (the prompt kernel needs none)
             .pm = try d.alloc_(16 * 24 * ns * 4), .pl = try d.alloc_(16 * 24 * ns * 4), .po = try d.alloc_(16 * 24 * ns * 256 * 4),
-            .pscr = try d.alloc_(CHUNK * D * 4), .logits = try d.alloc_(VOCAB * 2), .tok = try d.alloc_(4), .pv = try d.alloc_(1024), .pi = try d.alloc_(1024), .ids = try d.alloc_(CHUNK * 4),
+            .pscr = try d.alloc_(CHUNK * D * 4), .logits = try d.alloc_(16 * VOCAB * 2), .tok = try d.alloc_(16 * 4), .pv = try d.alloc_(16 * 1024), .pi = try d.alloc_(16 * 1024), .taps = try d.alloc_(CHUNK * 5 * D * 2), .ids = try d.alloc_(CHUNK * 4),
             .zeros = try d.alloc_(CHUNK * 48 * 128 * 2), .ones = try d.alloc_(CHUNK * 48 * 4),
         };
     }
@@ -426,8 +447,14 @@ fn dumpBuf(d: *Dev, name: []const u8, p: *anyopaque, n: usize, kind: enum { f16,
     _ = close(fd);
 }
 
-/// One forward over `ids` (≤ CHUNK rows) at positions p0..; the greedy next token of the last row if `want`.
-fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, want: bool) !?i32 {
+/// What a forward leaves: nothing, the last row's logits and greedy token, or every row's (verification, ≤ 16 rows).
+pub const Want = enum { none, last, rows };
+pub const Mode = struct { want: Want = .last, stash: bool = false, taps: bool = false };
+
+/// One forward over `ids` (≤ CHUNK rows) at positions p0..; the greedy token of the last row (or rows: a.tok).
+/// Up to 16 rows the GDN runs serially (gdn_step), as decode does, so a verified row equals the serial one.
+fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mode) !?i32 {
+    const want = mode.want != .none;
     const T: u32 = @intCast(ids.len);
     const t32: i32 = @intCast(T);
     const tp = (T + 63) / 64 * 64; // GDN chunk rows (padded)
@@ -460,7 +487,7 @@ fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, want: bool) 
                 try d.launch(d.k.gdn_pre_rows, .{ .x = T }, .{ a.p, cin, cout, l.conv_w.?, l.alog.?, l.dt.?, a.q, a.k, a.v, a.g, a.beta, t32 })
             else
                 try d.launch(d.k.gdn_pre, .{ .x = T, .y = 40 }, .{ a.p, cin, cout, l.conv_w.?, l.alog.?, l.dt.?, a.q, a.k, a.v, a.g, a.beta, t32 });
-            if (T > 1 and tp > T) {                      // neutral padding rows: the state does not move
+            if (T > 16 and tp > T) {                     // neutral padding rows: the state does not move
                 const pad = tp - T;
                 const cp = struct {
                     fn f(dd: *Dev, dst: *anyopaque, src: *anyopaque, n: usize) !void {
@@ -472,7 +499,17 @@ fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, want: bool) 
                 try cp(d, off(a.beta, T * 48 * 4), a.zeros, pad * 48 * 4);
                 try cp(d, off(a.g, T * 48 * 4), a.ones, pad * 48 * 4);
             }
-            if (T == 1) {
+            if (T <= 16) {
+                if (mode.stash) {                        // entry state and inputs, for Runner.commit's replay
+                    const st = l.stash.?;
+                    try copy(d, l.rec_save.?, l.rec.?, 48 * 128 * 128 * 4);
+                    try copy(d, off(st, ST_Q), a.q, T * 16 * 128 * 2);
+                    try copy(d, off(st, ST_K), a.k, T * 16 * 128 * 2);
+                    try copy(d, off(st, ST_V), a.v, T * 48 * 128 * 2);
+                    try copy(d, off(st, ST_G), a.g, T * 48 * 4);
+                    try copy(d, off(st, ST_B), a.beta, T * 48 * 4);
+                    try copy(d, off(st, ST_P), a.p, T * GDN_IN * 2);
+                }
                 try d.launch(d.k.gdn_step, .{ .x = 16, .y = 48 }, .{ a.q, a.k, a.v, a.g, a.beta, l.rec.?, a.y, t32 });
             } else {
                 const nc: i32 = @intCast(tp / 64);
@@ -501,20 +538,23 @@ fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, want: bool) 
         try d.launch(d.k.swiglu, .{ .x = T, .y = 17 }, .{ a.p, a.h, a.ahi, a.alo });
         try gemm(d, a, a.h, a.ahi, a.alo, l.down, a.r, T);
         if (p0 == 0 and i < 4) try dump(d, a, T, try std.fmt.allocPrint(alloc, "{d}", .{i}), true);
+        if (mode.taps) for (TAP_LAYERS, 0..) |tl, slot| if (tl == i)
+            try d.launch(d.k.tap, .{ .x = D / 256, .y = T }, .{ a.x, a.r, a.taps, @as(i32, D), @as(i32, @intCast(slot)) });
     }
     if (!want) {                                     // x is per token: nothing carries to the next chunk
         try d.sync();
         return null;
     }
     try d.launch(d.k.add_rmsnorm, .{ .x = T }, .{ a.x, a.r, m.norm, a.h, a.ahi, a.alo, @as(i32, D), EPS, @as(i32, 1) });
-    const last = T - 1;
-    try gemm(d, a, off(a.h, last * D * 2), off(a.ahi, last * (D / GS) * 2), off(a.alo, last * (D / GS) * 2), m.head, a.logits, 1);
-    try d.launch(d.k.argmax_part, .{ .x = 256 }, .{ a.logits, @as(i32, VOCAB), a.pv, a.pi });
-    try d.launch(d.k.argmax, .{ .x = 1 }, .{ a.pv, a.pi, a.tok });
-    var tok: i32 = 0;
-    try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, &tok, a.tok, 4, null, 0, null));
+    const first = if (mode.want == .rows) 0 else T - 1;
+    const rows = T - first;
+    try gemm(d, a, off(a.h, first * D * 2), off(a.ahi, first * (D / GS) * 2), off(a.alo, first * (D / GS) * 2), m.head, a.logits, rows);
+    try d.launch(d.k.argmax_part, .{ .x = 256, .y = rows }, .{ a.logits, @as(i32, VOCAB), a.pv, a.pi });
+    try d.launch(d.k.argmax, .{ .x = rows }, .{ a.pv, a.pi, a.tok });
+    var toks: [16]i32 = undefined;
+    try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, &toks, a.tok, rows * 4, null, 0, null));
     try d.sync();
-    return tok;
+    return toks[rows - 1];
 }
 
 extern "c" fn clock_gettime(clk: c_int, ts: *[2]i64) c_int;
@@ -533,6 +573,11 @@ pub const Runner = struct {
     last: u32 = 0, // greedy next token of the last forward
     context: u32,
     host_logits: []f32 = &.{},
+    block: [16]u32 = @splat(0), // the last verified block's greedy tokens
+    block_rows: u32 = 0,
+    /// Target hidden states for a drafter: when on, every forward fills acts.taps and calls `on_taps` with its rows.
+    taps_on: bool = false,
+    on_taps: ?struct { ctx: *anyopaque, f: *const fn (*anyopaque, *anyopaque, u32) anyerror!void } = null,
 
     /// Loads `dir` (MLX affine 4/64) onto the first B70 with room for `context` positions.
     pub fn init(dir: []const u8, context: u32) !*Runner {
@@ -574,7 +619,7 @@ pub const Runner = struct {
             .embed = try d.kernel(mg, "embed", 256), .add_rmsnorm = try d.kernel(mg, "add_rmsnorm", 512),
             .gdn_pre = try d.kernel(mg, "gdn_pre", 256), .gdn_pre_rows = try d.kernel(mg, "gdn_pre_rows", 256), .gated_norm = try d.kernel(mg, "gated_norm", 256),
             .attn_prep = try d.kernel(mg, "attn_prep", 256), .attn_gate = try d.kernel(mg, "attn_gate", 256),
-            .swiglu = try d.kernel(mg, "swiglu", 256), .argmax = try d.kernel(mg, "argmax", 256), .argmax_part = try d.kernel(mg, "argmax_part", 256),
+            .swiglu = try d.kernel(mg, "swiglu", 256), .argmax = try d.kernel(mg, "argmax", 256), .argmax_part = try d.kernel(mg, "argmax_part", 256), .tap = try d.kernel(mg, "tap", 256), .conv_commit = try d.kernel(mg, "conv_commit", 256),
             .repack = try d.kernel(mg, "repack", 16), .gdn_step = try d.kernel(md, "gdn_step", 16),
             .attn_decode = try d.kernel(md, "attn_decode", 16), .attn_merge = try d.kernel(md, "attn_merge", 16),
             .dec_wide = try d.kernel(mm, "w4k1_decode", 64), .dec_wide64 = try d.kernel(mm, "w4k1_d64", 64), .dec_narrow = try d.kernel(mm, "w4k_dsplit", 64),
@@ -615,7 +660,8 @@ pub const Runner = struct {
             const end = @min(ids.len, at + CHUNK);
             const want = last and end == ids.len;
             if (r.pos + (end - at) > r.context) return error.ContextFull;
-            if (try forward(&r.d, &r.model, &r.acts, @ptrCast(ids[at..end]), r.pos, want)) |t| r.last = @intCast(t);
+            if (try forward(&r.d, &r.model, &r.acts, @ptrCast(ids[at..end]), r.pos, .{ .want = if (want) .last else .none, .taps = r.taps_on })) |t| r.last = @intCast(t);
+            if (r.taps_on) if (r.on_taps) |cb| try cb.f(cb.ctx, r.acts.taps, @intCast(end - at));
             r.pos += @intCast(end - at);
             at = end;
         }
@@ -625,8 +671,50 @@ pub const Runner = struct {
     pub fn step(r: *Runner, token: u32) !void {
         if (r.pos + 1 > r.context) return error.ContextFull;
         const id: i32 = @intCast(token);
-        r.last = @intCast((try forward(&r.d, &r.model, &r.acts, &.{id}, r.pos, true)).?);
+        r.last = @intCast((try forward(&r.d, &r.model, &r.acts, &.{id}, r.pos, .{ .taps = r.taps_on })).?);
         r.pos += 1;
+        if (r.taps_on) if (r.on_taps) |cb| try cb.f(cb.ctx, r.acts.taps, 1);
+    }
+
+    /// Verifies a block: `ids` (≤ 16 rows: the pending token and the drafts) run from `pos`, every row's greedy token
+    /// returned (and its logits kept for sampling). The state moves by all rows until `commit` keeps a prefix.
+    pub fn verify(r: *Runner, ids: []const u32) ![]const u32 {
+        if (ids.len == 0 or ids.len > 16) return error.BadBlock;
+        if (r.pos + ids.len > r.context) return error.ContextFull;
+        _ = try forward(&r.d, &r.model, &r.acts, @ptrCast(ids), r.pos, .{ .want = .rows, .stash = true, .taps = r.taps_on });
+        var toks: [16]i32 = undefined;
+        try ze.check(r.d.g.api.zeCommandListAppendMemoryCopy(r.d.list, &toks, r.acts.tok, ids.len * 4, null, 0, null));
+        try r.d.sync();
+        for (r.block[0..ids.len], toks[0..ids.len]) |*o, t| o.* = @intCast(t);
+        r.block_rows = @intCast(ids.len);
+        return r.block[0..ids.len];
+    }
+
+    /// Keeps the first `keep` rows of the last verified block: the GDN and convolution states are rebuilt from the
+    /// block's entry by replaying those rows (the attention caches need nothing: later positions overwrite them).
+    pub fn commit(r: *Runner, keep: u32) !void {
+        if (keep == 0 or keep > r.block_rows) return error.BadCommit;
+        if (keep < r.block_rows) for (&r.model.layers) |*l| if (!l.attn) {
+            const st = l.stash.?;
+            try copy(&r.d, l.rec.?, l.rec_save.?, 48 * 128 * 128 * 4);
+            try r.d.launch(r.d.k.gdn_step, .{ .x = 16, .y = 48 }, .{ off(st, ST_Q), off(st, ST_K), off(st, ST_V), off(st, ST_G), off(st, ST_B), l.rec.?, r.acts.y, @as(i32, @intCast(keep)) });
+            // the block's forward flipped conv_cur: conv[cur] is the state after all rows, conv[1 - cur] the entry
+            try r.d.launch(r.d.k.conv_commit, .{ .x = 40 }, .{ l.conv[1 - l.conv_cur].?, off(st, ST_P), l.conv[l.conv_cur].?, @as(i32, @intCast(keep)) });
+        };
+        r.pos += keep;
+        r.last = r.block[keep - 1];
+        r.block_rows = 0;
+        try r.d.sync();
+    }
+
+    /// The logits of row `row` of the last verified block (or of the last forward's row, row 0), fp32 on the host.
+    pub fn rowLogits(r: *Runner, row: u32) ![]const f32 {
+        const raw = try alloc.alloc(f16, VOCAB);
+        defer alloc.free(raw);
+        try ze.check(r.d.g.api.zeCommandListAppendMemoryCopy(r.d.list, raw.ptr, off(r.acts.logits, row * VOCAB * 2), VOCAB * 2, null, 0, null));
+        try r.d.sync();
+        for (r.host_logits, raw) |*o, v| o.* = v;
+        return r.host_logits;
     }
 
     /// The kept row's logits, fp32 on the host (for sampling).

@@ -47,9 +47,43 @@ pub fn main(init: std.process.Init) !void {
     }
     const t2 = q.now();
     q.profReport("decode");
+    if (std.c.getenv("XPU_VERIFY_TEST") != null) try verifyTest(r, ids.items, out.items);
     std.debug.print("prompt: {d} tokens in {d:.3} s ({d:.0} tok/s)\n", .{ ids.items.len, t1 - t0, @as(f64, @floatFromInt(ids.items.len)) / (t1 - t0) });
     std.debug.print("decode: {d} tokens in {d:.3} s ({d:.1} tok/s)\n", .{ steps - 1, t2 - t1, @as(f64, @floatFromInt(steps - 1)) / (t2 - t1) });
     std.debug.print("tokens:", .{});
     for (out.items) |t| std.debug.print(" {d}", .{t});
     std.debug.print("\n", .{});
+}
+
+/// The drafted-equals-serial contract with stand-in drafts: blocks of 8 verified rows, with perfect drafts (the serial
+/// reply itself) and with wrong ones (token 0); both replies must equal the serial one.
+fn verifyTest(r: *q.Runner, prompt: []const u32, serial: []const u32) !void {
+    for ([_]bool{ true, false }) |perfect| {
+        try r.reset();
+        try r.prompt(prompt, true);
+        var got: std.ArrayList(u32) = .empty;
+        try got.append(alloc, r.last);
+        var rounds: usize = 0;
+        while (got.items.len < serial.len) {
+            var block: [8]u32 = undefined;
+            block[0] = got.items[got.items.len - 1];
+            for (1..8) |j| {
+                const at = got.items.len - 1 + j;
+                block[j] = if (perfect and at < serial.len) serial[at] else 0;
+            }
+            const greedy = try r.verify(&block);
+            var n: u32 = 0; // accepted drafts
+            while (n + 1 < 8 and greedy[n] == block[n + 1]) n += 1;
+            try r.commit(n + 1);
+            for (greedy[0 .. n + 1]) |t| try got.append(alloc, t);
+            rounds += 1;
+        }
+        const same = std.mem.eql(u32, got.items[0..serial.len], serial);
+        std.debug.print("verify test ({s} drafts): {d} rounds, equal to serial: {}\n", .{ if (perfect) "perfect" else "wrong", rounds, same });
+        if (!same) {
+            std.debug.print("  got:", .{});
+            for (got.items[0..serial.len]) |t| std.debug.print(" {d}", .{t});
+            std.debug.print("\n", .{});
+        }
+    }
 }
