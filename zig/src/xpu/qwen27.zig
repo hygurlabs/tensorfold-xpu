@@ -98,7 +98,7 @@ pub const Dev = struct {
         embed_dense: ze.H, dense_rows: ze.H, repack_gptq: ze.H, quantize_mlx: ze.H,
         dec_wide_g128: ze.H, dec_wide64_g128: ze.H, dec_narrow_g128: ze.H, ngen_wide_g128: ze.H, ngen_narrow_g128: ze.H,
         ngen_swiglu: ze.H, ngen_swiglu_g128: ze.H, rowsums_ff: ze.H, fakequant_rows: ze.H,
-        a8: ze.H, a8_swiglu: ze.H, quant_a8: ze.H,
+        a8: ze.H, a8_swiglu: ze.H, quant_a8: ze.H, a4: ze.H, quant_a4: ze.H,
         dec_wide: ze.H, dec_wide64: ze.H, dec_narrow: ze.H, gdn_prep: ze.H, gdn_state: ze.H, gdn_out: ze.H, ngen_wide: ze.H,
         ngen_narrow: ze.H, prompt_attn: ze.H,
     },
@@ -692,6 +692,10 @@ var kv_i8 = false;
 /// Rotated weights (a `hadamard128` file in the checkpoint, tools/xpu/rotate_w4.py): every GEMM input rotated by blocks
 /// of 128 where it is made (norms, gates, SwiGLU), the residual stream and the head untouched.
 var rot_on: i32 = 0;
+/// W4A4 on down (and the mixers' out projections with XPU_PREFILL_INT4_SITES=10) (XPU_PREFILL_INT4=1, with XPU_PREFILL_INT8 and rotated weights): their
+/// inputs in int4 by (row, group of 128), DPAS u4 × s4.
+var prefill_int4 = false;
+var int4_sites: u32 = 8; // XPU_PREFILL_INT4_SITES: 8 down (default: perplexity at the GPTQ W4A8 level), 2 the mixers' out projections
 fn kvBytes() usize {
     return @as(usize, MAX_CTX) * 4 * @as(usize, if (kv_i8) 256 + 4 else 256 * 2);
 }
@@ -706,8 +710,12 @@ pub const no_q8: ?*anyopaque = null;
 /// Prompt GEMM: W4A8 when the option is on and the rows are prompt rows, else the fp16 GEMM.
 /// `pre`: x is already quantized into acts.a8 (by the norm that produced it).
 /// qrot: the input is rotated by quantA8 (down's, the GEMM epilogue's SwiGLU), not where it was made.
-fn pgemm(d: *Dev, a: *Acts, x: *anyopaque, w: Proj, out: *anyopaque, T: u32, pre: bool, qrot: i32) !void {
+fn pgemm(d: *Dev, a: *Acts, x: *anyopaque, w: Proj, out: *anyopaque, T: u32, pre: bool, qrot: i32, int4: bool) !void {
     if (!prefill_int8 or T <= 16 or w.gs != 128) return gemm(d, a.pscr, x, a.ahi, a.alo, w, out, T);
+    if (int4 and prefill_int4) {
+        try d.launch(d.k.quant_a4, .{ .x = T }, .{ x, a.a8, a.sa, a.ahi, a.alo, @as(i32, @intCast(w.k)), @as(i32, @intCast(CHUNK + 32)), qrot });
+        return d.launch(d.k.a4, a8Groups(w, T), a8Args(a, w, out, T));
+    }
     if (!pre) try quantA8(d, a, x, w.k, T, qrot);
     try d.launch(d.k.a8, a8Groups(w, T), a8Args(a, w, out, T));
 }
@@ -764,7 +772,7 @@ fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mode) 
         const min_in = if (a8_group != 0 and T > 16 and a8_sites & 1 != 0) a.r else a.h;
         if (min_in != a.h) try copy(d, a.r, a.h, T * D * 2);
         try a8(d, a, min_in, D, T, 1);
-        try pgemm(d, a, min_in, l.mixer_in, a.p, T, q8on, 0);
+        try pgemm(d, a, min_in, l.mixer_in, a.p, T, q8on, 0, false);
         if (l.ab) |ab| try d.launch(d.k.dense_rows, .{ .x = (T + 15) / 16, .y = 96 / 16 }, .{ a.h, ab, a.p, t32, @as(i32, GDN_IN), @as(i32, 16384) });
         if (probe) try dumpBuf(d, "p0", a.p, T * GDN_IN, .f16);
         if (l.attn) {
@@ -839,13 +847,13 @@ fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mode) 
             if (probe) try dumpBuf(d, "o0", a.h, T * 6144, .f16);
         }
         try a8(d, a, a.h, 6144, T, 2);
-        try pgemm(d, a, a.h, l.mixer_out, a.r, T, false, 0);
+        try pgemm(d, a, a.h, l.mixer_out, a.r, T, false, 0, int4_sites & 2 != 0);
         if (probe) try dumpBuf(d, "r0", a.r, T * D, .f16);
         try d.launch(if (T > 16) d.k.add_rmsnorm else d.k.add_rmsnorm_dec, .{ .x = T }, .{ a.x, a.r, l.post_norm, a.h, a.ahi, a.alo, @as(i32, D), EPS, @as(i32, 1), gs, q8a, q8s, q8ms, rot_on });
         try a8(d, a, a.h, D, T, 4);
         const act = try mlpIn(d, a, l.gu, T, gs, q8on);
         try a8(d, a, act, 17408, T, 8);
-        try pgemm(d, a, act, l.down, a.r, T, false, if (act == a.p) rot_on else 0);
+        try pgemm(d, a, act, l.down, a.r, T, false, if (act == a.p) rot_on else 0, int4_sites & 8 != 0);
         if (p0 == 0 and i < 4) try dump(d, a, T, try std.fmt.allocPrint(alloc, "{d}", .{i}), true);
         if (mode.taps) for (TAP_LAYERS, 0..) |tl, slot| if (tl == i)
             try d.launch(d.k.tap, .{ .x = D / 256, .y = T }, .{ a.x, a.r, a.taps, @as(i32, D), @as(i32, @intCast(slot)) });
@@ -915,6 +923,8 @@ pub const Runner = struct {
         if (std.c.getenv("XPU_PREFILL_INT8") != null) prefill_int8 = true;
         if (std.c.getenv("XPU_ATTN_TRITON") != null) attn_own = false;
         if (std.c.getenv("XPU_KV_INT8") != null) kv_i8 = true;
+        if (std.c.getenv("XPU_PREFILL_INT4") != null) prefill_int4 = true;
+        if (std.c.getenv("XPU_PREFILL_INT4_SITES")) |v| int4_sites = try std.fmt.parseInt(u32, std.mem.span(v), 10);
         if (std.c.getenv("XPU_KV8")) |v| kv8 = try std.fmt.parseInt(i32, std.mem.span(v), 10);
         if (std.c.getenv("XPU_A8_ROT") != null) a8_rot = 1;
         if (std.c.getenv("XPU_A8_SITES4")) |v| a8_sites4 = try std.fmt.parseInt(u32, std.mem.span(v), 10);
@@ -929,6 +939,7 @@ pub const Runner = struct {
             const fd = open(marker.ptr, 0);
             rot_on = if (fd >= 0) 1 else 0;
         }
+        if (prefill_int4 and (rot_on == 0 or !prefill_int8)) return error.Int4NeedsRotatedWeightsAndInt8;
         var ckpt: Checkpoint = .{};
         {
             const index_path = try std.fmt.allocPrintSentinel(alloc, "{s}/model.safetensors.index.json", .{dir}, 0);
@@ -978,7 +989,8 @@ pub const Runner = struct {
             .ngen_swiglu_g128 = try d.kernel(try d.g.module(&kb.ngen_swiglu128), "w4g_dpb_swiglu", 256),
             .rowsums_ff = try d.kernel(mg, "rowsums_ff", 128), .fakequant_rows = try d.kernel(mg, "fakequant_rows", 256),
             .a8 = try d.kernel(try d.g.module(&kb.ngen_a8), "w4a8", 256), .a8_swiglu = try d.kernel(try d.g.module(&kb.ngen_a8_swiglu), "w4a8_swiglu", 256),
-            .quant_a8 = try d.kernel(mg, "quant_a8", 256),
+            .quant_a8 = try d.kernel(mg, "quant_a8", 256), .quant_a4 = try d.kernel(mg, "quant_a4", 256),
+            .a4 = try d.kernel(try d.g.module(&kb.ngen_a4), "w4a4", 256),
             .dec_wide = try d.kernel(mm, "w4k1_decode", 64), .dec_wide64 = try d.kernel(mm, "w4k1_d64", 64), .dec_narrow = try d.kernel(mm, "w4k_dsplit", 64),
             .gdn_prep = try d.kernel(mgd, "gdn_prep", 64), .gdn_state = try d.kernel(mgd, "gdn_state", 256),
             .gdn_out = try d.kernel(mgd, "gdn_out", 128), .ngen_wide = try d.kernel(mw, "w4g_dpb", 256),

@@ -47,6 +47,7 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         .{ "ngen_swiglu128", "128", &.{ "tn2", "fold32", "lag", "dpb", "layout3", "b3", "swiglu" } },
         .{ "ngen_a8", "128", &.{"a8"} },
         .{ "ngen_a8_swiglu", "128", &.{ "a8", "swiglu" } },
+        .{ "ngen_a4", "128", &.{"a4"} },
     }) |z| {
         const run = std.Build.Step.Run.create(b, b.fmt("nGEN {s}", .{z[0]}));
         run.addFileArg(gen_bin);
@@ -70,6 +71,7 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         \\pub const ngen_swiglu128 align(8) = @embedFile("ngen_swiglu128.zebin").*;
         \\pub const ngen_a8 align(8) = @embedFile("ngen_a8.zebin").*;
         \\pub const ngen_a8_swiglu align(8) = @embedFile("ngen_a8_swiglu.zebin").*;
+        \\pub const ngen_a4 align(8) = @embedFile("ngen_a4.zebin").*;
         \\pub const prompt_attention align(8) = @embedFile("prompt_attention.bin").*;
         \\
     ) });

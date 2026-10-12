@@ -669,6 +669,50 @@ static void quant_row(local const half *hl, int K, global char *A8, global float
 }
 
 // La quantification seule, ligne X fp16 [T, K] : un groupe de 256 par ligne.
+// W4A4 (poids tournés) : une ligne en int4 par groupe de 128 (échelle max |x| / 7, valeurs −8 … 7), [t][K/2] octets ;
+// le mot du couloir (8 valeurs consécutives) dans l'ordre des quartets des poids réorganisés (repack_gptq) :
+// quartet i = valeur π(i), π = 0 2 4 6 1 3 5 7. Sommes de ligne et échelles comme quant_row.
+static void quant_row4(local const half *hl, int K, global uint *A4, global float *SA, int MS, global half *AHI,
+                       global half *ALO, int t) {
+  const int lane = get_sub_group_local_id();
+  for (int g = get_sub_group_id(); g < K / 128; g += get_num_sub_groups()) {
+    const half8 xv = vload8(0, hl + g * 128 + lane * 8);
+    float m = 0.0f;
+    for (int j = 0; j < 8; j++) m = fmax(m, fabs((float)xv[j]));
+    m = sub_group_reduce_max(m);
+    const float s = m > 0.0f ? m / 7.0f : 1.0f;
+    uint w = 0;
+    int qs = 0;
+    for (int i = 0; i < 8; i++) {
+      const int j = i < 4 ? 2 * i : 2 * (i - 4) + 1;
+      const int v = (int)clamp(rint((float)xv[j] / s), -8.0f, 7.0f);
+      w |= ((uint)v & 0xFu) << (4 * i);
+      qs += v;
+    }
+    A4[((long)t * K / 2 + g * 64) / 4 + lane] = w;
+    qs = sub_group_reduce_add(qs);
+    if (lane == 0) {
+      SA[(long)g * MS + t] = s;
+      const float a = s * (float)qs * (1.0f / 128.0f);
+      const half hi = convert_half_rte(a);
+      AHI[(long)t * (K / 128) + g] = hi;
+      ALO[(long)t * (K / 128) + g] = convert_half_rte(a - (float)hi);
+    }
+  }
+}
+KERNEL(256) void quant_a4(global const half *X, global uint *A4, global float *SA, global half *AHI, global half *ALO,
+                          int K, int MS, int rot) {
+  local half hl[17408];
+  const int t = get_group_id(0);
+  for (int e = get_local_id(0) * 4; e < K; e += 1024) vstore4(vload4(0, X + (long)t * K + e), 0, hl + e);
+  barrier(CLK_LOCAL_MEM_FENCE);
+  if (rot) {
+    rot128_local(hl, K);
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+  quant_row4(hl, K, A4, SA, MS, AHI, ALO, t);
+}
+
 KERNEL(256) void quant_a8(global const half *X, global char *A8, global float *SA, global half *AHI, global half *ALO,
                           int K, int MS, int rot) {
   local half hl[17408];

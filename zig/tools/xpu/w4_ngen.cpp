@@ -659,7 +659,10 @@ class W4A8Prompt : public ELFCodeGenerator<hw> {
     }
 
 public:
-    W4A8Prompt(Product product, bool swiglu) : ELFCodeGenerator<hw>(product) {
+    // a4 : W4A4 (activations int4 tournées, [M, K/2] octets, 8 valeurs par mot dans l'ordre des quartets des poids
+    // réorganisés, 0 2 4 6 1 3 5 7) : une tuile A de 128 K par groupe, deux DPAS u4 × s4 (K 64) sur les mots de poids
+    // tels quels, sans dépliage.
+    W4A8Prompt(Product product, bool swiglu, bool a4 = false) : ELFCodeGenerator<hw>(product) {
         newArgument("A", ExternalArgumentType::GlobalPtr);
         newArgument("W", ExternalArgumentType::GlobalPtr);
         newArgument("S", ExternalArgumentType::GlobalPtr);
@@ -673,7 +676,7 @@ public:
         newArgument("Mp", DataType::d);
         newArgument("G", DataType::d);
         newArgument("SA", ExternalArgumentType::GlobalPtr);
-        externalName(swiglu ? "w4a8_swiglu" : "w4a8");
+        externalName(a4 ? "w4a4" : swiglu ? "w4a8_swiglu" : "w4a8");
         requireSIMD(16);
         requireGRF(256);
         requireLocalID(1);
@@ -712,7 +715,11 @@ public:
         shl(1, n0, r0.ud(6), 8);
         add(1, n0, n0, t.d(1));                           // n0 = nt·256 + (sg / 2)·32
 
-        add(1, t.d(2), K, -1);                            // K − 1 (octets d'une ligne de A8)
+        if (a4) {
+            shr(1, t.d(2), K, 1);
+            add(1, t.d(2), t.d(2), -1);                   // K/2 − 1 (octets d'une ligne de A4)
+        } else
+            add(1, t.d(2), K, -1);                        // K − 1 (octets d'une ligne de A8)
         add(1, t.d(3), M, -1);
         header(hA, A, t.d(2), t.d(3), 32, 32, 2);
         mov(1, hA.ud(6), m0);
@@ -749,11 +756,17 @@ public:
         load(1, null, block_2d(DataSizeLSC::D32, 16, 16), A64, hPW);
         add(1, hPW.ud(5), n0, 16);
         load(1, null, block_2d(DataSizeLSC::D32, 16, 16), A64, hPW);
-        shl(1, kx, g, 7);
-        add(1, hPA.ud(5), kx, 128);
-        load(1, null, block_2d(DataSizeLSC::D8, 32, 32, 2), A64, hPA);
-        add(1, hPA.ud(5), kx, 192);
-        load(1, null, block_2d(DataSizeLSC::D8, 32, 32, 2), A64, hPA);
+        if (a4) {
+            shl(1, kx, g, 6);                             // octets de A4 avant ce groupe
+            add(1, hPA.ud(5), kx, 64);
+            load(1, null, block_2d(DataSizeLSC::D8, 32, 32, 2), A64, hPA);
+        } else {
+            shl(1, kx, g, 7);
+            add(1, hPA.ud(5), kx, 128);
+            load(1, null, block_2d(DataSizeLSC::D8, 32, 32, 2), A64, hPA);
+            add(1, hPA.ud(5), kx, 192);
+            load(1, null, block_2d(DataSizeLSC::D8, 32, 32, 2), A64, hPA);
+        }
         // Échelles des poids (32 colonnes, fp16 → fp32) et des activations (32 lignes, fp32).
         mul32(t.d(0), g, N, t.d(5));
         add(1, t.d(0), t.d(0), n0);
@@ -767,7 +780,21 @@ public:
         mov(1, addr.uq(0), t.ud(1));
         add(1, addr.uq(0), addr.uq(0), SA);
         load.ugm(1, sa0, block(DataSizeLSC::D32, 32), A64, addr);
-        for (int h = 0; h < 2; h++) {
+        if (a4) {                                         // 128 K = 64 octets : une lecture, deux pas k64
+            mov(1, hA.ud(5), kx);
+            load(1, GRF(A0), block_2d(DataSizeLSC::D8, 32, 32, 2), A64, hA);
+            for (int st = 0; st < 2; st++)
+                for (int j = 0; j < 2; j++)
+                    for (int i = 0; i < 4; i++) {
+                        const GRF part = GRF(PART + 8 * (i * 2 + j)), a = GRF(A0 + 16 * st + 4 * i);
+                        const GRF bw = GRF(W0 + 16 * j + 8 * st);
+                        if (st == 0)
+                            dpas(16, 8, 8, part.d(), null.d(), bw.u4(), a.s4());
+                        else
+                            dpas(16, 8, 8, part.d(), part.d(), bw.u4(), a.s4());
+                    }
+        }
+        for (int h = 0; h < 2 && !a4; h++) {
             add(1, hA.ud(5), kx, 64 * h);
             load(1, GRF(A0), block_2d(DataSizeLSC::D8, 32, 32, 2), A64, hA);
             for (int st = 0; st < 2; st++) {
@@ -923,11 +950,13 @@ int main(int argc, char **argv) {
         if (!std::strcmp(argv[i], "b3")) b3 = true;
         if (!std::strcmp(argv[i], "swiglu")) swiglu = true;
     }
-    bool a8 = false;
-    for (int i = 4; i < argc; i++)
+    bool a8 = false, a4 = false;
+    for (int i = 4; i < argc; i++) {
         if (!std::strcmp(argv[i], "a8")) a8 = true;
-    if (a8) {                                          // W4A8 (GPTQ g128) : seules options, swiglu
-        auto bin8 = W4A8Prompt<HW::Xe2>(Product(ProductFamily::GenericXe2, 0, PlatformType::Discrete), swiglu).getBinary();
+        if (!std::strcmp(argv[i], "a4")) a4 = true;
+    }
+    if (a8 || a4) {                                    // W4A8 / W4A4 (GPTQ g128) : seules options, swiglu (W4A8)
+        auto bin8 = W4A8Prompt<HW::Xe2>(Product(ProductFamily::GenericXe2, 0, PlatformType::Discrete), swiglu, a4).getBinary();
         std::ofstream(argv[3], std::ios::binary).write(reinterpret_cast<const char *>(bin8.data()), bin8.size());
         std::printf("%s : %zu octets\n", argv[3], bin8.size());
         return 0;
