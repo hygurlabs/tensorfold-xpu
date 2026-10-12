@@ -31,6 +31,9 @@ static float wg_sum256(float v, local float *red) {
   return t;
 }
 
+static void quant_row(local const half *hl, int K, global char *A8, global float *SA, int MS, global half *AHI,
+                      global half *ALO, int t);
+
 // Sommes de ligne d'une ligne fp16 rangée en mémoire locale (K valeurs), écrites en [row, K / gs] : un sous-groupe par
 // groupe de gs, gs / 16 valeurs par couloir (k croissant), puis la somme du sous-groupe ; ordre fixe.
 static void rowsums(local const half *hl, int K, global half *AHI, global half *ALO, long row, int gs) {
@@ -100,7 +103,8 @@ KERNEL(256) void dense_rows(global const half *H, global const half *W, global h
 // par fil pour D = 5 120 ; 512 est le plafond en mode 256 registres) ; somme des carrés : sous-groupes, puis les 32
 // sommes partielles dans l'ordre.
 KERNEL(512) void add_rmsnorm(global float *X, global const half *R, global const ushort *WN, global half *H,
-                              global half *AHI, global half *ALO, int D, float eps, int has_r, int gs) {
+                              global half *AHI, global half *ALO, int D, float eps, int has_r, int gs,
+                              global char *A8, global float *SA, int MS) {
   local float red[32];
   local half hl[5120];
   const int t = get_group_id(0), lid = get_local_id(0);
@@ -129,7 +133,10 @@ KERNEL(512) void add_rmsnorm(global float *X, global const half *R, global const
     hl[e] = v;
   }
   barrier(CLK_LOCAL_MEM_FENCE);
-  rowsums(hl, D, AHI, ALO, t, gs);
+  if (A8)                                             // W4A8 : h quantifié pour la projection suivante
+    quant_row(hl, D, A8, SA, MS, AHI, ALO, t);
+  else
+    rowsums(hl, D, AHI, ALO, t, gs);
 }
 
 // GDN, avant la récurrence. P : sortie du GEMM gdn.in, fp16 [T, 16 640] = qkv (10 240) | z (6 144) | a (48) | b (48),
@@ -361,16 +368,16 @@ KERNEL(256) void fakequant_rows(global half *X, global half *AHI, global half *A
   rowsums(hl, K, AHI, ALO, t, gs);
 }
 
-// W4A8 du prompt : quantification des activations. Ligne t de X fp16 [T, K] en int8 symétrique par groupe de 128
-// (échelle s = max |x| / 127 dans SA [K/128, MS] fp32), rangée dans A8 [T, K] par blocs de 16 dans l'ordre
+// W4A8 du prompt : quantification des activations. Ligne t (en mémoire locale, K valeurs fp16) en int8 symétrique par
+// groupe de 128 (échelle s = max |x| / 127 dans SA [K/128, MS] fp32), rangée dans A8 [T, K] par blocs de 16 dans l'ordre
 // [k0 k4 k1 k5 | k8 k12 k9 k13 | k2 k6 k3 k7 | k10 k14 k11 k15] (celui du dépliage des mots dans w4a8) ; AHI, ALO :
-// Σ (s·q) / 128 en hi/lo fp16, la somme des activations déquantifiées (terme de biais). Un groupe de 256 par ligne ;
-// le couloir tient 8 K (un mot : w = couloir % 2 dans son bloc de 16).
-KERNEL(256) void quant_a8(global const half *X, global char *A8, global float *SA, global half *AHI, global half *ALO,
-                          int K, int MS) {
-  const int t = get_group_id(0), lane = get_sub_group_local_id();
+// Σ (s·q) / 128 en hi/lo fp16, la somme des activations déquantifiées (terme de biais). Un sous-groupe par groupe de
+// 128 ; le couloir tient 8 K (un mot : w = couloir % 2 dans son bloc de 16).
+static void quant_row(local const half *hl, int K, global char *A8, global float *SA, int MS, global half *AHI,
+                      global half *ALO, int t) {
+  const int lane = get_sub_group_local_id();
   for (int g = get_sub_group_id(); g < K / 128; g += get_num_sub_groups()) {
-    const half8 xv = vload8(0, X + (long)t * K + g * 128 + lane * 8);
+    const half8 xv = vload8(0, hl + g * 128 + lane * 8);
     float m = 0.0f;
     for (int j = 0; j < 8; j++) m = fmax(m, fabs((float)xv[j]));
     m = sub_group_reduce_max(m);
@@ -395,6 +402,16 @@ KERNEL(256) void quant_a8(global const half *X, global char *A8, global float *S
       ALO[(long)t * (K / 128) + g] = convert_half_rte(a - (float)hi);
     }
   }
+}
+
+// La quantification seule, ligne X fp16 [T, K] : un groupe de 256 par ligne.
+KERNEL(256) void quant_a8(global const half *X, global char *A8, global float *SA, global half *AHI, global half *ALO,
+                          int K, int MS) {
+  local half hl[17408];
+  const int t = get_group_id(0);
+  for (int e = get_local_id(0) * 4; e < K; e += 1024) vstore4(vload4(0, X + (long)t * K + e), 0, hl + e);
+  barrier(CLK_LOCAL_MEM_FENCE);
+  quant_row(hl, K, A8, SA, MS, AHI, ALO, t);
 }
 
 // Arg max de chaque ligne de logits fp16 [T, V] (le premier indice en cas d'égalité), en deux noyaux : maxima

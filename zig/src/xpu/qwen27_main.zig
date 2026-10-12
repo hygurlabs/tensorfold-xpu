@@ -238,7 +238,10 @@ fn a8Loop(r: *q.Runner, path: []const u8) !void {
     const copy = try alloc.alignedAlloc(u8, .@"8", size);
     @memcpy(copy, bin[0..size]);
     const k = try d.kernel(try d.g.module(copy), "w4a8", 256);
-    const w = r.model.layers[0].gu;
+    // XPU_A8_PROJ: gu (default), in (gdn.in), out (gdn.out), down
+    const which = if (std.c.getenv("XPU_A8_PROJ")) |v| std.mem.span(v) else "gu";
+    const l0 = &r.model.layers[0];
+    const w = if (std.mem.eql(u8, which, "in")) l0.mixer_in else if (std.mem.eql(u8, which, "out")) l0.mixer_out else if (std.mem.eql(u8, which, "down")) l0.down else l0.gu;
     const T = q.CHUNK;
     const tiles = (T + 63) / 64;
     try d.launch(d.k.quant_a8, .{ .x = T }, .{ a.h, a.a8, a.sa, a.ahi, a.alo, @as(i32, @intCast(w.k)), @as(i32, @intCast(T + 32)) });
@@ -251,5 +254,5 @@ fn a8Loop(r: *q.Runner, path: []const u8) !void {
     try d.sync();
     const dt = (q.now() - t0) / 2000;
     const ops = 2.0 * @as(f64, @floatFromInt(T)) * @as(f64, @floatFromInt(w.n)) * @as(f64, @floatFromInt(w.k));
-    std.debug.print("a8 loop {s}: {d:.3} ms a call, {d:.1} TOPS\n", .{ path, dt * 1e3, ops / dt / 1e12 });
+    std.debug.print("a8 loop {s} {s} (N {d}, K {d}): {d:.3} ms a call, {d:.1} TOPS\n", .{ path, which, w.n, w.k, dt * 1e3, ops / dt / 1e12 });
 }

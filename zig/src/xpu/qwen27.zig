@@ -550,9 +550,9 @@ fn chainTable() [16 * 17]i32 {
 
 /// gate|up and SwiGLU: the activation (fp16 [T, 17 408]) and its row sums; returns the buffer holding it. Prompt rows:
 /// the GEMM's SwiGLU epilogue writes it into P; decode rows: the GEMM into P, then `swiglu` into H.
-fn mlpIn(d: *Dev, a: *Acts, w: Proj, T: u32, gs: i32) !*anyopaque {
+fn mlpIn(d: *Dev, a: *Acts, w: Proj, T: u32, gs: i32, pre: bool) !*anyopaque {
     if (prefill_int8 and T > 16 and w.ilv and w.gs == 128) { // W4A8: SwiGLU epilogue; down quantizes its own input
-        try quantA8(d, a, a.h, w.k, T);
+        if (!pre) try quantA8(d, a, a.h, w.k, T);
         try d.launch(d.k.a8_swiglu, a8Groups(w, T), a8Args(a, w, a.p, T));
         return a.p;
     }
@@ -667,11 +667,14 @@ var dump_h: ?c_int = null;
 var a8_group: u32 = 0;
 /// W4A8 prompt GEMMs (XPU_PREFILL_INT8, local option, GPTQ g128 only): int8 activations by (row, group of 128).
 pub var prefill_int8 = false;
+/// add_rmsnorm without the fused W4A8 quantization (its A8 and SA arguments).
+pub const no_q8: ?*anyopaque = null;
 
 /// Prompt GEMM: W4A8 when the option is on and the rows are prompt rows, else the fp16 GEMM.
-fn pgemm(d: *Dev, a: *Acts, x: *anyopaque, w: Proj, out: *anyopaque, T: u32) !void {
+/// `pre`: x is already quantized into acts.a8 (by the norm that produced it).
+fn pgemm(d: *Dev, a: *Acts, x: *anyopaque, w: Proj, out: *anyopaque, T: u32, pre: bool) !void {
     if (!prefill_int8 or T <= 16 or w.gs != 128) return gemm(d, a.pscr, x, a.ahi, a.alo, w, out, T);
-    try quantA8(d, a, x, w.k, T);
+    if (!pre) try quantA8(d, a, x, w.k, T);
     try d.launch(d.k.a8, a8Groups(w, T), a8Args(a, w, out, T));
 }
 fn quantA8(d: *Dev, a: *Acts, x: *anyopaque, K: u32, T: u32) !void {
@@ -704,19 +707,24 @@ fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mode) 
     const nul: ?*anyopaque = null;
     const gs: i32 = @intCast(GS);
     const tree: ?*anyopaque = if (mode.tree) a.tree else null;
+    // W4A8 prompt: the norms before mixer in and gate|up quantize h themselves (not with the study mode)
+    const q8on = prefill_int8 and T > 16 and GS == 128 and a8_group == 0;
+    const q8a: ?*anyopaque = if (q8on) a.a8 else null;
+    const q8s: ?*anyopaque = if (q8on) a.sa else null;
+    const q8ms: i32 = @intCast(CHUNK + 32);
     const table = if (mode.tree) a.tree else a.chain;
     try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, a.ids, ids.ptr, ids.len * 4, null, 0, null));
     try embedRows(d, m, a.ids, a.x, T);
     if (p0 == 0) try dump(d, a, T, "embed", false);
     for (&m.layers, 0..) |*l, i| {
-        try d.launch(d.k.add_rmsnorm, .{ .x = T }, .{ a.x, a.r, l.in_norm, a.h, a.ahi, a.alo, @as(i32, D), EPS, @as(i32, if (i == 0) 0 else 1), gs });
+        try d.launch(d.k.add_rmsnorm, .{ .x = T }, .{ a.x, a.r, l.in_norm, a.h, a.ahi, a.alo, @as(i32, D), EPS, @as(i32, if (i == 0) 0 else 1), gs, q8a, q8s, q8ms });
         const probe = p0 == 0 and i == 0;
         if (probe) try dumpBuf(d, "h0", a.h, T * D, .f16);
         // W4A8 study: the GEMM reads a quantized copy (in r, free until mixer_out); the dense a/b gates read h as is
         const min_in = if (a8_group != 0 and T > 16 and a8_sites & 1 != 0) a.r else a.h;
         if (min_in != a.h) try copy(d, a.r, a.h, T * D * 2);
         try a8(d, a, min_in, D, T, 1);
-        try pgemm(d, a, min_in, l.mixer_in, a.p, T);
+        try pgemm(d, a, min_in, l.mixer_in, a.p, T, q8on);
         if (l.ab) |ab| try d.launch(d.k.dense_rows, .{ .x = (T + 15) / 16, .y = 96 / 16 }, .{ a.h, ab, a.p, t32, @as(i32, GDN_IN), @as(i32, 16384) });
         if (probe) try dumpBuf(d, "p0", a.p, T * GDN_IN, .f16);
         if (l.attn) {
@@ -784,13 +792,13 @@ fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mode) 
             if (probe) try dumpBuf(d, "o0", a.h, T * 6144, .f16);
         }
         try a8(d, a, a.h, 6144, T, 2);
-        try pgemm(d, a, a.h, l.mixer_out, a.r, T);
+        try pgemm(d, a, a.h, l.mixer_out, a.r, T, false);
         if (probe) try dumpBuf(d, "r0", a.r, T * D, .f16);
-        try d.launch(d.k.add_rmsnorm, .{ .x = T }, .{ a.x, a.r, l.post_norm, a.h, a.ahi, a.alo, @as(i32, D), EPS, @as(i32, 1), gs });
+        try d.launch(d.k.add_rmsnorm, .{ .x = T }, .{ a.x, a.r, l.post_norm, a.h, a.ahi, a.alo, @as(i32, D), EPS, @as(i32, 1), gs, q8a, q8s, q8ms });
         try a8(d, a, a.h, D, T, 4);
-        const act = try mlpIn(d, a, l.gu, T, gs);
+        const act = try mlpIn(d, a, l.gu, T, gs, q8on);
         try a8(d, a, act, 17408, T, 8);
-        try pgemm(d, a, act, l.down, a.r, T);
+        try pgemm(d, a, act, l.down, a.r, T, false);
         if (p0 == 0 and i < 4) try dump(d, a, T, try std.fmt.allocPrint(alloc, "{d}", .{i}), true);
         if (mode.taps) for (TAP_LAYERS, 0..) |tl, slot| if (tl == i)
             try d.launch(d.k.tap, .{ .x = D / 256, .y = T }, .{ a.x, a.r, a.taps, @as(i32, D), @as(i32, @intCast(slot)) });
@@ -800,7 +808,7 @@ fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mode) 
         return null;
     }
     const hgs: i32 = @intCast(m.head.gs);
-    try d.launch(d.k.add_rmsnorm, .{ .x = T }, .{ a.x, a.r, m.norm, a.h, a.ahi, a.alo, @as(i32, D), EPS, @as(i32, 1), hgs });
+    try d.launch(d.k.add_rmsnorm, .{ .x = T }, .{ a.x, a.r, m.norm, a.h, a.ahi, a.alo, @as(i32, D), EPS, @as(i32, 1), hgs, no_q8, no_q8, @as(i32, 0) });
     if (dump_h) |fd| {                               // XPU_DUMP_H: every row's final normed hidden state, appended
         const host = try alloc.alloc(u16, T * D);
         defer alloc.free(host);
