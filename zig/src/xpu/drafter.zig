@@ -24,7 +24,14 @@ const SPAN_LO = 98304; // the drafter's head: target vocab [0, 98 304) ∪ [248 
 const SPAN_HI0 = 248032;
 const HEAD_N = SPAN_LO + (q.VOCAB - SPAN_HI0); // 98 592
 const RANK = 256;
-const TOPK = 16;
+pub const TOPK = 16;
+pub const DEPTHS = MAXL;
+// the tree policy (tensorfold's Metal values): edge weight, weight of the target's noise, temperature of the pops,
+// children a node pushes
+const EDGE = 0.6;
+const NOISE = 0.7;
+const SCALE = 1.5;
+const BRANCH = 4;
 
 const Layer = struct {
     in_norm: *anyopaque,
@@ -47,6 +54,36 @@ const Layer = struct {
 /// A device-side MLX affine part (words [n, k/8], scales and biases bf16 [n, k/64]) to repack at column n0.
 const Mlx = struct { w: *anyopaque, s: *anyopaque, b: *anyopaque, n: u32 };
 
+/// The tree search's frontier: a few dozen items, popped smallest (score, parent, token, depth) first like heapq.
+const Heap = struct {
+    const Item = struct { score: f64, parent: i32, token: u32, depth: u32 };
+    items: [MAXL * BRANCH + BRANCH]Item = undefined,
+    n: usize = 0,
+    fn push(h: *Heap, it: Item) void {
+        if (h.n < h.items.len) {
+            h.items[h.n] = it;
+            h.n += 1;
+        }
+    }
+    fn before(a: Item, b: Item) bool {
+        if (a.score != b.score) return a.score < b.score;
+        if (a.parent != b.parent) return a.parent < b.parent;
+        if (a.token != b.token) return a.token < b.token;
+        return a.depth < b.depth;
+    }
+    fn pop(h: *Heap) ?Item {
+        if (h.n == 0) return null;
+        var best: usize = 0;
+        for (1..h.n) |i| if (before(h.items[i], h.items[best])) {
+            best = i;
+        };
+        const it = h.items[best];
+        h.n -= 1;
+        h.items[best] = h.items[h.n];
+        return it;
+    }
+};
+
 pub const Drafter = struct {
     r: *q.Runner,
     k: struct { dconv: ze.H, dprep: ze.H, dattn: ze.H, rowsums_rows: ze.H, taps_in: ze.H, to_res: ze.H, topk_part: ze.H, quantize4: ze.H },
@@ -61,6 +98,11 @@ pub const Drafter = struct {
     succ: []const u8,
     cap: u32,
     end: u32 = 0, // context rows held (absolute positions 0 .. end)
+    // the last block's lattice: per depth the top 16 candidates (target ids), their logits, the selector projection
+    cand: [MAXL][TOPK]u32 = undefined,
+    unary: [MAXL][TOPK]f64 = undefined,
+    sp: [MAXL * RANK]f16 = undefined,
+    depths: u32 = 0,
     // buffers
     x: *anyopaque, // fp32 [rows, D]
     h: *anyopaque, // fp16 [rows, 25 600]
@@ -258,8 +300,83 @@ pub const Drafter = struct {
         dr.end += n; // no wait: the next block queues behind on the in-order list
     }
 
-    /// Proposes `count` (≤ MAXL − 1) drafts after `pending`, the token at position `end`.
+    /// Proposes `count` (≤ MAXL − 1) drafts after `pending`, the token at position `end`: one chain, each depth's
+    /// best child under the selector's score (unary + edge).
     pub fn propose(dr: *Drafter, pending: u32, count: u32, out: []u32) !void {
+        try dr.lattice(pending, count);
+        var parent = pending;
+        for (0..count) |depth| {
+            var best: usize = 0;
+            var best_score: f64 = -std.math.inf(f64);
+            for (0..TOPK) |j| {
+                const tok = dr.cand[depth][j];
+                const score = dr.unary[depth][j] + EDGE * dr.edge(parent, depth, tok);
+                if (score > best_score or (score == best_score and tok < dr.cand[depth][best])) {
+                    best_score = score;
+                    best = j;
+                }
+            }
+            out[depth] = dr.cand[depth][best];
+            parent = out[depth];
+        }
+    }
+
+    fn edge(dr: *const Drafter, parent: u32, depth: usize, tok: u32) f64 {
+        var e: f64 = 0;
+        for (0..RANK) |rr| e += code(dr.pred, parent, rr) * @as(f64, dr.sp[depth * RANK + rr]) * code(dr.succ, tok, rr);
+        return e;
+    }
+
+    /// A tree of at most `max_nodes` drafts over the last lattice (tensorfold's DFlash2 best-first policy, after
+    /// families/qwen3_5/cuda/draft_tree.py): nodes in pop order, parents first, `parents[i]` −1 at the root (the
+    /// pending token). `noise` (sampled replies): the target's keyed Gumbel noise of each candidate, `temp` its
+    /// temperature. Returns the node count.
+    pub fn tree(dr: *Drafter, pending: u32, max_nodes: u32, noise: ?*const [MAXL][TOPK]f64, temp: f64, tokens: []u32, parents: []i32) u32 {
+        var heap: Heap = .{};
+        dr.expand(&heap, noise, @max(temp, 1e-6), pending, 0, -1, 0);
+        var n: u32 = 0;
+        while (n < max_nodes) {
+            const it = heap.pop() orelse break;
+            tokens[n] = it.token;
+            parents[n] = it.parent;
+            const me: i32 = @intCast(n);
+            n += 1;
+            if (it.depth + 1 < dr.depths) dr.expand(&heap, noise, @max(temp, 1e-6), it.token, it.depth + 1, me, it.score);
+        }
+        return n;
+    }
+
+    /// Pushes the BRANCH best children of `token` at `depth`, scored by path − log p under the policy.
+    fn expand(dr: *const Drafter, heap: *Heap, noise: ?*const [MAXL][TOPK]f64, temp: f64, token: u32, depth: u32, parent: i32, path: f64) void {
+        var v: [TOPK]f64 = undefined;
+        for (0..TOPK) |j| {
+            v[j] = (dr.unary[depth][j] + EDGE * dr.edge(token, depth, dr.cand[depth][j])) / temp;
+            if (noise) |nz| v[j] += NOISE * nz[depth][j];
+            v[j] /= SCALE;
+        }
+        var mx = v[0];
+        for (v) |x| mx = @max(mx, x);
+        var sum: f64 = 0;
+        for (&v) |*x| {
+            x.* -= mx;
+            sum += @exp(x.*);
+        }
+        const lse = @log(sum);
+        var taken: [TOPK]bool = @splat(false);
+        for (0..BRANCH) |_| { // the BRANCH largest, ties to the lower index (numpy's argsort of −logp)
+            var j: usize = TOPK;
+            for (0..TOPK) |i| if (!taken[i] and (j == TOPK or v[i] > v[j])) {
+                j = i;
+            };
+            taken[j] = true;
+            const lp = v[j] - lse;
+            if (!std.math.isFinite(lp)) break;
+            heap.push(.{ .score = path - lp, .parent = parent, .token = dr.cand[depth][j], .depth = depth });
+        }
+    }
+
+    /// The drafter's block after `pending`: per depth 1 .. count the top 16 candidates and the selector projection.
+    pub fn lattice(dr: *Drafter, pending: u32, count: u32) !void {
         const d = &dr.r.d;
         const L = count + 1;
         var tokens: [MAXL]i32 = undefined;
@@ -297,14 +414,10 @@ pub const Drafter = struct {
         try d.launch(dr.k.topk_part, .{ .x = 256, .y = rows }, .{ dr.logits, @as(i32, HEAD_N), @as(i32, @intCast(dr.head.n)), dr.pv, dr.pi });
         var pv: [MAXL * 256 * 16]f32 = undefined;
         var pi: [MAXL * 256 * 16]i32 = undefined;
-        var sp: [MAXL * RANK]f16 = undefined;
         try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, &pv, dr.pv, rows * 256 * 16 * 4, null, 0, null));
         try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, &pi, dr.pi, rows * 256 * 16 * 4, null, 0, null));
-        try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, &sp, dr.selp, rows * RANK * 2, null, 0, null));
+        try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, &dr.sp, dr.selp, rows * RANK * 2, null, 0, null));
         try d.sync();
-        // lattice: per depth the top 16 (global ids), their logits, and the selector projection
-        var cand: [MAXL][TOPK]u32 = undefined;
-        var unary: [MAXL][TOPK]f64 = undefined;
         for (0..rows) |row| {
             var bv: [TOPK]f32 = @splat(-std.math.inf(f32));
             var bi: [TOPK]i32 = @splat(std.math.maxInt(i32));
@@ -323,28 +436,11 @@ pub const Drafter = struct {
             }
             for (0..TOPK) |j| {
                 const local: u32 = @intCast(bi[j]);
-                cand[row][j] = if (local < SPAN_LO) local else SPAN_HI0 + (local - SPAN_LO);
-                unary[row][j] = bv[j];
+                dr.cand[row][j] = if (local < SPAN_LO) local else SPAN_HI0 + (local - SPAN_LO);
+                dr.unary[row][j] = bv[j];
             }
         }
-        // chain: from the pending token, each depth's best child under the selector's score (unary + edge)
-        var parent = pending;
-        for (0..rows) |depth| {
-            var best: usize = 0;
-            var best_score: f64 = -std.math.inf(f64);
-            for (0..TOPK) |j| {
-                const tok = cand[depth][j];
-                var e: f64 = 0;
-                for (0..RANK) |rr| e += code(dr.pred, parent, rr) * @as(f64, sp[depth * RANK + rr]) * code(dr.succ, tok, rr);
-                const score = unary[depth][j] + 0.6 * e;
-                if (score > best_score or (score == best_score and tok < cand[depth][best])) {
-                    best_score = score;
-                    best = j;
-                }
-            }
-            out[depth] = cand[depth][best];
-            parent = out[depth];
-        }
+        dr.depths = rows;
     }
 
     fn code(t: []const u8, row: u32, col: usize) f64 {
@@ -353,3 +449,52 @@ pub const Drafter = struct {
         return @as(f32, @bitCast(@as(u32, bits) << 16));
     }
 };
+
+/// How a round draws the target's tokens: greedy (each verified row's argmax) without one; with one, `row` draws
+/// row `row` of the verified block at `position` and `gumbel` gives the target's keyed noise of a candidate there.
+pub const Draw = struct {
+    ctx: *anyopaque,
+    row: *const fn (*anyopaque, row: u32, position: u64) anyerror!u32,
+    gumbel: *const fn (*anyopaque, position: u64, id: u64) f64,
+    temperature: f64,
+};
+
+pub const Round = struct { tokens: []const u32, terminal: u32, drafted: u32, accepted: u32 };
+
+/// One tree round from `pending` (the token at the target's position): drafts a tree of at most `nodes`, verifies it,
+/// walks the drawn tokens down the tree and keeps that path. Returns the pending token and the accepted drafts; the
+/// terminal draw (the next pending token) is also `r.last` when greedy.
+pub fn treeRound(dr: *Drafter, pending: u32, depths: u32, nodes: u32, draw: ?Draw, out: *[MAXL]u32) !Round {
+    const r = dr.r;
+    const p0: u64 = r.pos;
+    try dr.lattice(pending, depths);
+    var noise: [MAXL][TOPK]f64 = undefined;
+    if (draw) |dw| for (0..depths) |dd| for (0..TOPK) |j| {
+        noise[dd][j] = dw.gumbel(dw.ctx, p0 + 1 + dd, dr.cand[dd][j]);
+    };
+    var ids: [MAXL]u32 = undefined;
+    var par: [MAXL]i32 = undefined;
+    ids[0] = pending;
+    const n = dr.tree(pending, @min(nodes, MAXL - 1), if (draw != null) &noise else null, if (draw) |dw| dw.temperature else 1.0, ids[1..], par[1..]);
+    var rows: [MAXL]i32 = undefined; // the tree in verified rows: row 0 the pending token
+    rows[0] = 0;
+    for (1..n + 1) |i| rows[i] = if (par[i] < 0) 0 else par[i] + 1;
+    const greedy = try r.verifyTree(ids[0 .. n + 1], rows[0 .. n + 1]);
+    var path: [MAXL]u32 = undefined;
+    path[0] = 0;
+    var len: u32 = 1;
+    var terminal = if (draw) |dw| try dw.row(dw.ctx, 0, p0 + 1) else greedy[0];
+    walk: while (true) {
+        for (1..n + 1) |c| if (rows[c] == path[len - 1] and ids[c] == terminal) {
+            path[len] = @intCast(c);
+            len += 1;
+            terminal = if (draw) |dw| try dw.row(dw.ctx, @intCast(c), p0 + len) else greedy[c];
+            continue :walk;
+        };
+        break;
+    }
+    try r.commitPath(path[0..len]);
+    try dr.addTaps(r.acts.taps, len);
+    for (0..len) |i| out[i] = ids[path[i]];
+    return .{ .tokens = out[0..len], .terminal = terminal, .drafted = n, .accepted = len - 1 };
+}

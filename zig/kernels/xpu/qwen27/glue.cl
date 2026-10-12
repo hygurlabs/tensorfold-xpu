@@ -105,14 +105,16 @@ KERNEL(512) void add_rmsnorm(global float *X, global const half *R, global const
 // Grille (T, 40) : un groupe de 256 par bloc de 256 canaux (deux têtes de 128) ; le bloc 0 calcule aussi g et β.
 KERNEL(256) void gdn_pre(global const half *P, global const half *CIN, global half *COUT, global const ushort *CW,
                          global const ushort *ALOG, global const ushort *DT, global ushort *Q, global ushort *K,
-                         global ushort *V, global float *G, global float *BETA, int T) {
+                         global ushort *V, global float *G, global float *BETA, int T, global const int *TREE) {
   local float cv[256];
   const int t = get_group_id(0), blk = get_group_id(1), lid = get_local_id(0), sg = get_sub_group_id();
   const int lane = get_sub_group_local_id(), c = blk * 256 + lid;
   float s = 0.0f;
+  const int dep = TREE ? TREE[t * 17] & 255 : t;
   for (int j = 0; j < 4; j++) {
-    const int i = t + j;                              // ligne de concat(état, qkv)
-    const float x = i < 3 ? (float)CIN[i * NCONV + c] : (float)P[(long)(i - 3) * 16640 + c];
+    const int dd = dep - 3 + j;                       // profondeur de l'entrée (négative : l'état d'entrée)
+    const int row = dd < 0 ? 0 : (TREE ? TREE[t * 17 + 1 + dd] : dd);
+    const float x = dd < 0 ? (float)CIN[(3 + dd) * NCONV + c] : (float)P[(long)row * 16640 + c];
     s += x * bf2f(CW[c * 4 + j]);
   }
   cv[lid] = rbf(silu(s));
@@ -215,9 +217,10 @@ KERNEL(256) void gated_norm(global const ushort *Y, global const half *P, global
 // θ^(−i/32)), arrondi bf16. Q [T, 24, 256] ; K, V écrits au cache [L, 4, 256] à la position p0 + t.
 KERNEL(256) void attn_prep(global const half *P, global const ushort *QN, global const ushort *KN,
                            global const float *INVF, global ushort *Q, global ushort *KC, global ushort *VC, int p0,
-                           float eps) {
+                           float eps, global const int *TREE) {
+  // TREE (si non nul) : la position de la ligne t est p0 + sa profondeur ; ses K, V restent rangés à p0 + t
   const int t = get_group_id(0), sg = get_sub_group_id(), lane = get_sub_group_local_id();
-  const float pos = (float)(p0 + t);
+  const float pos = (float)(p0 + (TREE ? TREE[t * 17] & 255 : t));
   for (int hh = sg; hh < 32; hh += 16) {               // 0-23 : q, 24-27 : k, 28-31 : v
     if (hh >= 28) {
       for (int i = 0; i < 16; i++)
@@ -330,13 +333,14 @@ KERNEL(256) void tap(global const float *X, global const half *R, global ushort 
   if (e < D) TAPS[(long)t * 5 * D + slot * D + e] = f2bf(rbf(X[(long)t * D + e] + (float)R[(long)t * D + e]));
 }
 
-// État de convolution après les KEEP premières lignes d'un bloc : COUT = 3 dernières lignes de concat(CIN, qkv[0..KEEP)),
-// qkv lu dans P (pas 16 640). Grille 40 groupes de 256 canaux.
-KERNEL(256) void conv_commit(global const half *CIN, global const half *P, global half *COUT, int keep) {
+// État de convolution après un chemin gardé de KEEP lignes (PATH : leurs lignes, ou les KEEP premières si nul) :
+// COUT = 3 dernières lignes de concat(CIN, qkv du chemin), qkv lu dans P (pas 16 640). Grille 40 groupes de 256 canaux.
+KERNEL(256) void conv_commit(global const half *CIN, global const half *P, global half *COUT, int keep,
+                             global const int *PATH) {
   const int c = get_global_id(0);
   for (int r = 0; r < 3; r++) {
     const int i = keep + r;                           // ligne de concat(état, qkv), 3 + keep lignes
-    COUT[r * NCONV + c] = i < 3 ? CIN[i * NCONV + c] : P[(long)(i - 3) * 16640 + c];
+    COUT[r * NCONV + c] = i < 3 ? CIN[i * NCONV + c] : P[(long)(PATH ? PATH[i - 3] : i - 3) * 16640 + c];
   }
 }
 

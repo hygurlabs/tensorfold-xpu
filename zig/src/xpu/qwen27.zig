@@ -87,7 +87,7 @@ pub const Dev = struct {
     staging: []u8 = &.{}, // USM host memory: the driver cannot copy from file-backed mmap pages directly
     k: struct {
         embed: ze.H, add_rmsnorm: ze.H, gdn_pre: ze.H, gdn_pre_rows: ze.H, gated_norm: ze.H, attn_prep: ze.H, attn_gate: ze.H,
-        swiglu: ze.H, argmax: ze.H, argmax_part: ze.H, tap: ze.H, conv_commit: ze.H, repack: ze.H, gdn_step: ze.H, attn_decode: ze.H, attn_merge: ze.H,
+        swiglu: ze.H, argmax: ze.H, argmax_part: ze.H, tap: ze.H, conv_commit: ze.H, repack: ze.H, gdn_step: ze.H, attn_decode: ze.H, attn_merge: ze.H, kv_move: ze.H,
         dec_wide: ze.H, dec_wide64: ze.H, dec_narrow: ze.H, gdn_prep: ze.H, gdn_state: ze.H, gdn_out: ze.H, ngen_wide: ze.H,
         ngen_narrow: ze.H, prompt_attn: ze.H,
     },
@@ -173,8 +173,8 @@ const Prof = struct {
     events: [4096]ze.H = @splat(null),
     kernel: [4096]ze.H = @splat(null),
     used: usize = 0,
-    names: [25]struct { k: ze.H = null, name: []const u8 = "" } = @splat(.{}),
-    total: [25]f64 = @splat(0),
+    names: [40]struct { k: ze.H = null, name: []const u8 = "" } = @splat(.{}),
+    total: [40]f64 = @splat(0),
 };
 pub var prof: Prof = .{};
 
@@ -353,6 +353,10 @@ const Acts = struct {
     ids: *anyopaque, // i32 [CHUNK]
     zeros: *anyopaque, // padding rows of the GDN chunks: k = v = 0, β = 0 …
     ones: *anyopaque, // … and g = 1
+    chain: *anyopaque, // i32 [16, 17]: the tree table of a chain (row t at depth t), for the decode attention
+    tree: *anyopaque, // i32 [16, 17]: the verified block's tree table (decode.cl, DEPTH and ANC)
+    path: *anyopaque, // i32 [16]: the rows of the kept path
+    sl: *anyopaque, // fp32 [16, 48, 128, 128]: GDN state after each row of a verified tree
 
     fn init(d: *Dev) !Acts {
         const nc = CHUNK / 64;
@@ -368,9 +372,21 @@ const Acts = struct {
             .pm = try d.alloc_(16 * 24 * ns * 4), .pl = try d.alloc_(16 * 24 * ns * 4), .po = try d.alloc_(16 * 24 * ns * 256 * 4),
             .pscr = try d.alloc_(CHUNK * D * 4), .logits = try d.alloc_(16 * VOCAB * 2), .tok = try d.alloc_(16 * 4), .pv = try d.alloc_(16 * 1024), .pi = try d.alloc_(16 * 1024), .taps = try d.alloc_(CHUNK * 5 * D * 2), .ids = try d.alloc_(CHUNK * 4),
             .zeros = try d.alloc_(CHUNK * 48 * 128 * 2), .ones = try d.alloc_(CHUNK * 48 * 4),
+            .chain = try d.upload(std.mem.sliceAsBytes(&chainTable())), .tree = try d.alloc_(16 * 17 * 4), .path = try d.alloc_(16 * 4),
+            .sl = try d.alloc_(16 * 48 * 128 * 128 * 4),
         };
     }
 };
+
+/// Row t at depth t, its ancestors rows 0 .. t: a chain's tree table.
+fn chainTable() [16 * 17]i32 {
+    var t: [16 * 17]i32 = @splat(0);
+    for (0..16) |r| {
+        t[r * 17] = @intCast(r);
+        for (0..r + 1) |dd| t[r * 17 + 1 + dd] = @intCast(dd);
+    }
+    return t;
+}
 
 /// out[M, N] fp16 = h[M, K] · Wᵀ : decode kernels up to 16 rows, the nGEN prompt GEMMs above.
 pub fn gemm(d: *Dev, pscr: *anyopaque, h: *anyopaque, ahi: *anyopaque, alo: *anyopaque, w: Proj, out: *anyopaque, m: u32) !void {
@@ -449,7 +465,8 @@ fn dumpBuf(d: *Dev, name: []const u8, p: *anyopaque, n: usize, kind: enum { f16,
 
 /// What a forward leaves: nothing, the last row's logits and greedy token, or every row's (verification, ≤ 16 rows).
 pub const Want = enum { none, last, rows };
-pub const Mode = struct { want: Want = .last, stash: bool = false, taps: bool = false };
+/// tree: the rows form a tree (acts.tree), each seeing its ancestors only; their GDN states land in acts.sl.
+pub const Mode = struct { want: Want = .last, stash: bool = false, taps: bool = false, tree: bool = false };
 
 /// One forward over `ids` (≤ CHUNK rows) at positions p0..; the greedy token of the last row (or rows: a.tok).
 /// Up to 16 rows the GDN runs serially (gdn_step), as decode does, so a verified row equals the serial one.
@@ -458,6 +475,9 @@ fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mode) 
     const T: u32 = @intCast(ids.len);
     const t32: i32 = @intCast(T);
     const tp = (T + 63) / 64 * 64; // GDN chunk rows (padded)
+    const nul: ?*anyopaque = null;
+    const tree: ?*anyopaque = if (mode.tree) a.tree else null;
+    const table = if (mode.tree) a.tree else a.chain;
     try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, a.ids, ids.ptr, ids.len * 4, null, 0, null));
     try d.launch(d.k.embed, .{ .x = T }, .{ a.ids, m.embed_w, m.embed_s, m.embed_b, a.x, @as(i32, D) });
     if (p0 == 0) try dump(d, a, T, "embed", false);
@@ -468,15 +488,14 @@ fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mode) 
         try gemm(d, a.pscr, a.h, a.ahi, a.alo, l.mixer_in, a.p, T);
         if (probe) try dumpBuf(d, "p0", a.p, T * GDN_IN, .f16);
         if (l.attn) {
-            const ctx = p0 + T;
+            const ctx = p0 + T; // a tree's rows see fewer: the slices past their depth are empty
             const ns = (ctx + SPLIT - 1) / SPLIT;
-            try d.launch(d.k.attn_prep, .{ .x = T }, .{ a.p, l.qn.?, l.kn.?, m.invf, a.q, l.kc.?, l.vc.?, @as(i32, @intCast(p0)), EPS });
+            try d.launch(d.k.attn_prep, .{ .x = T }, .{ a.p, l.qn.?, l.kn.?, m.invf, a.q, l.kc.?, l.vc.?, @as(i32, @intCast(p0)), EPS, tree });
             if (T > 16) {                                // the port's Triton prompt kernel: 256 rows a program
-                const nul: ?*anyopaque = null;
                 try d.launch(d.k.prompt_attn, .{ .x = (T + 255) / 256, .y = 24 }, .{ a.q, l.kc.?, l.vc.?, a.y, @as(i32, @intCast(p0)), t32, @as(i32, @intCast(ctx)), nul, nul });
             } else {
-                try d.launch(d.k.attn_decode, .{ .x = ns, .y = 4, .z = T }, .{ a.q, l.kc.?, l.vc.?, a.pm, a.pl, a.po, @as(i32, @intCast(p0)), @as(i32, @intCast(ns)), @as(f32, 1.0 / 16.0) });
-                try d.launch(d.k.attn_merge, .{ .x = 24, .y = T }, .{ a.pm, a.pl, a.po, a.y, @as(i32, @intCast(p0)), @as(i32, @intCast(ns)) });
+                try d.launch(d.k.attn_decode, .{ .x = ns, .y = 4, .z = T }, .{ a.q, l.kc.?, l.vc.?, a.pm, a.pl, a.po, @as(i32, @intCast(p0)), @as(i32, @intCast(ns)), @as(f32, 1.0 / 16.0), table });
+                try d.launch(d.k.attn_merge, .{ .x = 24, .y = T }, .{ a.pm, a.pl, a.po, a.y, @as(i32, @intCast(p0)), @as(i32, @intCast(ns)), table });
             }
             try d.launch(d.k.attn_gate, .{ .x = T }, .{ a.y, a.p, a.h, a.ahi, a.alo });
         } else {
@@ -486,7 +505,7 @@ fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mode) 
             if (T > 16)
                 try d.launch(d.k.gdn_pre_rows, .{ .x = T }, .{ a.p, cin, cout, l.conv_w.?, l.alog.?, l.dt.?, a.q, a.k, a.v, a.g, a.beta, t32 })
             else
-                try d.launch(d.k.gdn_pre, .{ .x = T, .y = 40 }, .{ a.p, cin, cout, l.conv_w.?, l.alog.?, l.dt.?, a.q, a.k, a.v, a.g, a.beta, t32 });
+                try d.launch(d.k.gdn_pre, .{ .x = T, .y = 40 }, .{ a.p, cin, cout, l.conv_w.?, l.alog.?, l.dt.?, a.q, a.k, a.v, a.g, a.beta, t32, tree });
             if (T > 16 and tp > T) {                     // neutral padding rows: the state does not move
                 const pad = tp - T;
                 const cp = struct {
@@ -510,7 +529,8 @@ fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mode) 
                     try copy(d, off(st, ST_P), a.p, T * GDN_IN * 2);
                 }
                 // verification: the state after the block goes to rec_save, rec keeps the entry for the replay
-                try d.launch(d.k.gdn_step, .{ .x = 16, .y = 48 }, .{ a.q, a.k, a.v, a.g, a.beta, l.rec.?, if (mode.stash) l.rec_save.? else l.rec.?, a.y, t32 });
+                // a tree: each row's state to acts.sl, rec untouched
+                try d.launch(d.k.gdn_step, .{ .x = 16, .y = 48 }, .{ a.q, a.k, a.v, a.g, a.beta, l.rec.?, if (mode.stash) l.rec_save.? else l.rec.?, a.y, t32, nul, tree, a.sl });
             } else {
                 const nc: i32 = @intCast(tp / 64);
                 const ncu: u32 = tp / 64;
@@ -576,6 +596,9 @@ pub const Runner = struct {
     host_logits: []f32 = &.{},
     block: [16]u32 = @splat(0), // the last verified block's greedy tokens
     block_rows: u32 = 0,
+    tree_on: bool = false, // the last verified block was a tree (commitPath)
+    tree_host: [16 * 17]i32 = @splat(0),
+    path_host: [16]i32 = @splat(0),
     /// Target hidden states for a drafter: when on, every forward fills acts.taps and calls `on_taps` with its rows.
     taps_on: bool = false,
     on_taps: ?struct { ctx: *anyopaque, f: *const fn (*anyopaque, *anyopaque, u32) anyerror!void } = null,
@@ -622,7 +645,7 @@ pub const Runner = struct {
             .attn_prep = try d.kernel(mg, "attn_prep", 256), .attn_gate = try d.kernel(mg, "attn_gate", 256),
             .swiglu = try d.kernel(mg, "swiglu", 256), .argmax = try d.kernel(mg, "argmax", 256), .argmax_part = try d.kernel(mg, "argmax_part", 256), .tap = try d.kernel(mg, "tap", 256), .conv_commit = try d.kernel(mg, "conv_commit", 256),
             .repack = try d.kernel(mg, "repack", 16), .gdn_step = try d.kernel(md, "gdn_step", 16),
-            .attn_decode = try d.kernel(md, "attn_decode", 16), .attn_merge = try d.kernel(md, "attn_merge", 16),
+            .attn_decode = try d.kernel(md, "attn_decode", 16), .attn_merge = try d.kernel(md, "attn_merge", 16), .kv_move = try d.kernel(md, "kv_move", 16),
             .dec_wide = try d.kernel(mm, "w4k1_decode", 64), .dec_wide64 = try d.kernel(mm, "w4k1_d64", 64), .dec_narrow = try d.kernel(mm, "w4k_dsplit", 64),
             .gdn_prep = try d.kernel(mgd, "gdn_prep", 64), .gdn_state = try d.kernel(mgd, "gdn_state", 256),
             .gdn_out = try d.kernel(mgd, "gdn_out", 128), .ngen_wide = try d.kernel(mw, "w4g_dpb", 256),
@@ -694,20 +717,90 @@ pub const Runner = struct {
     /// Keeps the first `keep` rows of the last verified block: the GDN and convolution states are rebuilt from the
     /// block's entry by replaying those rows (the attention caches need nothing: later positions overwrite them).
     pub fn commit(r: *Runner, keep: u32) !void {
-        if (keep == 0 or keep > r.block_rows) return error.BadCommit;
+        if (keep == 0 or keep > r.block_rows or r.tree_on) return error.BadCommit;
+        const nul: ?*anyopaque = null;
         for (&r.model.layers) |*l| if (!l.attn) {
             if (keep == r.block_rows) { // every row kept: the block's final state is the state
                 std.mem.swap(?*anyopaque, &l.rec, &l.rec_save);
                 continue;
             }
             const st = l.stash.?;
-            try r.d.launch(r.d.k.gdn_step, .{ .x = 16, .y = 48 }, .{ off(st, ST_Q), off(st, ST_K), off(st, ST_V), off(st, ST_G), off(st, ST_B), l.rec.?, l.rec.?, r.acts.y, @as(i32, @intCast(keep)) });
+            try r.d.launch(r.d.k.gdn_step, .{ .x = 16, .y = 48 }, .{ off(st, ST_Q), off(st, ST_K), off(st, ST_V), off(st, ST_G), off(st, ST_B), l.rec.?, l.rec.?, r.acts.y, @as(i32, @intCast(keep)), nul, nul, nul });
             // the block's forward flipped conv_cur: conv[cur] is the state after all rows, conv[1 - cur] the entry
-            try r.d.launch(r.d.k.conv_commit, .{ .x = 40 }, .{ l.conv[1 - l.conv_cur].?, off(st, ST_P), l.conv[l.conv_cur].?, @as(i32, @intCast(keep)) });
+            try r.d.launch(r.d.k.conv_commit, .{ .x = 40 }, .{ l.conv[1 - l.conv_cur].?, off(st, ST_P), l.conv[l.conv_cur].?, @as(i32, @intCast(keep)), nul });
         };
         r.pos += keep;
         r.last = r.block[keep - 1];
         r.block_rows = 0; // no wait: the next commands queue behind these on the in-order list
+    }
+
+    /// Verifies a tree: row 0 the pending token, `parents[t]` the row below row t (t ≥ 1, parents first). Every row's
+    /// greedy token returned; `commitPath` then keeps one root path.
+    pub fn verifyTree(r: *Runner, ids: []const u32, parents: []const i32) ![]const u32 {
+        if (ids.len == 0 or ids.len > 16 or parents.len != ids.len) return error.BadBlock;
+        var depth_max: u32 = 0;
+        for (0..ids.len) |t| {
+            const row = r.tree_host[t * 17 ..][0..17];
+            if (t == 0) {
+                row[0] = 0;
+                row[1] = 0;
+                continue;
+            }
+            const p: usize = @intCast(parents[t]);
+            if (p >= t) return error.BadBlock;
+            const pr = r.tree_host[p * 17 ..][0..17];
+            row[0] = pr[0] + 1;
+            @memcpy(row[1 .. 1 + @as(usize, @intCast(pr[0])) + 1], pr[1 .. 1 + @as(usize, @intCast(pr[0])) + 1]);
+            row[1 + @as(usize, @intCast(row[0]))] = @intCast(t);
+            depth_max = @max(depth_max, @as(u32, @intCast(row[0])));
+        }
+        for (1..ids.len) |t| { // LOAD: the parent is not the row before ; SAVE: a child is not the row after
+            const p: usize = @intCast(parents[t]);
+            if (p + 1 != t) {
+                r.tree_host[t * 17] |= 512;
+                r.tree_host[p * 17] |= 256;
+            }
+        }
+        if (r.pos + depth_max + 1 > r.context or r.pos + ids.len > r.context) return error.ContextFull;
+        try ze.check(r.d.g.api.zeCommandListAppendMemoryCopy(r.d.list, r.acts.tree, &r.tree_host, ids.len * 17 * 4, null, 0, null));
+        _ = try forward(&r.d, &r.model, &r.acts, @ptrCast(ids), r.pos, .{ .want = .rows, .stash = true, .taps = r.taps_on, .tree = true });
+        var toks: [16]i32 = undefined;
+        try ze.check(r.d.g.api.zeCommandListAppendMemoryCopy(r.d.list, &toks, r.acts.tok, ids.len * 4, null, 0, null));
+        try r.d.sync();
+        for (r.block[0..ids.len], toks[0..ids.len]) |*o, t| o.* = @intCast(t);
+        r.block_rows = @intCast(ids.len);
+        r.tree_on = true;
+        return r.block[0..ids.len];
+    }
+
+    /// Keeps the root path `path` (rows of the last verified tree, path[0] = 0, each the parent of the next): GDN and
+    /// convolution states replayed along it, its K/V moved to their positions, its taps gathered to the front.
+    pub fn commitPath(r: *Runner, path: []const u32) !void {
+        if (!r.tree_on or path.len == 0 or path.len > r.block_rows or path[0] != 0) return error.BadCommit;
+        var straight = true;
+        for (path, 0..) |row, dd| {
+            r.path_host[dd] = @intCast(row);
+            straight = straight and row == dd;
+        }
+        const keep: i32 = @intCast(path.len);
+        try ze.check(r.d.g.api.zeCommandListAppendMemoryCopy(r.d.list, r.acts.path, &r.path_host, path.len * 4, null, 0, null));
+        const nul: ?*anyopaque = null;
+        for (&r.model.layers) |*l| {
+            if (l.attn) {
+                if (!straight) try r.d.launch(r.d.k.kv_move, .{ .x = 4 }, .{ l.kc.?, l.vc.?, @as(i32, @intCast(r.pos)), r.acts.path, keep });
+                continue;
+            }
+            const st = l.stash.?;
+            try r.d.launch(r.d.k.gdn_step, .{ .x = 16, .y = 48 }, .{ off(st, ST_Q), off(st, ST_K), off(st, ST_V), off(st, ST_G), off(st, ST_B), l.rec.?, l.rec.?, r.acts.y, keep, r.acts.path, nul, nul });
+            try r.d.launch(r.d.k.conv_commit, .{ .x = 40 }, .{ l.conv[1 - l.conv_cur].?, off(st, ST_P), l.conv[l.conv_cur].?, keep, r.acts.path });
+        }
+        if (r.taps_on and !straight) for (path, 0..) |row, dd| if (row != dd)
+            try copy(&r.d, off(r.acts.taps, dd * 5 * D * 2), off(r.acts.taps, row * 5 * D * 2), 5 * D * 2);
+        r.pos += @intCast(path.len);
+        r.last = r.block[path[path.len - 1]];
+        r.block_rows = 0;
+        r.tree_on = false;
+        try r.d.sync(); // path_host is read by the queued copy
     }
 
     /// The logits of row `row` of the last verified block (or of the last forward's row, row 0), fp32 on the host.

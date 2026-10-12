@@ -4,7 +4,8 @@
 //!                                              N synthetic prompt tokens ; XPU_CTX: context (4 096)
 const std = @import("std");
 const q = @import("qwen27.zig");
-const Drafter = @import("drafter.zig").Drafter;
+const dr_mod = @import("drafter.zig");
+const Drafter = dr_mod.Drafter;
 
 const alloc = std.heap.c_allocator;
 extern "c" fn open(path: [*:0]const u8, flags: c_int, ...) c_int;
@@ -113,7 +114,22 @@ fn drafted(r: *q.Runner, dir: []const u8, prompt: []const u32, serial: []const u
     var t_draft: f64 = 0;
     var t_verify: f64 = 0;
     const t0 = q.now();
+    const nodes: u32 = if (std.c.getenv("XPU_TREE")) |v| try std.fmt.parseInt(u32, std.mem.span(v), 10) else 0;
+    var accepted: usize = 0;
+    var drafted_n: usize = 0;
     while (got.items.len < serial.len) {
+        if (nodes > 0) { // tree rounds: drafting and verification timed together
+            const a = q.now();
+            var out: [16]u32 = undefined;
+            const round = try dr_mod.treeRound(dr, r.last, L - 1, nodes, null, &out);
+            t_verify += q.now() - a;
+            for (round.tokens[1..]) |t| try got.append(alloc, t);
+            try got.append(alloc, round.terminal);
+            accepted += round.accepted;
+            drafted_n += round.drafted;
+            rounds += 1;
+            continue;
+        }
         var block: [16]u32 = undefined;
         block[0] = r.last;
         const a = q.now();
@@ -131,6 +147,7 @@ fn drafted(r: *q.Runner, dir: []const u8, prompt: []const u32, serial: []const u
     }
     const dt = q.now() - t0;
     q.profReport("drafted rounds");
+    if (nodes > 0) std.debug.print("tree: {d} nodes a round, {d:.2} accepted of {d:.1} drafted\n", .{ nodes, @as(f64, @floatFromInt(accepted)) / @as(f64, @floatFromInt(rounds)), @as(f64, @floatFromInt(drafted_n)) / @as(f64, @floatFromInt(rounds)) });
     const len = @min(got.items.len, serial.len);
     const same = std.mem.eql(u32, got.items[0..len], serial[0..len]);
     std.debug.print("drafted: {d} tokens in {d} rounds ({d:.2} a round), {d:.1} tok/s, draft {d:.1} ms + verify {d:.1} ms a round, equal to serial: {}\n", .{ got.items.len - 1, rounds, @as(f64, @floatFromInt(got.items.len - 1)) / @as(f64, @floatFromInt(rounds)), @as(f64, @floatFromInt(got.items.len - 1)) / dt, t_draft * 1e3 / @as(f64, @floatFromInt(rounds)), t_verify * 1e3 / @as(f64, @floatFromInt(rounds)), same });

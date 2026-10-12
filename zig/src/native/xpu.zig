@@ -20,6 +20,7 @@ const Host = struct {
     serial: *Serial.Host,
     drafter: ?*Drafter = null,
     block: u32 = 8,
+    nodes: u32 = 15, // drafts a tree round verifies (XPU_TREE; 0: one chain of block − 1)
     out: [16]u32 = undefined,
     pending: ?u32 = null, // a sampled reply's next token, drawn at the end of the previous round
 
@@ -42,6 +43,10 @@ const Host = struct {
         const r = h.runner;
         const dr = h.drafter orelse return error.DraftNotAttached;
         const L = h.block;
+        if (h.nodes > 0) {
+            const round = try xq.drafter.treeRound(dr, r.last, L - 1, h.nodes, null, h.out[0..16]);
+            return h.cut(round, budget, eos);
+        }
         var block: [16]u32 = undefined;
         block[0] = r.last;
         try dr.propose(r.last, L - 1, block[1..L]);
@@ -95,6 +100,28 @@ const Host = struct {
     }
     /// A drafted round for a sampled reply: every verified row is drawn at its position as the serial reply would,
     /// and a draft counts only while it equals that draw; the first differing draw is the round's bonus.
+    /// A tree round's tokens cut at the budget and the first stop token.
+    fn cut(h: *Host, round: xq.drafter.Round, budget: u32, eos: []const u32) Serial.Batch {
+        _ = h;
+        var count: u32 = @min(@as(u32, @intCast(round.tokens.len)), budget);
+        for (round.tokens[0..count], 0..) |t, i| if (std.mem.indexOfScalar(u32, eos, t) != null) {
+            count = @intCast(i + 1);
+            break;
+        };
+        return .{ .tokens = round.tokens[0..count], .stats = .{ .rounds = 1, .drafted = round.drafted, .accepted = round.accepted, .min_rows = round.drafted + 1 } };
+    }
+    const Sampled = struct {
+        h: *Host,
+        s: api.Sampling,
+        fn row(ctx: *anyopaque, row_: u32, position: u64) !u32 {
+            const c: *@This() = @ptrCast(@alignCast(ctx));
+            return c.h.pick(try c.h.runner.rowLogits(row_), position, c.s);
+        }
+        fn gumbel(ctx: *anyopaque, position: u64, id: u64) f64 {
+            const c: *@This() = @ptrCast(@alignCast(ctx));
+            return -@log(-@log(sampling.uniform(c.s.seed, position, id)));
+        }
+    };
     fn batchSampled(ptr: *anyopaque, budget: u32, eos: []const u32, s: api.Sampling) !Serial.Batch {
         const h = self(ptr);
         const r = h.runner;
@@ -102,6 +129,12 @@ const Host = struct {
         const L = h.block;
         const p0 = r.pos;
         const pending = h.pending orelse try h.pick(try r.rowLogits(0), p0, s);
+        if (h.nodes > 0) {
+            var ctx: Sampled = .{ .h = h, .s = s };
+            const round = try xq.drafter.treeRound(dr, pending, L - 1, h.nodes, .{ .ctx = &ctx, .row = Sampled.row, .gumbel = Sampled.gumbel, .temperature = s.temperature }, h.out[0..16]);
+            h.pending = round.terminal;
+            return h.cut(round, budget, eos);
+        }
         var block: [16]u32 = undefined;
         block[0] = pending;
         try dr.propose(pending, L - 1, block[1..L]);
@@ -170,6 +203,7 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
         };
         h.drafter = dr;
         if (std.c.getenv("XPU_BLOCK")) |v| h.block = std.fmt.parseInt(u32, std.mem.span(v), 10) catch 8;
+        if (std.c.getenv("XPU_TREE")) |v| h.nodes = std.fmt.parseInt(u32, std.mem.span(v), 10) catch 15;
         runner.taps_on = true;
         runner.on_taps = .{ .ctx = dr, .f = Host.onTaps };
         h.serial.driver.draft_batch = Host.batch;
