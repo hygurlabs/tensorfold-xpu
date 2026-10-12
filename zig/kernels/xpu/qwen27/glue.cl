@@ -303,12 +303,14 @@ KERNEL(256) void attn_gate(global const ushort *O, global const half *P, global 
 
 // SwiGLU : GU fp16 [T, 34 816] = gate (17 408) | up (17 408) ; act = fp16(bf16(SiLU(g)·u)) et ses sommes de ligne.
 // Grille (T, 17) : un groupe de 256 par bloc de 1 024 colonnes (1 024 / gs groupes de sommes).
-KERNEL(256) void swiglu(global const half *GU, global half *H, global half *AHI, global half *ALO, int gs) {
+// ilv : gate|up entrelacés par blocs de 16 (gate de la colonne c en (c / 16)·32 + c % 16, up 16 plus loin).
+KERNEL(256) void swiglu(global const half *GU, global half *H, global half *AHI, global half *ALO, int gs, int ilv) {
   local half hl[1024];
   const int t = get_group_id(0), blk = get_group_id(1), lid = get_local_id(0);
   {                                                   // 4 colonnes consécutives par fil, lectures et écriture vectorielles
     const int e = lid * 4, c = blk * 1024 + e;
-    const half4 gv = vload4(0, GU + (long)t * 34816 + c), uv = vload4(0, GU + (long)t * 34816 + 17408 + c);
+    const long gc = ilv ? (c / 16) * 32 + c % 16 : c, uc = ilv ? gc + 16 : 17408 + c;
+    const half4 gv = vload4(0, GU + (long)t * 34816 + gc), uv = vload4(0, GU + (long)t * 34816 + uc);
     half4 o;
     for (int i = 0; i < 4; i++) o[i] = convert_half_rte(rbf(silu((float)gv[i]) * (float)uv[i]));
     vstore4(o, 0, H + (long)t * 17408 + c);
@@ -326,6 +328,15 @@ KERNEL(256) void swiglu(global const half *GU, global half *H, global half *AHI,
       ALO[(long)t * (17408 / gs) + blk * ng + g] = convert_half_rte(s - (float)hi);
     }
   }
+}
+
+// Sommes de ligne de l'activation écrite par l'épilogue SwiGLU (H fp16 [T, 17 408]) : grille T, groupes de 256.
+KERNEL(256) void rowsums_ff(global const half *H, global half *AHI, global half *ALO, int gs) {
+  local half hl[17408];
+  const int t = get_group_id(0);
+  for (int e = get_local_id(0) * 4; e < 17408; e += 1024) vstore4(vload4(0, H + (long)t * 17408 + e), 0, hl + e);
+  barrier(CLK_LOCAL_MEM_FENCE);
+  rowsums(hl, 17408, AHI, ALO, t, gs);
 }
 
 // Arg max de chaque ligne de logits fp16 [T, V] (le premier indice en cas d'égalité), en deux noyaux : maxima
@@ -386,42 +397,45 @@ KERNEL(256) void conv_commit(global const half *CIN, global const half *P, globa
 // Réempaquetage au chargement d'une projection MLX (mots [N, K/8], échelles et biais bf16 [N, K/64]) vers la
 // disposition du GEMM : mots [K/8, NT] aux colonnes n0 + n, quartets entrelacés (paire k = 2p, 2p + 1 : bits 4p et
 // 16 + 4p) ; échelles fp16 [K/64, NT] ; biais × 64 en fp16 [K/64, NT] (famille « biais par DPAS »).
+// ILV (gate|up entrelacés pour l'épilogue SwiGLU) : 1 gate, 2 up ; la colonne n va en (n / 16)·32 + (ILV − 1)·16 + n % 16.
 kernel void repack(global const uint *MW, global const ushort *MS, global const ushort *MB, global uint *W,
-                   global half *S, global half *BG, int N, int K, int NT, int n0) {
+                   global half *S, global half *BG, int N, int K, int NT, int n0, int ILV) {
   const int n = get_global_id(0), w = get_global_id(1);
   if (n >= N || w >= K / 8) return;
+  const long col = ILV ? (n / 16) * 32 + (ILV - 1) * 16 + n % 16 : n0 + n;
   const uint m = MW[(long)n * (K / 8) + w];
   uint o = 0;
   for (int p = 0; p < 4; p++) {
     o |= ((m >> (8 * p)) & 0xFu) << (4 * p);
     o |= ((m >> (8 * p + 4)) & 0xFu) << (16 + 4 * p);
   }
-  W[(long)w * NT + n0 + n] = o;
+  W[(long)w * NT + col] = o;
   if (w % (GS / 8) == 0) {
     const int g = w / (GS / 8);
-    S[(long)g * NT + n0 + n] = convert_half_rte(bf2f(MS[(long)n * (K / GS) + g]));
-    BG[(long)g * NT + n0 + n] = convert_half_rte(bf2f(MB[(long)n * (K / GS) + g]) * GS);
+    S[(long)g * NT + col] = convert_half_rte(bf2f(MS[(long)n * (K / GS) + g]));
+    BG[(long)g * NT + col] = convert_half_rte(bf2f(MB[(long)n * (K / GS) + g]) * GS);
   }
 }
 
 // Réempaquetage au chargement d'une projection GPTQ symétrique 4 bits (mots [K/8, N] int32, quartet j = k 8w + j ;
 // échelles fp16 [K/G, N] ; zéro 8) vers la disposition du GEMM : mêmes mots entrelacés, S = s, biais × G = −8·s·G.
 kernel void repack_gptq(global const uint *QW, global const half *SC, global uint *W, global half *S, global half *BG,
-                        int N, int K, int NT, int n0, int G) {
+                        int N, int K, int NT, int n0, int G, int ILV) {
   const int n = get_global_id(0), w = get_global_id(1);
   if (n >= N || w >= K / 8) return;
+  const long col = ILV ? (n / 16) * 32 + (ILV - 1) * 16 + n % 16 : n0 + n;
   const uint m = QW[(long)w * N + n];
   uint o = 0;
   for (int p = 0; p < 4; p++) {
     o |= ((m >> (8 * p)) & 0xFu) << (4 * p);
     o |= ((m >> (8 * p + 4)) & 0xFu) << (16 + 4 * p);
   }
-  W[(long)w * NT + n0 + n] = o;
+  W[(long)w * NT + col] = o;
   if (w % (G / 8) == 0) {
     const int g = w / (G / 8);
     const half s = SC[(long)g * N + n];
-    S[(long)g * NT + n0 + n] = s;
-    BG[(long)g * NT + n0 + n] = convert_half_rte((float)s * (-8.0f * G));
+    S[(long)g * NT + col] = s;
+    BG[(long)g * NT + col] = convert_half_rte((float)s * (-8.0f * G));
   }
 }
 

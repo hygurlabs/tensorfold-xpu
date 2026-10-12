@@ -189,6 +189,13 @@ pub const Gpu = struct {
         return l;
     }
 
+    /// Immediate list without the in-order flag: commands with no barrier or event between them may overlap.
+    pub fn immediateUnordered(g: *Gpu, ordinal: u32) Error!H {
+        var l: H = null;
+        try check(g.api.zeCommandListCreateImmediate(g.context, g.device, &.{ .ordinal = ordinal, .flags = 0, .mode = 2, .priority = 0 }, &l));
+        return l;
+    }
+
     pub fn module(g: *Gpu, bin: []const u8) Error!H {
         var m: H = null;
         try check(g.api.zeModuleCreate(g.context, g.device, &.{ .inputSize = bin.len, .pInputModule = bin.ptr }, &m, null));

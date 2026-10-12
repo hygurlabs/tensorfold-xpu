@@ -49,6 +49,7 @@ pub fn main(init: std.process.Init) !void {
     }
     const t2 = q.now();
     q.profReport("decode");
+    if (std.c.getenv("XPU_OVERLAP_PROBE") != null) try overlapProbe(r);
     if (std.c.getenv("XPU_VERIFY_TEST") != null) try verifyTest(r, ids.items, out.items);
     if (std.c.getenv("XPU_DRAFTER")) |dir| try drafted(r, std.mem.span(dir), ids.items, out.items);
     std.debug.print("prompt: {d} tokens in {d:.3} s ({d:.0} tok/s)\n", .{ ids.items.len, t1 - t0, @as(f64, @floatFromInt(ids.items.len)) / (t1 - t0) });
@@ -151,4 +152,49 @@ fn drafted(r: *q.Runner, dir: []const u8, prompt: []const u32, serial: []const u
     const len = @min(got.items.len, serial.len);
     const same = std.mem.eql(u32, got.items[0..len], serial[0..len]);
     std.debug.print("drafted: {d} tokens in {d} rounds ({d:.2} a round), {d:.1} tok/s, draft {d:.1} ms + verify {d:.1} ms a round, equal to serial: {}\n", .{ got.items.len - 1, rounds, @as(f64, @floatFromInt(got.items.len - 1)) / @as(f64, @floatFromInt(rounds)), @as(f64, @floatFromInt(got.items.len - 1)) / dt, t_draft * 1e3 / @as(f64, @floatFromInt(rounds)), t_verify * 1e3 / @as(f64, @floatFromInt(rounds)), same });
+}
+
+/// Can a prompt GEMM and the vector-heavy chunked GDN of another chunk share the card? Times a gate|up GEMM of 2 048
+/// rows (A) and the GDN chunk kernels of 2 048 rows (B): alone, chained, and launched with no order between them.
+fn overlapProbe(r: *q.Runner) !void {
+    const d = &r.d;
+    const a = &r.acts;
+    const T: u32 = q.CHUNK;
+    const ordered = d.list;
+    const free = try d.g.immediateUnordered(0);
+    var gdn_layer: usize = 0;
+    while (r.model.layers[gdn_layer].attn) gdn_layer += 1;
+    const lg = &r.model.layers[gdn_layer];
+    const l0 = &r.model.layers[0];
+    const nc: i32 = @intCast(T / 64);
+    const ncu: u32 = T / 64;
+    const hk: i32 = 16;
+    const hv: i32 = 48;
+    const runA = struct {
+        fn f(dd: *q.Dev, aa: *q.Acts, l: anytype, t: u32) !void {
+            try q.gemm(dd, aa.pscr, aa.h, aa.ahi, aa.alo, l.gu, aa.p, t);
+        }
+    }.f;
+    const runB = struct {
+        fn f(dd: *q.Dev, aa: *q.Acts, l: anytype, ncv: i32, ncuv: u32, hkv: i32, hvv: i32) !void {
+            try dd.launch(dd.k.gdn_prep, .{ .x = ncuv, .y = 48 }, .{ aa.k, aa.v, aa.g, aa.beta, aa.la, aa.wb, aa.u0, hkv, hvv, ncv, @as(i32, 0) });
+            try dd.launch(dd.k.gdn_state, .{ .x = 48 }, .{ aa.k, aa.wb, aa.u0, aa.la, l.rec.?, l.rec.?, aa.hs, aa.vn, hkv, hvv, ncv });
+            try dd.launch(dd.k.gdn_out, .{ .x = ncuv, .y = 48 }, .{ aa.q, aa.k, aa.la, aa.hs, aa.vn, aa.y, hkv, hvv, ncv });
+        }
+    }.f;
+    var best = [5]f64{ 1e9, 1e9, 1e9, 1e9, 1e9 };
+    for (0..6) |_| {
+        for (0..5) |mode| {
+            d.list = if (mode >= 3) free else ordered;
+            try d.sync();
+            const t0 = q.now();
+            if (mode == 4) try runB(d, a, lg, nc, ncu, hk, hv);
+            if (mode == 0 or mode >= 2) try runA(d, a, l0, T);
+            if (mode >= 1 and mode <= 3) try runB(d, a, lg, nc, ncu, hk, hv);
+            try d.sync();
+            best[mode] = @min(best[mode], q.now() - t0);
+        }
+    }
+    d.list = ordered;
+    std.debug.print("overlap probe ({d} rows): GEMM gate|up {d:.2} ms, GDN chunk {d:.2} ms, chained {d:.2} ms, unordered A,B {d:.2} ms, unordered B,A {d:.2} ms\n", .{ T, best[0] * 1e3, best[1] * 1e3, best[2] * 1e3, best[3] * 1e3, best[4] * 1e3 });
 }

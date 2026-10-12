@@ -132,7 +132,7 @@ pub const Drafter = struct {
         }
         var n0: u32 = 0;
         for (parts) |p| {
-            try d.launch(d.k.repack, .{ .x = (p.n + 15) / 16, .y = k / 8 }, .{ p.w, p.s, p.b, out.w, out.s, out.bg, @as(i32, @intCast(p.n)), @as(i32, @intCast(k)), @as(i32, @intCast(n)), @as(i32, @intCast(n0)) });
+            try d.launch(d.k.repack, .{ .x = (p.n + 15) / 16, .y = k / 8 }, .{ p.w, p.s, p.b, out.w, out.s, out.bg, @as(i32, @intCast(p.n)), @as(i32, @intCast(k)), @as(i32, @intCast(n)), @as(i32, @intCast(n0)), @as(i32, 0) });
             n0 += p.n;
         }
         try d.sync();
@@ -430,7 +430,7 @@ pub const Drafter = struct {
             try q.gemm(d, dr.pscr, dr.h, dr.ahi, dr.alo, l.kp_mlp, dr.dyn, L);
             try d.launch(dr.k.dconv, .{ .x = L, .y = D / 512 }, .{ dr.h, dr.dyn, @as(i32, @intCast(l.kp_mlp.n)), l.base_mlp, @as(i32, 0), dr.x, @as(i32, 0), dr.h2, dr.ahi, dr.alo });
             try q.gemm(d, dr.pscr, dr.h2, dr.ahi, dr.alo, l.gu, dr.p, L);
-            try d.launch(d.k.swiglu, .{ .x = L, .y = 17 }, .{ dr.p, dr.h2, dr.ahi, dr.alo, @as(i32, GS) });
+            try d.launch(d.k.swiglu, .{ .x = L, .y = 17 }, .{ dr.p, dr.h2, dr.ahi, dr.alo, @as(i32, GS), @as(i32, 0) });
             try q.gemm(d, dr.pscr, dr.h2, dr.ahi, dr.alo, l.down, dr.r16, L);
             try d.launch(dr.k.dconv, .{ .x = L, .y = D / 512 }, .{ dr.r16, dr.dyn, @as(i32, @intCast(l.kp_mlp.n)), l.base_mlp, @as(i32, 1), dr.x, @as(i32, 1), dr.h2, dr.ahi, dr.alo });
         }

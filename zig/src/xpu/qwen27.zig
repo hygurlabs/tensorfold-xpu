@@ -95,6 +95,7 @@ pub const Dev = struct {
         swiglu: ze.H, argmax: ze.H, argmax_part: ze.H, tap: ze.H, conv_commit: ze.H, repack: ze.H, gdn_step: ze.H, attn_decode: ze.H, attn_merge: ze.H, kv_move: ze.H,
         embed_dense: ze.H, dense_rows: ze.H, repack_gptq: ze.H, quantize_mlx: ze.H,
         dec_wide_g128: ze.H, dec_wide64_g128: ze.H, dec_narrow_g128: ze.H, ngen_wide_g128: ze.H, ngen_narrow_g128: ze.H,
+        ngen_swiglu: ze.H, ngen_swiglu_g128: ze.H, rowsums_ff: ze.H,
         dec_wide: ze.H, dec_wide64: ze.H, dec_narrow: ze.H, gdn_prep: ze.H, gdn_state: ze.H, gdn_out: ze.H, ngen_wide: ze.H,
         ngen_narrow: ze.H, prompt_attn: ze.H,
     },
@@ -198,7 +199,8 @@ pub fn profReport(label: []const u8) void {
 
 /// An int4 projection in the GEMM layout: words [K/8, N] (nibble pairs interleaved), scales and biases × gs [K/gs, N]
 /// fp16. `wide`: no K slices (family dpb), else 4 slices (family s4dpb, narrow shapes).
-pub const Proj = struct { w: *anyopaque, s: *anyopaque, bg: *anyopaque, n: u32, k: u32, wide: bool, gs: u32 = 64 };
+/// `ilv`: gate|up interleaved by blocks of 16 columns (the prompt GEMM's SwiGLU epilogue reads both halves of a column).
+pub const Proj = struct { w: *anyopaque, s: *anyopaque, bg: *anyopaque, n: u32, k: u32, wide: bool, gs: u32 = 64, ilv: bool = false };
 
 const Layer = struct {
     in_norm: *anyopaque,
@@ -244,7 +246,7 @@ fn bf16Tensor(d: *Dev, c: *const Checkpoint, name: []const u8) !*anyopaque {
 }
 
 /// Fused projection from MLX parts stacked on N, repacked on the GPU through a raw staging area.
-pub fn projection(d: *Dev, c: *const Checkpoint, prefix: []const u8, parts: []const []const u8, wide: bool, stage: *anyopaque) !Proj {
+pub fn projection(d: *Dev, c: *const Checkpoint, prefix: []const u8, parts: []const []const u8, wide: bool, ilv: bool, stage: *anyopaque) !Proj {
     var n_total: u32 = 0;
     var k: u32 = 0;
     for (parts) |p| {
@@ -255,13 +257,14 @@ pub fn projection(d: *Dev, c: *const Checkpoint, prefix: []const u8, parts: []co
     // N padded to the GEMM tile: the padding columns have zero scales and biases, so they come out as zeros.
     const n_real = n_total;
     n_total = (n_total + 255) / 256 * 256;
-    const out: Proj = .{ .w = try d.alloc_(@as(usize, k / 8) * n_total * 4), .s = try d.alloc_(@as(usize, k / 64) * n_total * 2), .bg = try d.alloc_(@as(usize, k / 64) * n_total * 2), .n = n_total, .k = k, .wide = wide };
+    const out: Proj = .{ .w = try d.alloc_(@as(usize, k / 8) * n_total * 4), .s = try d.alloc_(@as(usize, k / 64) * n_total * 2), .bg = try d.alloc_(@as(usize, k / 64) * n_total * 2), .n = n_total, .k = k, .wide = wide, .ilv = ilv };
+    if (ilv and (parts.len != 2 or n_real != n_total)) return error.BadInterleave;
     if (n_real != n_total) {
         try d.fill(out.s, @as(u16, 0), @as(usize, k / 64) * n_total * 2);
         try d.fill(out.bg, @as(u16, 0), @as(usize, k / 64) * n_total * 2);
     }
     var n0: u32 = 0;
-    for (parts) |p| {
+    for (parts, 0..) |p, pi| {
         const w = try c.get(try std.fmt.allocPrint(alloc, "{s}{s}.weight", .{ prefix, p }));
         const s = try c.get(try std.fmt.allocPrint(alloc, "{s}{s}.scales", .{ prefix, p }));
         const b = try c.get(try std.fmt.allocPrint(alloc, "{s}{s}.biases", .{ prefix, p }));
@@ -272,7 +275,7 @@ pub fn projection(d: *Dev, c: *const Checkpoint, prefix: []const u8, parts: []co
         try d.copyIn(sw, w.bytes);
         try d.copyIn(ss, s.bytes);
         try d.copyIn(sb, b.bytes);
-        try d.launch(d.k.repack, .{ .x = (n + 15) / 16, .y = k / 8 }, .{ sw, ss, sb, out.w, out.s, out.bg, @as(i32, @intCast(n)), @as(i32, @intCast(k)), @as(i32, @intCast(n_total)), @as(i32, @intCast(n0)) });
+        try d.launch(d.k.repack, .{ .x = (n + 15) / 16, .y = k / 8 }, .{ sw, ss, sb, out.w, out.s, out.bg, @as(i32, @intCast(n)), @as(i32, @intCast(k)), @as(i32, @intCast(n_total)), @as(i32, @intCast(n0)), @as(i32, if (ilv) @intCast(pi + 1) else 0) });
         try d.sync();
         n0 += n;
     }
@@ -281,7 +284,7 @@ pub fn projection(d: *Dev, c: *const Checkpoint, prefix: []const u8, parts: []co
 
 /// Fused projection from GPTQ symmetric 4-bit parts (qweight [K/8, N], scales fp16 [K/G, N]) stacked on N, at least
 /// `min_n` columns (the extra ones zero).
-fn projectionGptq(d: *Dev, c: *const Checkpoint, prefix: []const u8, parts: []const []const u8, wide: bool, min_n: u32, stage: *anyopaque) !Proj {
+fn projectionGptq(d: *Dev, c: *const Checkpoint, prefix: []const u8, parts: []const []const u8, wide: bool, min_n: u32, ilv: bool, stage: *anyopaque) !Proj {
     var n_total: u32 = 0;
     var k: u32 = 0;
     for (parts) |p| {
@@ -292,14 +295,15 @@ fn projectionGptq(d: *Dev, c: *const Checkpoint, prefix: []const u8, parts: []co
     const n_real = n_total;
     n_total = (@max(n_total, min_n) + 255) / 256 * 256;
     const g = GS;
-    const out: Proj = .{ .w = try d.alloc_(@as(usize, k / 8) * n_total * 4), .s = try d.alloc_(@as(usize, k / g) * n_total * 2), .bg = try d.alloc_(@as(usize, k / g) * n_total * 2), .n = n_total, .k = k, .wide = wide, .gs = g };
+    const out: Proj = .{ .w = try d.alloc_(@as(usize, k / 8) * n_total * 4), .s = try d.alloc_(@as(usize, k / g) * n_total * 2), .bg = try d.alloc_(@as(usize, k / g) * n_total * 2), .n = n_total, .k = k, .wide = wide, .gs = g, .ilv = ilv };
+    if (ilv and (parts.len != 2 or n_real != n_total)) return error.BadInterleave;
     if (n_real != n_total) {
         try d.fill(out.w, @as(u32, 0), @as(usize, k / 8) * n_total * 4);
         try d.fill(out.s, @as(u16, 0), @as(usize, k / g) * n_total * 2);
         try d.fill(out.bg, @as(u16, 0), @as(usize, k / g) * n_total * 2);
     }
     var n0: u32 = 0;
-    for (parts) |p| {
+    for (parts, 0..) |p, pi| {
         const w = try c.get(try std.fmt.allocPrint(alloc, "{s}{s}.qweight", .{ prefix, p }));
         const sc = try c.get(try std.fmt.allocPrint(alloc, "{s}{s}.scales", .{ prefix, p }));
         if (!std.mem.eql(u8, sc.dtype, "F16") or sc.shape[0] * g != k) return error.UnexpectedGptqLayout;
@@ -307,7 +311,7 @@ fn projectionGptq(d: *Dev, c: *const Checkpoint, prefix: []const u8, parts: []co
         const ss = off(stage, w.bytes.len);
         try d.copyIn(stage, w.bytes);
         try d.copyIn(ss, sc.bytes);
-        try d.launch(d.k.repack_gptq, .{ .x = (n + 15) / 16, .y = k / 8 }, .{ stage, ss, out.w, out.s, out.bg, @as(i32, @intCast(n)), @as(i32, @intCast(k)), @as(i32, @intCast(n_total)), @as(i32, @intCast(n0)), @as(i32, @intCast(g)) });
+        try d.launch(d.k.repack_gptq, .{ .x = (n + 15) / 16, .y = k / 8 }, .{ stage, ss, out.w, out.s, out.bg, @as(i32, @intCast(n)), @as(i32, @intCast(k)), @as(i32, @intCast(n_total)), @as(i32, @intCast(n0)), @as(i32, @intCast(g)), @as(i32, if (ilv) @intCast(pi + 1) else 0) });
         try d.sync();
         n0 += n;
     }
@@ -333,7 +337,7 @@ fn projectionQuantized(d: *Dev, c: *const Checkpoint, name: []const u8, wide: bo
         const mb = off(ms, @as(usize, r) * (k / 64) * 2);
         try d.copyIn(raw, t.bytes[@as(usize, n0) * k * 2 ..][0 .. @as(usize, r) * k * 2]);
         try d.launch(d.k.quantize_mlx, .{ .x = (r + 15) / 16, .y = k / 64 }, .{ raw, @as(i32, @intCast(r)), @as(i32, @intCast(k)), mw, ms, mb });
-        try d.launch(d.k.repack, .{ .x = (r + 15) / 16, .y = k / 8 }, .{ mw, ms, mb, out.w, out.s, out.bg, @as(i32, @intCast(r)), @as(i32, @intCast(k)), @as(i32, @intCast(n)), @as(i32, @intCast(n0)) });
+        try d.launch(d.k.repack, .{ .x = (r + 15) / 16, .y = k / 8 }, .{ mw, ms, mb, out.w, out.s, out.bg, @as(i32, @intCast(r)), @as(i32, @intCast(k)), @as(i32, @intCast(n)), @as(i32, @intCast(n0)), @as(i32, 0) });
         try d.sync();
     }
     return out;
@@ -381,17 +385,17 @@ fn loadGptq(d: *Dev, c: *const Checkpoint) !Model {
                 return std.fmt.allocPrint(alloc, "{s}{s}", .{ pp, sx }) catch unreachable;
             }
         }.n;
-        l.* = .{ .in_norm = try vecTensor(d, c, f(p, "input_layernorm.weight"), true), .post_norm = try vecTensor(d, c, f(p, "post_attention_layernorm.weight"), true), .attn = isAttention(i), .mixer_in = undefined, .mixer_out = undefined, .gu = try projectionGptq(d, c, f(p, "mlp."), &.{ "gate_proj", "up_proj" }, true, 0, stage), .down = try projectionGptq(d, c, f(p, "mlp."), &.{"down_proj"}, false, 0, stage) };
+        l.* = .{ .in_norm = try vecTensor(d, c, f(p, "input_layernorm.weight"), true), .post_norm = try vecTensor(d, c, f(p, "post_attention_layernorm.weight"), true), .attn = isAttention(i), .mixer_in = undefined, .mixer_out = undefined, .gu = try projectionGptq(d, c, f(p, "mlp."), &.{ "gate_proj", "up_proj" }, true, 0, true, stage), .down = try projectionGptq(d, c, f(p, "mlp."), &.{"down_proj"}, false, 0, false, stage) };
         if (l.attn) {
-            l.mixer_in = try projectionGptq(d, c, f(p, "self_attn."), &.{ "q_proj", "k_proj", "v_proj" }, true, 0, stage);
-            l.mixer_out = try projectionGptq(d, c, f(p, "self_attn."), &.{"o_proj"}, false, 0, stage);
+            l.mixer_in = try projectionGptq(d, c, f(p, "self_attn."), &.{ "q_proj", "k_proj", "v_proj" }, true, 0, false, stage);
+            l.mixer_out = try projectionGptq(d, c, f(p, "self_attn."), &.{"o_proj"}, false, 0, false, stage);
             l.qn = try vecTensor(d, c, f(p, "self_attn.q_norm.weight"), true);
             l.kn = try vecTensor(d, c, f(p, "self_attn.k_norm.weight"), true);
             l.kc = try d.alloc_(MAX_CTX * 4 * 256 * 2);
             l.vc = try d.alloc_(MAX_CTX * 4 * 256 * 2);
         } else {
-            l.mixer_in = try projectionGptq(d, c, f(p, "linear_attn."), &.{ "in_proj_qkv", "in_proj_z" }, true, GDN_IN, stage);
-            l.mixer_out = try projectionGptq(d, c, f(p, "linear_attn."), &.{"out_proj"}, false, 0, stage);
+            l.mixer_in = try projectionGptq(d, c, f(p, "linear_attn."), &.{ "in_proj_qkv", "in_proj_z" }, true, GDN_IN, false, stage);
+            l.mixer_out = try projectionGptq(d, c, f(p, "linear_attn."), &.{"out_proj"}, false, 0, false, stage);
             const ta = try c.get(f(p, "linear_attn.in_proj_a.weight"));
             const tb = try c.get(f(p, "linear_attn.in_proj_b.weight"));
             if (!std.mem.eql(u8, ta.dtype, "F16") or ta.bytes.len != 48 * D * 2 or tb.bytes.len != 48 * D * 2) return error.UnexpectedShape;
@@ -431,7 +435,7 @@ fn load(d: *Dev, c: *const Checkpoint) !Model {
     m.embed_s = try bf16Tensor(d, c, "model.embed_tokens.scales");
     m.embed_b = try bf16Tensor(d, c, "model.embed_tokens.biases");
     m.norm = try bf16Tensor(d, c, "model.norm.weight");
-    m.head = try projection(d, c, "lm_head", &.{""}, true, stage);
+    m.head = try projection(d, c, "lm_head", &.{""}, true, false, stage);
     var invf: [32]f32 = undefined;
     for (&invf, 0..) |*f, i| f.* = @floatCast(std.math.pow(f64, 1e7, -@as(f64, @floatFromInt(i)) / 32.0));
     m.invf = try d.upload(std.mem.sliceAsBytes(&invf));
@@ -442,17 +446,17 @@ fn load(d: *Dev, c: *const Checkpoint) !Model {
                 return std.fmt.allocPrint(alloc, "{s}{s}", .{ pp, s }) catch unreachable;
             }
         }.n;
-        l.* = .{ .in_norm = try bf16Tensor(d, c, f(p, "input_layernorm.weight")), .post_norm = try bf16Tensor(d, c, f(p, "post_attention_layernorm.weight")), .attn = isAttention(i), .mixer_in = undefined, .mixer_out = undefined, .gu = try projection(d, c, f(p, "mlp."), &.{ "gate_proj", "up_proj" }, true, stage), .down = try projection(d, c, f(p, "mlp."), &.{"down_proj"}, false, stage) };
+        l.* = .{ .in_norm = try bf16Tensor(d, c, f(p, "input_layernorm.weight")), .post_norm = try bf16Tensor(d, c, f(p, "post_attention_layernorm.weight")), .attn = isAttention(i), .mixer_in = undefined, .mixer_out = undefined, .gu = try projection(d, c, f(p, "mlp."), &.{ "gate_proj", "up_proj" }, true, true, stage), .down = try projection(d, c, f(p, "mlp."), &.{"down_proj"}, false, false, stage) };
         if (l.attn) {
-            l.mixer_in = try projection(d, c, f(p, "self_attn."), &.{ "q_proj", "k_proj", "v_proj" }, true, stage);
-            l.mixer_out = try projection(d, c, f(p, "self_attn."), &.{"o_proj"}, false, stage);
+            l.mixer_in = try projection(d, c, f(p, "self_attn."), &.{ "q_proj", "k_proj", "v_proj" }, true, false, stage);
+            l.mixer_out = try projection(d, c, f(p, "self_attn."), &.{"o_proj"}, false, false, stage);
             l.qn = try bf16Tensor(d, c, f(p, "self_attn.q_norm.weight"));
             l.kn = try bf16Tensor(d, c, f(p, "self_attn.k_norm.weight"));
             l.kc = try d.alloc_(MAX_CTX * 4 * 256 * 2);
             l.vc = try d.alloc_(MAX_CTX * 4 * 256 * 2);
         } else {
-            l.mixer_in = try projection(d, c, f(p, "linear_attn."), &.{ "in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b" }, true, stage);
-            l.mixer_out = try projection(d, c, f(p, "linear_attn."), &.{"out_proj"}, false, stage);
+            l.mixer_in = try projection(d, c, f(p, "linear_attn."), &.{ "in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b" }, true, false, stage);
+            l.mixer_out = try projection(d, c, f(p, "linear_attn."), &.{"out_proj"}, false, false, stage);
             l.conv_w = try bf16Tensor(d, c, f(p, "linear_attn.conv1d.weight"));
             l.alog = try bf16Tensor(d, c, f(p, "linear_attn.A_log"));
             l.dt = try bf16Tensor(d, c, f(p, "linear_attn.dt_bias"));
@@ -475,7 +479,7 @@ fn load(d: *Dev, c: *const Checkpoint) !Model {
 
 // ---------------------------------------------------------------- activations and the forward
 
-const Acts = struct {
+pub const Acts = struct {
     x: *anyopaque, // fp32 [CHUNK, D]
     h: *anyopaque, // fp16 [CHUNK, FF]
     ahi: *anyopaque, // fp16 [CHUNK, FF / 64]
@@ -538,6 +542,22 @@ fn chainTable() [16 * 17]i32 {
         for (0..r + 1) |dd| t[r * 17 + 1 + dd] = @intCast(dd);
     }
     return t;
+}
+
+/// gate|up and SwiGLU: the activation (fp16 [T, 17 408]) and its row sums; returns the buffer holding it. Prompt rows:
+/// the GEMM's SwiGLU epilogue writes it into P; decode rows: the GEMM into P, then `swiglu` into H.
+fn mlpIn(d: *Dev, a: *Acts, w: Proj, T: u32, gs: i32) !*anyopaque {
+    if (T > 16 and w.ilv) {
+        const M: i32 = @intCast(T);
+        const tiles = (T + 63) / 64;
+        const k = if (w.gs == 128) d.k.ngen_swiglu_g128 else d.k.ngen_swiglu;
+        try d.launch(k, .{ .x = 8, .y = w.n / 256, .z = (tiles + 7) / 8 }, .{ a.h, w.w, w.s, w.bg, a.p, M, @as(i32, @intCast(w.n)), @as(i32, @intCast(w.k)), a.ahi, a.alo, @as(i32, @intCast((T + 7) / 8 * 8)), @as(i32, @intCast(w.k / w.gs)) });
+        try d.launch(d.k.rowsums_ff, .{ .x = T }, .{ a.p, a.ahi, a.alo, gs });
+        return a.p;
+    }
+    try gemm(d, a.pscr, a.h, a.ahi, a.alo, w, a.p, T);
+    try d.launch(d.k.swiglu, .{ .x = T, .y = 17 }, .{ a.p, a.h, a.ahi, a.alo, gs, @as(i32, @intFromBool(w.ilv)) });
+    return a.h;
 }
 
 /// The rows' embeddings: x fp32 [T, D] (bf16 values) for the token ids at `ids` on the device.
@@ -724,9 +744,8 @@ fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mode) 
         try gemm(d, a.pscr, a.h, a.ahi, a.alo, l.mixer_out, a.r, T);
         if (probe) try dumpBuf(d, "r0", a.r, T * D, .f16);
         try d.launch(d.k.add_rmsnorm, .{ .x = T }, .{ a.x, a.r, l.post_norm, a.h, a.ahi, a.alo, @as(i32, D), EPS, @as(i32, 1), gs });
-        try gemm(d, a.pscr, a.h, a.ahi, a.alo, l.gu, a.p, T);
-        try d.launch(d.k.swiglu, .{ .x = T, .y = 17 }, .{ a.p, a.h, a.ahi, a.alo, gs });
-        try gemm(d, a.pscr, a.h, a.ahi, a.alo, l.down, a.r, T);
+        const act = try mlpIn(d, a, l.gu, T, gs);
+        try gemm(d, a.pscr, act, a.ahi, a.alo, l.down, a.r, T);
         if (p0 == 0 and i < 4) try dump(d, a, T, try std.fmt.allocPrint(alloc, "{d}", .{i}), true);
         if (mode.taps) for (TAP_LAYERS, 0..) |tl, slot| if (tl == i)
             try d.launch(d.k.tap, .{ .x = D / 256, .y = T }, .{ a.x, a.r, a.taps, @as(i32, D), @as(i32, @intCast(slot)) });
@@ -833,6 +852,9 @@ pub const Runner = struct {
             .repack_gptq = try d.kernel(mg, "repack_gptq", 16), .quantize_mlx = try d.kernel(mg, "quantize_mlx", 16),
             .dec_wide_g128 = try d.kernel(mm128, "w4k1_decode", 64), .dec_wide64_g128 = try d.kernel(mm128, "w4k1_d64", 64), .dec_narrow_g128 = try d.kernel(mm128, "w4k_dsplit", 64),
             .ngen_wide_g128 = try d.kernel(mw128, "w4g_dpb", 256), .ngen_narrow_g128 = try d.kernel(mn128, "w4g_s4dpb", 256),
+            .ngen_swiglu = try d.kernel(try d.g.module(&kb.ngen_swiglu), "w4g_dpb_swiglu", 256),
+            .ngen_swiglu_g128 = try d.kernel(try d.g.module(&kb.ngen_swiglu128), "w4g_dpb_swiglu", 256),
+            .rowsums_ff = try d.kernel(mg, "rowsums_ff", 256),
             .dec_wide = try d.kernel(mm, "w4k1_decode", 64), .dec_wide64 = try d.kernel(mm, "w4k1_d64", 64), .dec_narrow = try d.kernel(mm, "w4k_dsplit", 64),
             .gdn_prep = try d.kernel(mgd, "gdn_prep", 64), .gdn_state = try d.kernel(mgd, "gdn_state", 256),
             .gdn_out = try d.kernel(mgd, "gdn_out", 128), .ngen_wide = try d.kernel(mw, "w4g_dpb", 256),

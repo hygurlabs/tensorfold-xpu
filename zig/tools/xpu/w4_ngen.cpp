@@ -69,7 +69,7 @@ public:
     // bits que les noyaux w4k_* de w4.cl.
     W4Prompt(Product product, int gsz, bool pipe, Ablate ab = {}, int tn = 1, int simdFold = 16, bool lag = false,
              bool dpb = false, bool slmA = false, int layout = 0, bool ilv = false, bool s4 = false, bool asplit = false,
-             bool b3 = false)
+             bool b3 = false, bool swiglu = false)
         : ELFCodeGenerator<hw>(product) {
         const int subs = gsz / 64;
         newArgument("A", ExternalArgumentType::GlobalPtr);
@@ -90,7 +90,10 @@ public:
             newArgument("Asum", ExternalArgumentType::GlobalPtr);
             newArgument("Mp", DataType::d);
         }
-        externalName(s4 ? "w4g_s4dpb" : dpb ? "w4g_dpb" : tn == 1 ? "w4g_prompt" : "w4g_prompt_tn2");
+        // swiglu (dpb, tn = 2, sans s4) : poids gate|up entrelacés par blocs de 16 colonnes (tuile j = 0 gate, j = 1 up
+        // des mêmes 16 colonnes d'activation) ; la sortie est l'activation fp16(bf16(SiLU(g)·u)), g et u arrondis fp16
+        // d'abord, C [M, N/2]. SiLU(x) = x / (1 + 2^(−x·log2 e)), exp et inverse par l'unité mathématique.
+        externalName(swiglu ? "w4g_dpb_swiglu" : s4 ? "w4g_s4dpb" : dpb ? "w4g_dpb" : tn == 1 ? "w4g_prompt" : "w4g_prompt_tn2");
         requireSIMD(16);
         requireGRF(256);
         requireLocalID(1);
@@ -166,8 +169,12 @@ public:
         mov(1, hW.ud(6), 0);                               // ligne de mots du bloc courant
         header(hPW, W, t.d(4), t.d(5), 16, 8, 1);
         mov(1, hPW.ud(5), n0);
-        shl(1, t.d(6), N, 1);
-        add(1, t.d(6), t.d(6), -1);                       // N·2 − 1
+        if (swiglu)
+            add(1, t.d(6), N, -1);                         // (N/2)·2 − 1
+        else {
+            shl(1, t.d(6), N, 1);
+            add(1, t.d(6), t.d(6), -1);                   // N·2 − 1
+        }
         header(hC, C, t.d(6), t.d(3), 16, 8, 1);
         mov(1, hC.ud(5), n0);
         // A en mémoire locale. la.ud(0) : adresse locale des envois (seul le premier mot compte) ; la.d(1) : base des
@@ -580,6 +587,34 @@ public:
             jmpi(1 | f1[0], lGroup);
         }
 
+        if (swiglu) {
+            // Activation de 8 lignes × 16 colonnes par tuile de lignes i : colonnes d'activation n0/2 … + 15.
+            const GRF X = GRF(PART), E = GRF(PART + 1), Q = GRF(PART + 2), U = GRF(PART + 3), O = GRF(PART + 4);
+            shr(1, hC.ud(5), n0, 1);
+            for (int i = 0; i < 4; i++) {
+                for (int r = 0; r < 8; r++) {
+                    const GRF g = GRF(ACC + 8 * (2 * i) + r), u = GRF(ACC + 8 * (2 * i + 1) + r);
+                    mov(16, Q.hf(0)(1), g.f());              // g arrondi fp16
+                    mov(16, X.f(), Q.hf(0)(1));
+                    mov(16, Q.hf(16)(1), u.f());             // u arrondi fp16
+                    mov(16, U.f(), Q.hf(16)(1));
+                    mul(16, E.f(), X.f(), -1.4426950408889634f);
+                    math(16, MathFunction::exp, E.f(), E.f());
+                    add(16, E.f(), E.f(), 1.0f);
+                    math(16, MathFunction::inv, E.f(), E.f());
+                    mul(16, X.f(), X.f(), E.f());            // SiLU(g)
+                    mul(16, O.f(), X.f(), U.f());
+                    shr(16, E.ud(), O.ud(), 16);             // arrondi bf16 au plus proche pair
+                    and_(16, E.ud(), E.ud(), 1);
+                    add(16, E.ud(), E.ud(), 0x7FFF);
+                    add(16, O.ud(), O.ud(), E.ud());
+                    and_(16, O.ud(), O.ud(), 0xFFFF0000u);
+                    mov(16, GRF(H + r / 2).hf((r % 2) * 16)(1), O.f());
+                }
+                add(1, hC.ud(6), m0, 8 * i);
+                store(1, block_2d(DataSizeLSC::D16, 16, 8), A64, hC, GRF(H));
+            }
+        } else
         // Sortie : fp16 arrondi au plus proche pair, écrite par blocs 2D de 8 lignes × 16 colonnes.
         for (int i = 0; i < 4; i++)
             for (int j = 0; j < tn; j++) {
@@ -604,7 +639,7 @@ int main(int argc, char **argv) {
     int tn = 1, simdFold = 16;
     bool lag = false, dpb = false, slmA = false;
     int layout = 0;
-    bool ilv = false, s4 = false, asplit = false, b3 = false;
+    bool ilv = false, s4 = false, asplit = false, b3 = false, swiglu = false;
     typename W4Prompt<HW::Xe2>::Ablate ab;
     for (int i = 4; i < argc; i++) {
         if (!std::strcmp(argv[i], "simple")) pipe = false;
@@ -625,14 +660,15 @@ int main(int argc, char **argv) {
         if (!std::strcmp(argv[i], "s4")) s4 = true;
         if (!std::strcmp(argv[i], "asplit")) asplit = true;
         if (!std::strcmp(argv[i], "b3")) b3 = true;
+        if (!std::strcmp(argv[i], "swiglu")) swiglu = true;
     }
     if (tn == 2) pipe = false;
     std::vector<uint8_t> bin;
     if (std::strcmp(argv[1], "xe2") == 0)
-        bin = W4Prompt<HW::Xe2>(Product(ProductFamily::GenericXe2, 0, PlatformType::Discrete), gsz, pipe, ab, tn, simdFold, lag, dpb, slmA, layout, ilv, s4, asplit, b3).getBinary();
+        bin = W4Prompt<HW::Xe2>(Product(ProductFamily::GenericXe2, 0, PlatformType::Discrete), gsz, pipe, ab, tn, simdFold, lag, dpb, slmA, layout, ilv, s4, asplit, b3, swiglu).getBinary();
     else
         bin = W4Prompt<HW::Xe3>(Product(ProductFamily::GenericXe3, 0, PlatformType::Integrated), gsz, pipe,
-                                {ab.unpack, ab.fold, ab.aload, ab.wload, ab.sload, ab.pf, ab.bias}, tn, simdFold, lag, dpb, slmA, layout, ilv, s4, asplit, b3)
+                                {ab.unpack, ab.fold, ab.aload, ab.wload, ab.sload, ab.pf, ab.bias}, tn, simdFold, lag, dpb, slmA, layout, ilv, s4, asplit, b3, swiglu)
                   .getBinary();
     std::ofstream(argv[3], std::ios::binary).write(reinterpret_cast<const char *>(bin.data()), bin.size());
     std::printf("%s : %zu octets\n", argv[3], bin.size());
