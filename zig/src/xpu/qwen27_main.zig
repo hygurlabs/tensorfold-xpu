@@ -1,0 +1,570 @@
+//! Qwen3.8-27B forward on an Intel Xe2 GPU (Arc Pro B70) over Level Zero: MLX affine 4-bit g64 checkpoint, prompt in
+//! chunks of up to 128 rows, then greedy serial decode. A development runner: it prints the greedy tokens and the
+//! timings, to be checked against the fp32 torch reference of the Python port (tools/xpu-bench/integ/oracle.py).
+//!   xpu-qwen27 MODEL_DIR IDS_FILE [STEPS]      IDS_FILE: prompt token ids separated by spaces
+const std = @import("std");
+const ze = @import("ze.zig");
+const kb = @import("xpu_qwen27_kernels");
+
+const alloc = std.heap.c_allocator;
+
+// Qwen3.8-27B shape (checked against config.json at load).
+const D = 5120;
+const FF = 17408;
+const LAYERS = 64;
+const VOCAB = 248320;
+const GS = 64;
+const GDN_IN = 16640; // qkv 10240 | z 6144 | a 48 | b 48 = 16480, padded to the GEMM tile (256)
+const ATT_IN = 14336; // (q 256 | gate 256) × 24 | k 1024 | v 1024
+const CHUNK = 128; // prompt rows per forward
+const MAX_CTX = 4096;
+const SPLIT = 256; // keys per attention split (decode.cl)
+const EPS: f32 = 1e-6;
+
+fn isAttention(i: usize) bool {
+    return (i + 1) % 4 == 0;
+}
+
+// ---------------------------------------------------------------- safetensors (mmap through libc)
+
+extern "c" fn open(path: [*:0]const u8, flags: c_int, ...) c_int;
+extern "c" fn close(fd: c_int) c_int;
+extern "c" fn lseek(fd: c_int, off: i64, whence: c_int) i64;
+extern "c" fn mmap(addr: ?*anyopaque, len: usize, prot: c_int, flags: c_int, fd: c_int, off: i64) ?*anyopaque;
+
+const Tensor = struct { name: []const u8, dtype: []const u8, shape: [4]u64, rank: usize, bytes: []const u8 };
+
+const Checkpoint = struct {
+    tensors: std.ArrayList(Tensor) = .empty,
+
+    fn addShard(c: *Checkpoint, path: [:0]const u8) !void {
+        const fd = open(path.ptr, 0);
+        if (fd < 0) return error.FileNotFound;
+        defer _ = close(fd);
+        const size: usize = @intCast(lseek(fd, 0, 2));
+        const base = mmap(null, size, 1, 2, fd, 0) orelse return error.MmapFailed; // PROT_READ, MAP_PRIVATE
+        const bytes: [*]const u8 = @ptrCast(base);
+        const n = std.mem.readInt(u64, bytes[0..8], .little);
+        const header = bytes[8 .. 8 + n];
+        const data = bytes[8 + n .. size];
+        const parsed = try std.json.parseFromSlice(std.json.Value, alloc, header, .{});
+        var it = parsed.value.object.iterator();
+        while (it.next()) |e| {
+            if (std.mem.eql(u8, e.key_ptr.*, "__metadata__")) continue;
+            const o = e.value_ptr.object;
+            var t: Tensor = .{ .name = e.key_ptr.*, .dtype = o.get("dtype").?.string, .shape = @splat(1), .rank = 0, .bytes = &.{} };
+            for (o.get("shape").?.array.items, 0..) |d, i| t.shape[i] = @intCast(d.integer);
+            t.rank = o.get("shape").?.array.items.len;
+            const span = o.get("data_offsets").?.array.items;
+            t.bytes = data[@intCast(span[0].integer)..@intCast(span[1].integer)];
+            try c.tensors.append(alloc, t);
+        }
+    }
+
+    fn get(c: *const Checkpoint, name: []const u8) !Tensor {
+        for (c.tensors.items) |t| if (std.mem.endsWith(u8, t.name, name) and
+            (t.name.len == name.len or std.mem.startsWith(u8, t.name, "language_model."))) return t;
+        std.debug.print("missing tensor: {s}\n", .{name});
+        return error.MissingTensor;
+    }
+};
+
+// ---------------------------------------------------------------- device
+
+const Dev = struct {
+    g: ze.Gpu,
+    list: ze.H,
+    staging: []u8 = &.{}, // USM host memory: the driver cannot copy from file-backed mmap pages directly
+    k: struct {
+        embed: ze.H, add_rmsnorm: ze.H, gdn_pre: ze.H, gated_norm: ze.H, attn_prep: ze.H, attn_gate: ze.H,
+        swiglu: ze.H, argmax: ze.H, repack: ze.H, gdn_step: ze.H, attn_decode: ze.H, attn_merge: ze.H,
+        dec_wide: ze.H, dec_narrow: ze.H, gdn_prep: ze.H, gdn_state: ze.H, gdn_out: ze.H, ngen_wide: ze.H,
+        ngen_narrow: ze.H,
+    },
+
+    fn kernel(d: *Dev, m: ze.H, name: [*:0]const u8, local: u32) !ze.H {
+        const k = try d.g.kernel(m, name);
+        try ze.check(d.g.api.zeKernelSetGroupSize(k, local, 1, 1));
+        return k;
+    }
+
+    fn alloc_(d: *Dev, bytes: usize) !*anyopaque {
+        return d.g.deviceAlloc(@max(bytes, 64));
+    }
+
+    fn upload(d: *Dev, bytes: []const u8) !*anyopaque {
+        const p = try d.alloc_(bytes.len);
+        try d.copyIn(p, bytes);
+        return p;
+    }
+
+    /// Host bytes (any memory, mmap included) to the device, through the USM staging buffer.
+    fn copyIn(d: *Dev, dst: *anyopaque, bytes: []const u8) !void {
+        if (d.staging.len == 0) d.staging = @as([*]u8, @ptrCast(try d.g.hostAlloc(256 << 20)))[0 .. 256 << 20];
+        var done: usize = 0;
+        while (done < bytes.len) {
+            const n = @min(d.staging.len, bytes.len - done);
+            @memcpy(d.staging[0..n], bytes[done .. done + n]);
+            try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, off(dst, done), d.staging.ptr, n, null, 0, null));
+            try d.sync();
+            done += n;
+        }
+    }
+
+    fn launch(d: *Dev, k: ze.H, groups: ze.GroupCount, args: anytype) !void {
+        inline for (args, 0..) |a, i| try d.g.arg(k, i, a);
+        try ze.check(d.g.api.zeCommandListAppendLaunchKernel(d.list, k, &groups, null, 0, null));
+    }
+
+    fn sync(d: *Dev) !void {
+        try ze.check(d.g.api.zeCommandListHostSynchronize(d.list, std.math.maxInt(u64)));
+    }
+
+    fn fill(d: *Dev, p: *anyopaque, pattern: anytype, bytes: usize) !void {
+        const T = @TypeOf(pattern);
+        const host = try alloc.alloc(T, bytes / @sizeOf(T));
+        defer alloc.free(host);
+        @memset(host, pattern);
+        try d.copyIn(p, std.mem.sliceAsBytes(host));
+    }
+};
+
+fn off(p: *anyopaque, bytes: usize) *anyopaque {
+    return @ptrFromInt(@intFromPtr(p) + bytes);
+}
+
+/// An int4 projection in the GEMM layout: words [K/8, N] (nibble pairs interleaved), scales and biases × 64 [K/64, N]
+/// fp16. `wide`: no K slices (family dpb), else 4 slices (family s4dpb, narrow shapes).
+const Proj = struct { w: *anyopaque, s: *anyopaque, bg: *anyopaque, n: u32, k: u32, wide: bool };
+
+const Layer = struct {
+    in_norm: *anyopaque,
+    post_norm: *anyopaque,
+    attn: bool,
+    mixer_in: Proj, // gdn.in or attn.qkv
+    mixer_out: Proj, // out_proj or o_proj
+    gu: Proj,
+    down: Proj,
+    // GDN
+    conv_w: ?*anyopaque = null,
+    alog: ?*anyopaque = null,
+    dt: ?*anyopaque = null,
+    gnorm: ?*anyopaque = null,
+    rec: ?*anyopaque = null, // fp32 [48, 128, 128]
+    conv: [2]?*anyopaque = .{ null, null }, // fp16 [3, 10240], ping-pong
+    conv_cur: u1 = 0,
+    // attention
+    qn: ?*anyopaque = null,
+    kn: ?*anyopaque = null,
+    kc: ?*anyopaque = null, // bf16 [MAX_CTX, 4, 256]
+    vc: ?*anyopaque = null,
+};
+
+const Model = struct {
+    embed_w: *anyopaque,
+    embed_s: *anyopaque,
+    embed_b: *anyopaque,
+    layers: [LAYERS]Layer,
+    norm: *anyopaque,
+    head: Proj,
+    invf: *anyopaque,
+};
+
+fn bf16Tensor(d: *Dev, c: *const Checkpoint, name: []const u8) !*anyopaque {
+    const t = try c.get(name);
+    if (!std.mem.eql(u8, t.dtype, "BF16")) return error.UnexpectedDtype;
+    return d.upload(t.bytes);
+}
+
+/// Fused projection from MLX parts stacked on N, repacked on the GPU through a raw staging area.
+fn projection(d: *Dev, c: *const Checkpoint, prefix: []const u8, parts: []const []const u8, wide: bool, stage: *anyopaque) !Proj {
+    var n_total: u32 = 0;
+    var k: u32 = 0;
+    for (parts) |p| {
+        const w = try c.get(try std.fmt.allocPrint(alloc, "{s}{s}.weight", .{ prefix, p }));
+        n_total += @intCast(w.shape[0]);
+        k = @intCast(w.shape[1] * 8);
+    }
+    // N padded to the GEMM tile: the padding columns have zero scales and biases, so they come out as zeros.
+    const n_real = n_total;
+    n_total = (n_total + 255) / 256 * 256;
+    const out: Proj = .{ .w = try d.alloc_(@as(usize, k / 8) * n_total * 4), .s = try d.alloc_(@as(usize, k / GS) * n_total * 2), .bg = try d.alloc_(@as(usize, k / GS) * n_total * 2), .n = n_total, .k = k, .wide = wide };
+    if (n_real != n_total) {
+        try d.fill(out.s, @as(u16, 0), @as(usize, k / GS) * n_total * 2);
+        try d.fill(out.bg, @as(u16, 0), @as(usize, k / GS) * n_total * 2);
+    }
+    var n0: u32 = 0;
+    for (parts) |p| {
+        const w = try c.get(try std.fmt.allocPrint(alloc, "{s}{s}.weight", .{ prefix, p }));
+        const s = try c.get(try std.fmt.allocPrint(alloc, "{s}{s}.scales", .{ prefix, p }));
+        const b = try c.get(try std.fmt.allocPrint(alloc, "{s}{s}.biases", .{ prefix, p }));
+        const n: u32 = @intCast(w.shape[0]);
+        const sw = stage;
+        const ss = off(stage, w.bytes.len);
+        const sb = off(ss, s.bytes.len);
+        try d.copyIn(sw, w.bytes);
+        try d.copyIn(ss, s.bytes);
+        try d.copyIn(sb, b.bytes);
+        try d.launch(d.k.repack, .{ .x = (n + 15) / 16, .y = k / 8 }, .{ sw, ss, sb, out.w, out.s, out.bg, @as(i32, @intCast(n)), @as(i32, @intCast(k)), @as(i32, @intCast(n_total)), @as(i32, @intCast(n0)) });
+        try d.sync();
+        n0 += n;
+    }
+    return out;
+}
+
+fn load(d: *Dev, c: *const Checkpoint) !Model {
+    var m: Model = undefined;
+    const stage = try d.alloc_(800 << 20);
+    const e_w = try c.get("model.embed_tokens.weight");
+    m.embed_w = try d.upload(e_w.bytes);
+    m.embed_s = try bf16Tensor(d, c, "model.embed_tokens.scales");
+    m.embed_b = try bf16Tensor(d, c, "model.embed_tokens.biases");
+    m.norm = try bf16Tensor(d, c, "model.norm.weight");
+    m.head = try projection(d, c, "lm_head", &.{""}, true, stage);
+    var invf: [32]f32 = undefined;
+    for (&invf, 0..) |*f, i| f.* = @floatCast(std.math.pow(f64, 1e7, -@as(f64, @floatFromInt(i)) / 32.0));
+    m.invf = try d.upload(std.mem.sliceAsBytes(&invf));
+    for (&m.layers, 0..) |*l, i| {
+        const p = try std.fmt.allocPrint(alloc, "model.layers.{d}.", .{i});
+        const f = struct {
+            fn n(pp: []const u8, s: []const u8) []const u8 {
+                return std.fmt.allocPrint(alloc, "{s}{s}", .{ pp, s }) catch unreachable;
+            }
+        }.n;
+        l.* = .{ .in_norm = try bf16Tensor(d, c, f(p, "input_layernorm.weight")), .post_norm = try bf16Tensor(d, c, f(p, "post_attention_layernorm.weight")), .attn = isAttention(i), .mixer_in = undefined, .mixer_out = undefined, .gu = try projection(d, c, f(p, "mlp."), &.{ "gate_proj", "up_proj" }, true, stage), .down = try projection(d, c, f(p, "mlp."), &.{"down_proj"}, false, stage) };
+        if (l.attn) {
+            l.mixer_in = try projection(d, c, f(p, "self_attn."), &.{ "q_proj", "k_proj", "v_proj" }, true, stage);
+            l.mixer_out = try projection(d, c, f(p, "self_attn."), &.{"o_proj"}, false, stage);
+            l.qn = try bf16Tensor(d, c, f(p, "self_attn.q_norm.weight"));
+            l.kn = try bf16Tensor(d, c, f(p, "self_attn.k_norm.weight"));
+            l.kc = try d.alloc_(MAX_CTX * 4 * 256 * 2);
+            l.vc = try d.alloc_(MAX_CTX * 4 * 256 * 2);
+        } else {
+            l.mixer_in = try projection(d, c, f(p, "linear_attn."), &.{ "in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b" }, true, stage);
+            l.mixer_out = try projection(d, c, f(p, "linear_attn."), &.{"out_proj"}, false, stage);
+            l.conv_w = try bf16Tensor(d, c, f(p, "linear_attn.conv1d.weight"));
+            l.alog = try bf16Tensor(d, c, f(p, "linear_attn.A_log"));
+            l.dt = try bf16Tensor(d, c, f(p, "linear_attn.dt_bias"));
+            l.gnorm = try bf16Tensor(d, c, f(p, "linear_attn.norm.weight"));
+            l.rec = try d.alloc_(48 * 128 * 128 * 4);
+            try d.fill(l.rec.?, @as(u32, 0), 48 * 128 * 128 * 4);
+            for (&l.conv) |*cv| {
+                cv.* = try d.alloc_(3 * 10240 * 2);
+                try d.fill(cv.*.?, @as(u16, 0), 3 * 10240 * 2);
+            }
+        }
+        if (i % 8 == 7) std.debug.print("  layers loaded: {d}/{d}\n", .{ i + 1, LAYERS });
+    }
+    try d.sync();
+    d.g.free(stage);
+    return m;
+}
+
+// ---------------------------------------------------------------- activations and the forward
+
+const Acts = struct {
+    x: *anyopaque, // fp32 [CHUNK, D]
+    h: *anyopaque, // fp16 [CHUNK, FF]
+    ahi: *anyopaque, // fp16 [CHUNK, FF / 64]
+    alo: *anyopaque,
+    r: *anyopaque, // fp16 [CHUNK, D]
+    p: *anyopaque, // fp16 [CHUNK, 2 FF]
+    q: *anyopaque, // bf16 [CHUNK, 16, 128] (GDN) / [CHUNK, 24, 256] (attention)
+    k: *anyopaque, // bf16 [CHUNK, 16, 128]
+    v: *anyopaque, // bf16 [CHUNK, 48, 128]
+    g: *anyopaque, // fp32 [CHUNK, 48]
+    beta: *anyopaque,
+    y: *anyopaque, // bf16 [CHUNK, 6144] (GDN out, attention out)
+    la: *anyopaque,
+    wb: *anyopaque,
+    u0: *anyopaque,
+    hs: *anyopaque,
+    vn: *anyopaque,
+    pm: *anyopaque,
+    pl: *anyopaque,
+    po: *anyopaque,
+    pscr: *anyopaque, // fp32 [CHUNK, D] (slice totals of the narrow prompt GEMM)
+    logits: *anyopaque, // fp16 [VOCAB]
+    tok: *anyopaque, // i32
+    ids: *anyopaque, // i32 [CHUNK]
+    zeros: *anyopaque, // padding rows of the GDN chunks: k = v = 0, β = 0 …
+    ones: *anyopaque, // … and g = 1
+
+    fn init(d: *Dev) !Acts {
+        const nc = CHUNK / 64;
+        const ns = MAX_CTX / SPLIT;
+        return .{
+            .x = try d.alloc_(CHUNK * D * 4), .h = try d.alloc_(CHUNK * FF * 2), .ahi = try d.alloc_(CHUNK * (FF / GS) * 2),
+            .alo = try d.alloc_(CHUNK * (FF / GS) * 2), .r = try d.alloc_(CHUNK * D * 2), .p = try d.alloc_(CHUNK * 2 * FF * 2),
+            .q = try d.alloc_(CHUNK * 24 * 256 * 2), .k = try d.alloc_(CHUNK * 16 * 128 * 2), .v = try d.alloc_(CHUNK * 48 * 128 * 2),
+            .g = try d.alloc_(CHUNK * 48 * 4), .beta = try d.alloc_(CHUNK * 48 * 4), .y = try d.alloc_(CHUNK * 6144 * 2),
+            .la = try d.alloc_(48 * nc * 64 * 4), .wb = try d.alloc_(nc * 48 * 64 * 128 * 2), .u0 = try d.alloc_(nc * 48 * 64 * 128 * 4),
+            .hs = try d.alloc_(nc * 48 * 128 * 128 * 2), .vn = try d.alloc_(nc * 48 * 128 * 64 * 2),
+            .pm = try d.alloc_(CHUNK * 24 * ns * 4), .pl = try d.alloc_(CHUNK * 24 * ns * 4), .po = try d.alloc_(CHUNK * 24 * ns * 256 * 4),
+            .pscr = try d.alloc_(CHUNK * D * 4), .logits = try d.alloc_(VOCAB * 2), .tok = try d.alloc_(4), .ids = try d.alloc_(CHUNK * 4),
+            .zeros = try d.alloc_(CHUNK * 48 * 128 * 2), .ones = try d.alloc_(CHUNK * 48 * 4),
+        };
+    }
+};
+
+/// out[M, N] fp16 = h[M, K] · Wᵀ : decode kernels up to 16 rows, the nGEN prompt GEMMs above.
+fn gemm(d: *Dev, a: *Acts, h: *anyopaque, ahi: *anyopaque, alo: *anyopaque, w: Proj, out: *anyopaque, m: u32) !void {
+    const M: i32 = @intCast(m);
+    const N: i32 = @intCast(w.n);
+    const K: i32 = @intCast(w.k);
+    const G: i32 = @intCast(w.k / GS);
+    const mp: i32 = @intCast((m + 7) / 8 * 8);
+    if (m <= 16) {
+        if (w.wide)
+            try d.launch(d.k.dec_wide, .{ .x = 1, .y = w.n / 128 }, .{ h, w.w, w.s, w.bg, out, M, N, K, ahi, alo, mp, G })
+        else
+            try d.launch(d.k.dec_narrow, .{ .x = 1, .y = w.n / 32 }, .{ h, w.w, w.s, w.bg, out, M, N, K, ahi, alo, mp, G });
+    } else {
+        const tiles = (m + 63) / 64;
+        const groups: ze.GroupCount = .{ .x = 8, .y = w.n / 256, .z = (tiles + 7) / 8 };
+        if (w.wide)
+            try d.launch(d.k.ngen_wide, groups, .{ h, w.w, w.s, w.bg, out, M, N, K, ahi, alo, mp, G })
+        else
+            try d.launch(d.k.ngen_narrow, groups, .{ h, w.w, w.s, w.bg, out, M, N, K, ahi, alo, mp, G, a.pscr });
+    }
+}
+
+/// XPU_DUMP=DIR: the first forward writes DIR/xpu_x_embed.f32 and DIR/xpu_x_{i}.f32 (x + pending residual, fp32
+/// [T, D]) after each of the first four layers, to compare with tools/xpu-bench/integ/layers_ref.py.
+var dump_dir: ?[]const u8 = null;
+
+extern "c" fn creat(path: [*:0]const u8, mode: c_uint) c_int;
+extern "c" fn write(fd: c_int, buf: [*]const u8, n: usize) isize;
+
+fn dump(d: *Dev, a: *Acts, T: u32, name: []const u8, with_r: bool) !void {
+    const dir = dump_dir orelse return;
+    try d.sync();
+    const x = try alloc.alloc(f32, T * D);
+    defer alloc.free(x);
+    try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, x.ptr, a.x, T * D * 4, null, 0, null));
+    if (with_r) {
+        const r = try alloc.alloc(f16, T * D);
+        defer alloc.free(r);
+        try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, r.ptr, a.r, T * D * 2, null, 0, null));
+        try d.sync();
+        for (x, r) |*xv, rv| xv.* += @floatCast(rv);
+    } else try d.sync();
+    const path = try std.fmt.allocPrintSentinel(alloc, "{s}/xpu_x_{s}.f32", .{ dir, name }, 0);
+    const fd = creat(path.ptr, 0o644);
+    _ = write(fd, @ptrCast(x.ptr), x.len * 4);
+    _ = close(fd);
+}
+
+/// A device buffer of `n` values (2 bytes: fp16 or bf16, 4: fp32) as fp32 in DIR/xpu_{name}.f32.
+fn dumpBuf(d: *Dev, name: []const u8, p: *anyopaque, n: usize, kind: enum { f16, bf16, f32 }) !void {
+    const dir = dump_dir orelse return;
+    try d.sync();
+    const x = try alloc.alloc(f32, n);
+    defer alloc.free(x);
+    const raw = try alloc.alloc(u16, n * 2);
+    defer alloc.free(raw);
+    const bytes: usize = if (kind == .f32) n * 4 else n * 2;
+    try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, raw.ptr, p, bytes, null, 0, null));
+    try d.sync();
+    for (x, 0..) |*v, i| v.* = switch (kind) {
+        .f16 => @floatCast(@as(f16, @bitCast(raw[i]))),
+        .bf16 => @bitCast(@as(u32, raw[i]) << 16),
+        .f32 => @bitCast(@as(u32, raw[2 * i]) | (@as(u32, raw[2 * i + 1]) << 16)),
+    };
+    const path = try std.fmt.allocPrintSentinel(alloc, "{s}/xpu_{s}.f32", .{ dir, name }, 0);
+    const fd = creat(path.ptr, 0o644);
+    _ = write(fd, @ptrCast(x.ptr), x.len * 4);
+    _ = close(fd);
+}
+
+/// One forward over `ids` (≤ CHUNK rows) at positions p0..; the greedy next token of the last row if `want`.
+fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, want: bool) !?i32 {
+    const T: u32 = @intCast(ids.len);
+    const t32: i32 = @intCast(T);
+    const tp = (T + 63) / 64 * 64; // GDN chunk rows (padded)
+    try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, a.ids, ids.ptr, ids.len * 4, null, 0, null));
+    try d.launch(d.k.embed, .{ .x = T }, .{ a.ids, m.embed_w, m.embed_s, m.embed_b, a.x, @as(i32, D) });
+    if (p0 == 0) try dump(d, a, T, "embed", false);
+    for (&m.layers, 0..) |*l, i| {
+        try d.launch(d.k.add_rmsnorm, .{ .x = T }, .{ a.x, a.r, l.in_norm, a.h, a.ahi, a.alo, @as(i32, D), EPS, @as(i32, if (i == 0) 0 else 1) });
+        const probe = p0 == 0 and i == 0;
+        if (probe) try dumpBuf(d, "h0", a.h, T * D, .f16);
+        try gemm(d, a, a.h, a.ahi, a.alo, l.mixer_in, a.p, T);
+        if (probe) try dumpBuf(d, "p0", a.p, T * GDN_IN, .f16);
+        if (l.attn) {
+            const ctx = p0 + T;
+            const ns = (ctx + SPLIT - 1) / SPLIT;
+            try d.launch(d.k.attn_prep, .{ .x = T }, .{ a.p, l.qn.?, l.kn.?, m.invf, a.q, l.kc.?, l.vc.?, @as(i32, @intCast(p0)), EPS });
+            try d.launch(d.k.attn_decode, .{ .x = ns, .y = 4, .z = T }, .{ a.q, l.kc.?, l.vc.?, a.pm, a.pl, a.po, @as(i32, @intCast(p0)), @as(i32, @intCast(ns)), @as(f32, 1.0 / 16.0) });
+            try d.launch(d.k.attn_merge, .{ .x = 24, .y = T }, .{ a.pm, a.pl, a.po, a.y, @as(i32, @intCast(p0)), @as(i32, @intCast(ns)) });
+            try d.launch(d.k.attn_gate, .{ .x = T }, .{ a.y, a.p, a.h, a.ahi, a.alo });
+        } else {
+            const cin = l.conv[l.conv_cur].?;
+            const cout = l.conv[1 - l.conv_cur].?;
+            l.conv_cur = 1 - l.conv_cur;
+            try d.launch(d.k.gdn_pre, .{ .x = T }, .{ a.p, cin, cout, l.conv_w.?, l.alog.?, l.dt.?, a.q, a.k, a.v, a.g, a.beta, t32 });
+            if (T > 1 and tp > T) {                      // neutral padding rows: the state does not move
+                const pad = tp - T;
+                const cp = struct {
+                    fn f(dd: *Dev, dst: *anyopaque, src: *anyopaque, n: usize) !void {
+                        try ze.check(dd.g.api.zeCommandListAppendMemoryCopy(dd.list, dst, src, n, null, 0, null));
+                    }
+                }.f;
+                try cp(d, off(a.k, T * 16 * 128 * 2), a.zeros, pad * 16 * 128 * 2);
+                try cp(d, off(a.v, T * 48 * 128 * 2), a.zeros, pad * 48 * 128 * 2);
+                try cp(d, off(a.beta, T * 48 * 4), a.zeros, pad * 48 * 4);
+                try cp(d, off(a.g, T * 48 * 4), a.ones, pad * 48 * 4);
+            }
+            if (T == 1) {
+                try d.launch(d.k.gdn_step, .{ .x = 16, .y = 48 }, .{ a.q, a.k, a.v, a.g, a.beta, l.rec.?, a.y, t32 });
+            } else {
+                const nc: i32 = @intCast(tp / 64);
+                const ncu: u32 = tp / 64;
+                const hk: i32 = 16;
+                const hv: i32 = 48;
+                try d.launch(d.k.gdn_prep, .{ .x = ncu, .y = 48 }, .{ a.k, a.v, a.g, a.beta, a.la, a.wb, a.u0, hk, hv, nc, @as(i32, 0) });
+                try d.launch(d.k.gdn_state, .{ .x = 48 }, .{ a.k, a.wb, a.u0, a.la, l.rec.?, l.rec.?, a.hs, a.vn, hk, hv, nc });
+                try d.launch(d.k.gdn_out, .{ .x = ncu, .y = 48 }, .{ a.q, a.k, a.la, a.hs, a.vn, a.y, hk, hv, nc });
+            }
+            if (probe) {
+                try dumpBuf(d, "q0", a.q, T * 2048, .bf16);
+                try dumpBuf(d, "k0", a.k, T * 2048, .bf16);
+                try dumpBuf(d, "v0", a.v, T * 6144, .bf16);
+                try dumpBuf(d, "g0", a.g, T * 48, .f32);
+                try dumpBuf(d, "beta0", a.beta, T * 48, .f32);
+                try dumpBuf(d, "y0", a.y, T * 6144, .bf16);
+            }
+            try d.launch(d.k.gated_norm, .{ .x = T }, .{ a.y, a.p, l.gnorm.?, a.h, a.ahi, a.alo, EPS });
+            if (probe) try dumpBuf(d, "o0", a.h, T * 6144, .f16);
+        }
+        try gemm(d, a, a.h, a.ahi, a.alo, l.mixer_out, a.r, T);
+        if (probe) try dumpBuf(d, "r0", a.r, T * D, .f16);
+        try d.launch(d.k.add_rmsnorm, .{ .x = T }, .{ a.x, a.r, l.post_norm, a.h, a.ahi, a.alo, @as(i32, D), EPS, @as(i32, 1) });
+        try gemm(d, a, a.h, a.ahi, a.alo, l.gu, a.p, T);
+        try d.launch(d.k.swiglu, .{ .x = T }, .{ a.p, a.h, a.ahi, a.alo });
+        try gemm(d, a, a.h, a.ahi, a.alo, l.down, a.r, T);
+        if (p0 == 0 and i < 4) try dump(d, a, T, try std.fmt.allocPrint(alloc, "{d}", .{i}), true);
+    }
+    if (!want) {                                     // x is per token: nothing carries to the next chunk
+        try d.sync();
+        return null;
+    }
+    try d.launch(d.k.add_rmsnorm, .{ .x = T }, .{ a.x, a.r, m.norm, a.h, a.ahi, a.alo, @as(i32, D), EPS, @as(i32, 1) });
+    const last = T - 1;
+    try gemm(d, a, off(a.h, last * D * 2), off(a.ahi, last * (D / GS) * 2), off(a.alo, last * (D / GS) * 2), m.head, a.logits, 1);
+    try d.launch(d.k.argmax, .{ .x = 1 }, .{ a.logits, @as(i32, VOCAB), a.tok });
+    var tok: i32 = 0;
+    try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, &tok, a.tok, 4, null, 0, null));
+    try d.sync();
+    return tok;
+}
+
+extern "c" fn clock_gettime(clk: c_int, ts: *[2]i64) c_int;
+fn now() f64 {
+    var ts: [2]i64 = undefined;
+    _ = clock_gettime(1, &ts);
+    return @as(f64, @floatFromInt(ts[0])) + @as(f64, @floatFromInt(ts[1])) * 1e-9;
+}
+
+pub fn main(init: std.process.Init) !void {
+    const argv = try init.minimal.args.toSlice(init.arena.allocator());
+    if (argv.len < 3) {
+        std.debug.print("usage: xpu-qwen27 MODEL_DIR IDS_FILE [STEPS]\n", .{});
+        return;
+    }
+    const dir = argv[1];
+    const steps: usize = if (argv.len > 3) try std.fmt.parseInt(usize, argv[3], 10) else 32;
+    if (std.c.getenv("XPU_DUMP")) |v| dump_dir = std.mem.span(v);
+
+    // prompt ids
+    var ids: std.ArrayList(i32) = .empty;
+    {
+        const path = try std.fmt.allocPrintSentinel(alloc, "{s}", .{argv[2]}, 0);
+        const fd = open(path.ptr, 0);
+        if (fd < 0) return error.FileNotFound;
+        const size: usize = @intCast(lseek(fd, 0, 2));
+        const text: [*]const u8 = @ptrCast(mmap(null, size, 1, 2, fd, 0) orelse return error.MmapFailed);
+        var it = std.mem.tokenizeAny(u8, text[0..size], " \n,[]");
+        while (it.next()) |w| try ids.append(alloc, try std.fmt.parseInt(i32, w, 10));
+    }
+
+    // checkpoint shards
+    var ckpt: Checkpoint = .{};
+    {
+        const index_path = try std.fmt.allocPrintSentinel(alloc, "{s}/model.safetensors.index.json", .{dir}, 0);
+        const fd = open(index_path.ptr, 0);
+        if (fd < 0) return error.FileNotFound;
+        const size: usize = @intCast(lseek(fd, 0, 2));
+        const text: [*]const u8 = @ptrCast(mmap(null, size, 1, 2, fd, 0) orelse return error.MmapFailed);
+        const parsed = try std.json.parseFromSlice(std.json.Value, alloc, text[0..size], .{});
+        var seen: std.ArrayList([]const u8) = .empty;
+        var it = parsed.value.object.get("weight_map").?.object.iterator();
+        while (it.next()) |e| {
+            const f = e.value_ptr.string;
+            for (seen.items) |s| {
+                if (std.mem.eql(u8, s, f)) break;
+            } else {
+                try seen.append(alloc, f);
+                try ckpt.addShard(try std.fmt.allocPrintSentinel(alloc, "{s}/{s}", .{ dir, f }, 0));
+            }
+        }
+    }
+
+    var d: Dev = .{ .g = try ze.Gpu.open(0xe223), .list = undefined, .k = undefined };
+    d.list = try d.g.immediate(0, 0);
+    std.debug.print("modules…\n", .{});
+    const mg = try d.g.module(&kb.glue);
+    const md = try d.g.module(&kb.decode);
+    const mm = try d.g.module(&kb.gemm);
+    const mgd = try d.g.module(&kb.gdn);
+    const mw = try d.g.module(&kb.ngen_wide);
+    const mn = try d.g.module(&kb.ngen_narrow);
+    d.k = .{
+        .embed = try d.kernel(mg, "embed", 256), .add_rmsnorm = try d.kernel(mg, "add_rmsnorm", 256),
+        .gdn_pre = try d.kernel(mg, "gdn_pre", 256), .gated_norm = try d.kernel(mg, "gated_norm", 256),
+        .attn_prep = try d.kernel(mg, "attn_prep", 256), .attn_gate = try d.kernel(mg, "attn_gate", 256),
+        .swiglu = try d.kernel(mg, "swiglu", 256), .argmax = try d.kernel(mg, "argmax", 256),
+        .repack = try d.kernel(mg, "repack", 16), .gdn_step = try d.kernel(md, "gdn_step", 16),
+        .attn_decode = try d.kernel(md, "attn_decode", 16), .attn_merge = try d.kernel(md, "attn_merge", 16),
+        .dec_wide = try d.kernel(mm, "w4k1_decode", 64), .dec_narrow = try d.kernel(mm, "w4k_dsplit", 64),
+        .gdn_prep = try d.kernel(mgd, "gdn_prep", 64), .gdn_state = try d.kernel(mgd, "gdn_state", 256),
+        .gdn_out = try d.kernel(mgd, "gdn_out", 128), .ngen_wide = try d.kernel(mw, "w4g_dpb", 256),
+        .ngen_narrow = try d.kernel(mn, "w4g_s4dpb", 256),
+    };
+    std.debug.print("kernels ready\n", .{});
+    // repack is a 2D launch with a 1D group: (16 columns) × 1 word row
+    try ze.check(d.g.api.zeKernelSetGroupSize(d.k.repack, 16, 1, 1));
+
+    const t_load = now();
+    std.debug.print("checkpoint: {d} tensors\n", .{ckpt.tensors.items.len});
+    var model = try load(&d, &ckpt);
+    std.debug.print("loaded in {d:.1} s\n", .{now() - t_load});
+    var acts = try Acts.init(&d);
+    try d.fill(acts.zeros, @as(u16, 0), CHUNK * 48 * 128 * 2);
+    try d.fill(acts.ones, @as(f32, 1.0), CHUNK * 48 * 4);
+
+    // prompt
+    const t0 = now();
+    var p0: u32 = 0;
+    var tok: i32 = 0;
+    while (p0 < ids.items.len) {
+        const end = @min(ids.items.len, p0 + CHUNK);
+        const last = end == ids.items.len;
+        if (try forward(&d, &model, &acts, ids.items[p0..end], p0, last)) |t| tok = t;
+        p0 = @intCast(end);
+    }
+    const t1 = now();
+    var out: std.ArrayList(i32) = .empty;
+    try out.append(alloc, tok);
+    for (1..steps) |_| {
+        tok = (try forward(&d, &model, &acts, &.{tok}, p0, true)).?;
+        p0 += 1;
+        try out.append(alloc, tok);
+    }
+    const t2 = now();
+    std.debug.print("prompt: {d} tokens in {d:.3} s ({d:.0} tok/s)\n", .{ ids.items.len, t1 - t0, @as(f64, @floatFromInt(ids.items.len)) / (t1 - t0) });
+    std.debug.print("decode: {d} tokens in {d:.3} s ({d:.1} tok/s)\n", .{ steps - 1, t2 - t1, @as(f64, @floatFromInt(steps - 1)) / (t2 - t1) });
+    std.debug.print("tokens:", .{});
+    for (out.items) |t| std.debug.print(" {d}", .{t});
+    std.debug.print("\n", .{});
+}
