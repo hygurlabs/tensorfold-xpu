@@ -2,7 +2,7 @@
 //! chunks (XPU_CHUNK rows, 1 024 by default), serial decode. `Runner` is what the native serial host drives
 //! (native/xpu.zig) and what the development runner (qwen27_main.zig) times.
 const std = @import("std");
-const ze = @import("ze.zig");
+pub const ze = @import("ze.zig");
 const kb = @import("xpu_qwen27_kernels");
 
 pub const alloc = std.heap.c_allocator;

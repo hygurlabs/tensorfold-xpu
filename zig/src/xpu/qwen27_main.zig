@@ -51,6 +51,7 @@ pub fn main(init: std.process.Init) !void {
     q.profReport("decode");
     if (std.c.getenv("XPU_OVERLAP_PROBE") != null) try overlapProbe(r);
     if (std.c.getenv("XPU_GEMM_ZEBIN")) |path| try gemmLoop(r, std.mem.span(path));
+    if (std.c.getenv("XPU_A8_ZEBIN")) |path| try a8Loop(r, std.mem.span(path));
     if (std.c.getenv("XPU_VERIFY_TEST") != null) try verifyTest(r, ids.items, out.items);
     if (std.c.getenv("XPU_DRAFTER")) |dir| try drafted(r, std.mem.span(dir), ids.items, out.items);
     std.debug.print("prompt: {d} tokens in {d:.3} s ({d:.0} tok/s)\n", .{ ids.items.len, t1 - t0, @as(f64, @floatFromInt(ids.items.len)) / (t1 - t0) });
@@ -224,4 +225,31 @@ fn gemmLoop(r: *q.Runner, path: []const u8) !void {
     const dt = (q.now() - t0) / 4000;
     const flops = 2.0 * @as(f64, @floatFromInt(T)) * @as(f64, @floatFromInt(w.n)) * @as(f64, @floatFromInt(w.k));
     std.debug.print("gemm loop {s}: {d:.3} ms a call, {d:.1} TFLOPS\n", .{ path, dt * 1e3, flops / dt / 1e12 });
+}
+
+/// The W4A8 gate|up GEMM of a zebin given by path (kernel w4a8) in a loop of 2 000 calls of CHUNK rows: ms a call, TOPS.
+fn a8Loop(r: *q.Runner, path: []const u8) !void {
+    const d = &r.d;
+    const a = &r.acts;
+    const fd = open(try std.fmt.allocPrintSentinel(alloc, "{s}", .{path}, 0), 0);
+    if (fd < 0) return error.FileNotFound;
+    const size: usize = @intCast(lseek(fd, 0, 2));
+    const bin: [*]const u8 = @ptrCast(mmap(null, size, 1, 2, fd, 0) orelse return error.MmapFailed);
+    const copy = try alloc.alignedAlloc(u8, .@"8", size);
+    @memcpy(copy, bin[0..size]);
+    const k = try d.kernel(try d.g.module(copy), "w4a8", 256);
+    const w = r.model.layers[0].gu;
+    const T = q.CHUNK;
+    const tiles = (T + 63) / 64;
+    try d.launch(d.k.quant_a8, .{ .x = T }, .{ a.h, a.a8, a.sa, a.ahi, a.alo, @as(i32, @intCast(w.k)), @as(i32, @intCast(T + 32)) });
+    const args = .{ a.a8, w.w, w.s, w.bg, a.p, @as(i32, @intCast(T)), @as(i32, @intCast(w.n)), @as(i32, @intCast(w.k)), a.ahi, a.alo, @as(i32, @intCast(T + 32)), @as(i32, @intCast(w.k / 128)), a.sa };
+    const groups: q.ze.GroupCount = .{ .x = 8, .y = w.n / 256, .z = (tiles + 7) / 8 };
+    for (0..20) |_| try d.launch(k, groups, args);
+    try d.sync();
+    const t0 = q.now();
+    for (0..2000) |_| try d.launch(k, groups, args);
+    try d.sync();
+    const dt = (q.now() - t0) / 2000;
+    const ops = 2.0 * @as(f64, @floatFromInt(T)) * @as(f64, @floatFromInt(w.n)) * @as(f64, @floatFromInt(w.k));
+    std.debug.print("a8 loop {s}: {d:.3} ms a call, {d:.1} TOPS\n", .{ path, dt * 1e3, ops / dt / 1e12 });
 }

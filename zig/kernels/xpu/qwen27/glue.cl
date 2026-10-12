@@ -362,9 +362,10 @@ KERNEL(256) void fakequant_rows(global half *X, global half *AHI, global half *A
 }
 
 // W4A8 du prompt : quantification des activations. Ligne t de X fp16 [T, K] en int8 symétrique par groupe de 128
-// (échelle s = max |x| / 127 dans SA [K/128, MS] fp32), rangée dans A8 [T, K] par blocs de 8 dans l'ordre
-// [k0, k4, k1, k5, k2, k6, k3, k7] (celui du dépliage des mots dans w4a8) ; AHI, ALO : Σ (s·q) / 128 en hi/lo fp16,
-// la somme des activations déquantifiées (terme de biais). Un groupe de 256 par ligne ; le couloir tient 8 K.
+// (échelle s = max |x| / 127 dans SA [K/128, MS] fp32), rangée dans A8 [T, K] par blocs de 16 dans l'ordre
+// [k0 k4 k1 k5 | k8 k12 k9 k13 | k2 k6 k3 k7 | k10 k14 k11 k15] (celui du dépliage des mots dans w4a8) ; AHI, ALO :
+// Σ (s·q) / 128 en hi/lo fp16, la somme des activations déquantifiées (terme de biais). Un groupe de 256 par ligne ;
+// le couloir tient 8 K (un mot : w = couloir % 2 dans son bloc de 16).
 KERNEL(256) void quant_a8(global const half *X, global char *A8, global float *SA, global half *AHI, global half *ALO,
                           int K, int MS) {
   const int t = get_group_id(0), lane = get_sub_group_local_id();
@@ -374,14 +375,17 @@ KERNEL(256) void quant_a8(global const half *X, global char *A8, global float *S
     for (int j = 0; j < 8; j++) m = fmax(m, fabs((float)xv[j]));
     m = sub_group_reduce_max(m);
     const float s = m > 0.0f ? m / 127.0f : 1.0f;
-    char8 q;
+    char4 q0, q1;                                     // mot double (w & m), puis ((w >> 4) & m)
     int qs = 0;
     for (int j = 0; j < 8; j++) {
       const int v = (int)clamp(rint((float)xv[j] / s), -127.0f, 127.0f);
-      q[(j % 4) * 2 + j / 4] = (char)v;
+      const int b = (j % 2) * 2 + j / 4;              // octet dans son mot double
+      if ((j % 4) < 2) q0[b] = (char)v; else q1[b] = (char)v;
       qs += v;
     }
-    vstore8(q, 0, A8 + (long)t * K + g * 128 + lane * 8);
+    global char *blk = A8 + (long)t * K + g * 128 + (lane / 2) * 16;
+    vstore4(q0, 0, blk + (lane % 2) * 4);
+    vstore4(q1, 0, blk + 8 + (lane % 2) * 4);
     qs = sub_group_reduce_add(qs);
     if (lane == 0) {
       SA[(long)g * MS + t] = s;

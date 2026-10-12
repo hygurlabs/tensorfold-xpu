@@ -630,9 +630,12 @@ public:
 };
 
 // W4A8 (option locale, prompt) : C[M, N] = A8[M, K] · Wᵀ sur DPAS int8. A8 int8 [M, K], quantifié par (ligne, groupe de
-// 128) avec l'échelle SA [K/128, Mp] fp32, ses K rangés par blocs de 8 dans l'ordre [k0, k4, k1, k5, k2, k6, k3, k7] :
-// c'est l'ordre que donnent w & 0x0F0F0F0F puis (w >> 4) & 0x0F0F0F0F sur nos mots aux quartets entrelacés (trois
-// opérations pour 8 valeurs). Par groupe : quatre DPAS k32 en int32 à partir de 0, puis acc += float(part)·s_w·s_a.
+// 128) avec l'échelle SA [K/128, Mp] fp32, ses K rangés par blocs de 16 (deux mots w0, w1) dans l'ordre des quatre
+// mots doubles w0 & m, w1 & m, (w0 >> 4) & m, (w1 >> 4) & m (m = 0x0F0F0F0F, nos mots aux quartets entrelacés) :
+// [k0 k4 k1 k5 | k8 k12 k9 k13 | k2 k6 k3 k7 | k10 k14 k11 k15], trois instructions SIMD32 pour deux mots. Par
+// groupe : quatre DPAS k32 en int32 à partir de 0, puis acc += float(part)·s_w·s_a (deux lignes par instruction).
+// Mots par groupe et A par moitié de groupe (64 K) : des chargements plus fins par pas k32, en double tampon, sont
+// plus lents (158 contre 193 TOPS sur gate|up).
 // Le biais (b × 128, Ahi/Alo des activations déquantifiées) par DPAS fp16 en fin de noyau, comme w4g_dpb.
 // Sous-groupe 32 lignes × 32 colonnes, groupe de travail 64 × 256, même grille (GM, N/256, paquets). GPTQ g128.
 // swiglu : épilogue SwiGLU de w4g_dpb_swiglu (gate|up entrelacés par 16).
@@ -689,7 +692,7 @@ public:
         // Registres : en-têtes et scalaires r32-r47 ; W 48-79 (deux tuiles × 16 lignes de mots = 128 K) ; A 80-111
         // (64 K × 32 lignes int8) ; B 112-119 / 120-127 ; part (int32) 128-191 ; acc (fp32) 192-255.
         const GRF hA = r32, hW = r33, hC = r34, s = r35, t = r36, addr = r37, swraw = r38, hPW = r39;
-        const GRF sw0 = r40, sw1 = r41, sa0 = r42, ftmp = r44, hPA = r45;
+        const GRF sw0 = r40, sw1 = r41, sa0 = r42, ftmp = r44, hPA = r46;   // ftmp : r44-r45
         const int W0 = 48, A0 = 80, BB[2] = {112, 120}, PART = 128, ACC = 192;
         Label lEnd, lGroup;
 
@@ -771,11 +774,11 @@ public:
                 const int step = 2 * h + st;              // pas k32 du groupe : lignes de mots 4·step … + 3
                 for (int j = 0; j < 2; j++) {
                     const int bb = BB[j];
-                    for (int w = 0; w < 4; w++) {
-                        const GRF wd = GRF(W0 + 16 * j + 4 * step + w);
-                        and_(16, GRF(bb + 2 * w).ud(), wd.ud(), 0x0F0F0F0Fu);
-                        shr(16, GRF(bb + 2 * w + 1).ud(), wd.ud(), 4);
-                        and_(16, GRF(bb + 2 * w + 1).ud(), GRF(bb + 2 * w + 1).ud(), 0x0F0F0F0Fu);
+                    for (int p = 0; p < 2; p++) {          // B : [w0 & m, w1 & m, (w0 >> 4) & m, (w1 >> 4) & m, puis w2, w3]
+                        const GRF wd = GRF(W0 + 16 * j + 4 * step + 2 * p);
+                        and_(32, GRF(bb + 4 * p).ud(), wd.ud(), 0x0F0F0F0Fu);
+                        shr(32, GRF(bb + 4 * p + 2).ud(), wd.ud(), 4);
+                        and_(32, GRF(bb + 4 * p + 2).ud(), GRF(bb + 4 * p + 2).ud(), 0x0F0F0F0Fu);
                     }
                     for (int i = 0; i < 4; i++) {
                         const GRF part = GRF(PART + 8 * (i * 2 + j)), a = GRF(A0 + 16 * st + 4 * i);
@@ -792,12 +795,14 @@ public:
         mov(16, sw1.f(), swraw.hf(16)(1));
         for (int i = 0; i < 4; i++)
             for (int j = 0; j < 2; j++)
-                for (int r = 0; r < 8; r++) {
+                for (int r = 0; r < 8; r += 2) {
                     const int row = 8 * i + r;
                     const GRF part = GRF(PART + 8 * (i * 2 + j) + r), acc = GRF(ACC + 8 * (i * 2 + j) + r);
-                    mov(16, ftmp.f(), part.d());
-                    mul(16, ftmp.f(), ftmp.f(), (j ? sw1 : sw0).f());
-                    mad(16, acc.f(), acc.f(), ftmp.f(), GRF(sa0.getBase() + row / 16).f(row % 16));
+                    mov(32, ftmp.f(), part.d());
+                    mul(32, ftmp.f(), ftmp.f(), (j ? sw1 : sw0).f(0)(0, 16, 1));
+                    for (int q = 0; q < 2; q++)
+                        mad(16, GRF(acc.getBase() + q).f(), GRF(acc.getBase() + q).f(),
+                            GRF(sa0.getBase() + (row + q) / 16).f((row + q) % 16), GRF(ftmp.getBase() + q).f());
                 }
         add(1, g, g, 1);
         cmp(1 | lt | f1[0], g, groups);
@@ -807,7 +812,7 @@ public:
         {
             const auto Ahi = getArgument("Ahi"), Alo = getArgument("Alo"), Gs = getArgument("G");
             const GRF hAH = r46, hAL = r47, hBB = r43;
-            const Subregister st = ftmp.d(0), nst = ftmp.d(1);
+            const Subregister st = r45.d(0), nst = r45.d(1);
             Label lBias;
             shl(1, t.d(0), Gs, 1);
             add(1, t.d(0), t.d(0), -1);
