@@ -17,9 +17,8 @@
 #define D 128
 #define DPAS(a, b, c) intel_sub_group_bf16_bf16_matrix_mad_k16(as_short8(a), as_int8(b), c)
 
-static inline ushort bf(float f) {                     // fp32 → bf16 au plus proche pair (pas de NaN ici)
-  uint u = as_uint(f);
-  return (ushort)((u + 0x7FFFu + ((u >> 16) & 1u)) >> 16);
+static inline ushort bf(float f) {                     // fp32 → bf16 au plus proche pair, conversion matérielle
+  return intel_convert_bfloat16_as_ushort(f);
 }
 
 #define KERNEL_WG(N) __attribute__((intel_reqd_sub_group_size(16))) __attribute__((reqd_work_group_size(N, 1, 1))) kernel
@@ -33,7 +32,10 @@ static inline ushort bf(float f) {                     // fp32 → bf16 au plus 
 KERNEL_WG(64) void gdn_prep(global const ushort *K, global const ushort *V, global const float *G,
                             global const float *BETA, global float *LA, global ushort *WB, global float *U0, int HK,
                             int HV, int NC, int skip) {
-  local float as_[CK * CK], ts[CK * CK], la[CK], be[CK], co[CK];
+  // T = (I + A)⁻¹ prend la place de A une fois l'inversion finie (16 Ko de mémoire locale en moins : 6 groupes par
+  // cœur Xe au lieu de 3)
+  local float as_[CK * CK], la[CK], be[CK], co[CK];
+  local float *ts = as_;
   const int c = get_group_id(0), h = get_group_id(1), lane = get_sub_group_local_id(), kh = h / (HV / HK);
   const int sg = get_sub_group_id(), T = NC * CK;
   const global ushort *Kh = K + kh * D, *Vh = V + h * D;
@@ -92,9 +94,8 @@ KERNEL_WG(64) void gdn_prep(global const ushort *K, global const ushort *V, glob
     for (int r = 0; r < 16; r++) dsm[bi][r * 16 + lane] = d[r];
   }
   barrier(CLK_LOCAL_MEM_FENCE);
+  float tcol[CK / 16][16];                           // T_kj, colonne du couloir, k = bj..3
   for (int bj = sg; bj == sg && !(skip & 2); bj++) {        // bloc de colonnes bj = sous-groupe
-
-    float tcol[CK / 16][16];                         // T_kj, colonne du couloir, k = bj..3
 #pragma unroll
     for (int r = 0; r < 16; r++) tcol[bj][r] = dsm[bj][r * 16 + lane];
     for (int bi = bj + 1; bi < CK / 16; bi++) {
@@ -116,6 +117,9 @@ KERNEL_WG(64) void gdn_prep(global const ushort *K, global const ushort *V, glob
         tcol[bi][r] = y;
       }
     }
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);                      // A n'est plus lu : T s'écrit à sa place
+  for (int bj = sg; bj == sg && !(skip & 2); bj++) {
     for (int bi = 0; bi < CK / 16; bi++)
 #pragma unroll
       for (int r = 0; r < 16; r++) ts[(bi * 16 + r) * CK + bj * 16 + lane] = bi < bj ? 0.0f : tcol[bi][r];
