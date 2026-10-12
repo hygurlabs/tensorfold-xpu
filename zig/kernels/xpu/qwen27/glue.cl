@@ -252,39 +252,54 @@ KERNEL(256) void gdn_pre(global const half *P, global const half *CIN, global ha
 KERNEL(256) void gdn_pre_rows(global const half *P, global const half *CIN, global half *COUT, global const ushort *CW,
                               global const ushort *ALOG, global const ushort *DT, global ushort *Q, global ushort *K,
                               global ushort *V, global float *G, global float *BETA, int T) {
-  local float cv[NCONV];
-  const int t = get_group_id(0), lid = get_local_id(0), sg = get_sub_group_id(), lane = get_sub_group_local_id();
-  for (int c = lid; c < NCONV; c += 256) {
-    float s = 0.0f;
-    for (int j = 0; j < 4; j++) {
-      const int i = t + j;
-      const float x = i < 3 ? (float)CIN[i * NCONV + c] : (float)P[(long)(i - 3) * 16640 + c];
-      s += x * bf2f(CW[c * 4 + j]);
+  // Grille (⌈T/8⌉, 5) : 8 lignes et 16 têtes de 128 canaux (0-15 q, 16-31 k, 32-79 v) par groupe, un sous-groupe par
+  // tête, le canal 128 tête + 16 i + couloir. Les poids de la convolution sont lus une fois, la fenêtre glisse dans les
+  // registres (entrée X[i] = CIN[i] pour i < 3, P[i − 3] ensuite ; la ligne t lit X[t … t + 3]). Mêmes additions dans
+  // le même ordre que ligne par ligne : mêmes bits.
+  const int t0 = get_group_id(0) * 8, sg = get_sub_group_id(), lane = get_sub_group_local_id(), lid = get_local_id(0);
+  const int head = get_group_id(1) * 16 + sg;
+  float w[8][4], x[8][3];
+  for (int i = 0; i < 8; i++) {
+    const int c = head * 128 + i * 16 + lane;
+    for (int j = 0; j < 4; j++) w[i][j] = bf2f(CW[c * 4 + j]);
+    for (int j = 0; j < 3; j++) {
+      const int r = t0 + j;
+      x[i][j] = r < 3 ? (float)CIN[r * NCONV + c] : (float)P[(long)(r - 3) * 16640 + c];
     }
-    cv[c] = rbf(silu(s));
-    if (t >= T - 3) COUT[(t - (T - 3)) * NCONV + c] = P[(long)t * 16640 + c];
-    if (T < 3 && t == 0)
-      for (int r = 0; r < 3 - T; r++) COUT[r * NCONV + c] = CIN[(r + T) * NCONV + c];
   }
-  barrier(CLK_LOCAL_MEM_FENCE);
-  for (int hh = sg; hh < 32; hh += 16) {
+  for (int t = t0; t < min(t0 + 8, T); t++) {
     float v[8], ss = 0.0f;
     for (int i = 0; i < 8; i++) {
-      v[i] = cv[hh * 128 + i * 16 + lane];
+      const int c = head * 128 + i * 16 + lane, r = t + 3;
+      const float x3 = r < 3 ? (float)CIN[r * NCONV + c] : (float)P[(long)(r - 3) * 16640 + c];
+      float s = 0.0f;
+      s += x[i][0] * w[i][0];
+      s += x[i][1] * w[i][1];
+      s += x[i][2] * w[i][2];
+      s += x3 * w[i][3];
+      x[i][0] = x[i][1];
+      x[i][1] = x[i][2];
+      x[i][2] = x3;
+      v[i] = rbf(silu(s));
       ss += v[i] * v[i];
+      if (t >= T - 3) COUT[(t - (T - 3)) * NCONV + c] = P[(long)t * 16640 + c];
+      if (T < 3 && t == 0)
+        for (int q = 0; q < 3 - T; q++) COUT[q * NCONV + c] = CIN[(q + T) * NCONV + c];
     }
-    const float inv = rsqrt(sub_group_reduce_add(ss) / 128.0f + 1e-6f);
-    const float scale = hh < 16 ? 1.0f / 128.0f : rsqrt(128.0f);
-    global ushort *dst = hh < 16 ? Q + ((long)t * 16 + hh) * 128 : K + ((long)t * 16 + hh - 16) * 128;
-    for (int i = 0; i < 8; i++) dst[i * 16 + lane] = f2bf(v[i] * inv * scale);
-  }
-  for (int c = lid; c < NCONV - NQK * 2; c += 256) V[(long)t * 6144 + c] = f2bf(cv[NQK * 2 + c]);
-  if (lid < 48) {
-    const float a = (float)P[(long)t * 16640 + 16384 + lid], b = (float)P[(long)t * 16640 + 16432 + lid];
-    const float sp = a + bf2f(DT[lid]);
-    const float soft = sp > 20.0f ? sp : log1p(exp(sp));
-    BETA[(long)t * 48 + lid] = sigmoid_f(b);
-    G[(long)t * 48 + lid] = exp(-exp(bf2f(ALOG[lid])) * soft);
+    if (head < 32) {
+      const float inv = rsqrt(sub_group_reduce_add(ss) / 128.0f + 1e-6f);
+      const float scale = head < 16 ? 1.0f / 128.0f : rsqrt(128.0f);
+      global ushort *dst = head < 16 ? Q + ((long)t * 16 + head) * 128 : K + ((long)t * 16 + head - 16) * 128;
+      for (int i = 0; i < 8; i++) dst[i * 16 + lane] = f2bf(v[i] * inv * scale);
+    } else
+      for (int i = 0; i < 8; i++) V[(long)t * 6144 + (head - 32) * 128 + i * 16 + lane] = f2bf(v[i]);
+    if (get_group_id(1) == 0 && lid < 48) {
+      const float a = (float)P[(long)t * 16640 + 16384 + lid], b = (float)P[(long)t * 16640 + 16432 + lid];
+      const float sp = a + bf2f(DT[lid]);
+      const float soft = sp > 20.0f ? sp : log1p(exp(sp));
+      BETA[(long)t * 48 + lid] = sigmoid_f(b);
+      G[(long)t * 48 + lid] = exp(-exp(bf2f(ALOG[lid])) * soft);
+    }
   }
 }
 
