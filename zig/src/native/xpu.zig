@@ -4,6 +4,7 @@ const api = @import("engine_api");
 const xq = @import("xpu_qwen27");
 const Drafter = xq.drafter.Drafter;
 const Serial = api.serial_host;
+const sampling = @import("lanes").sampling;
 const Allocator = std.mem.Allocator;
 
 pub const backends: []const []const u8 = &.{"xpu"};
@@ -20,12 +21,14 @@ const Host = struct {
     drafter: ?*Drafter = null,
     block: u32 = 8,
     out: [16]u32 = undefined,
+    pending: ?u32 = null, // a sampled reply's next token, drawn at the end of the previous round
 
     fn self(ptr: *anyopaque) *Host {
         return @ptrCast(@alignCast(ptr));
     }
     fn reset(ptr: *anyopaque) !void {
         const h = self(ptr);
+        h.pending = null;
         try h.runner.reset();
         if (h.drafter) |dr| dr.reset();
     }
@@ -57,13 +60,73 @@ const Host = struct {
         return .{ .tokens = h.out[0..count], .stats = .{ .rounds = 1, .drafted = L - 1, .accepted = n, .min_rows = L } };
     }
     fn chunk(ptr: *anyopaque, ids: []const u32, last: bool) !void {
-        try self(ptr).runner.prompt(ids, last);
+        const h = self(ptr);
+        h.pending = null;
+        try h.runner.prompt(ids, last);
     }
-    fn draw(ptr: *anyopaque, sampling: ?api.Sampling) !u32 {
+    /// The serial draw of `row`'s logits at `position`: `Serial.choose` over the top `top_k` candidates only (the
+    /// draw reads no other: same candidates, same order by value then id, same keyed noise), not the whole vocabulary.
+    fn pick(h: *Host, row: []const f32, position: u64, s: api.Sampling) !u32 {
+        if (s.temperature <= 0 or s.top_k == 0 or s.top_k > 256) return Serial.choose(h.gpa, .{ .f32 = row }, position, s);
+        const k: usize = s.top_k;
+        var vals: [256]f64 = undefined;
+        var ids: [256]u64 = undefined;
+        var n: usize = 0;
+        for (row, 0..) |v32, i| {
+            const v: f64 = v32;
+            if (!std.math.isFinite(v)) return error.NonfiniteLogits;
+            if (n == k and !(v > vals[k - 1])) continue; // equal values keep the lower id, already held
+            var j = if (n < k) n else k - 1;
+            if (n < k) n += 1;
+            while (j > 0 and v > vals[j - 1]) : (j -= 1) {
+                vals[j] = vals[j - 1];
+                ids[j] = ids[j - 1];
+            }
+            vals[j] = v;
+            ids[j] = i;
+        }
+        return @intCast(try sampling.choose(h.gpa, vals[0..n], ids[0..n], position, s));
+    }
+    fn draw(ptr: *anyopaque, s: ?api.Sampling) !u32 {
         const h = self(ptr);
         if (h.runner.pos == 0) return error.RoundNotReady;
-        if (sampling) |s| return Serial.choose(h.gpa, .{ .f32 = try h.runner.logits() }, h.runner.pos, s);
+        if (s) |sp| return h.pick(try h.runner.logits(), h.runner.pos, sp);
         return h.runner.last;
+    }
+    /// A drafted round for a sampled reply: every verified row is drawn at its position as the serial reply would,
+    /// and a draft counts only while it equals that draw; the first differing draw is the round's bonus.
+    fn batchSampled(ptr: *anyopaque, budget: u32, eos: []const u32, s: api.Sampling) !Serial.Batch {
+        const h = self(ptr);
+        const r = h.runner;
+        const dr = h.drafter orelse return error.DraftNotAttached;
+        const L = h.block;
+        const p0 = r.pos;
+        const pending = h.pending orelse try h.pick(try r.rowLogits(0), p0, s);
+        var block: [16]u32 = undefined;
+        block[0] = pending;
+        try dr.propose(pending, L - 1, block[1..L]);
+        _ = try r.verify(block[0..L]);
+        var n: u32 = 0;
+        var bonus: u32 = 0;
+        while (true) {
+            const t = try h.pick(try r.rowLogits(n), p0 + 1 + n, s);
+            if (n + 1 < L and t == block[n + 1]) {
+                n += 1;
+                continue;
+            }
+            bonus = t;
+            break;
+        }
+        try r.commit(n + 1);
+        try dr.addTaps(r.acts.taps, n + 1);
+        h.pending = bonus;
+        @memcpy(h.out[0 .. n + 1], block[0 .. n + 1]);
+        var count = @min(n + 1, budget);
+        for (h.out[0..count], 0..) |t, i| if (std.mem.indexOfScalar(u32, eos, t) != null) {
+            count = @intCast(i + 1);
+            break;
+        };
+        return .{ .tokens = h.out[0..count], .stats = .{ .rounds = 1, .drafted = L - 1, .accepted = n, .min_rows = L } };
     }
     fn advance(ptr: *anyopaque, token: u32) !void {
         try self(ptr).runner.step(token);
@@ -110,6 +173,7 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
         runner.taps_on = true;
         runner.on_taps = .{ .ctx = dr, .f = Host.onTaps };
         h.serial.driver.draft_batch = Host.batch;
+        h.serial.driver.draft_sampled = Host.batchSampled;
     };
     return .{ .engine = h.serial.engine(), .close = close, .ctx = h };
 }

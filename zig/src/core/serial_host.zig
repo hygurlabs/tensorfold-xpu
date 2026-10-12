@@ -16,6 +16,9 @@ pub const Driver = struct {
     advance: *const fn (*anyopaque, u32) anyerror!void,
     /// Receives true remaining request tokens and returns one complete round of at most `max_round` tokens.
     draft_batch: ?*const fn (*anyopaque, u32, []const u32) anyerror!Batch = null,
+    /// A drafted round for a sampled request: as `draft_batch`, each verified row drawn with the request's sampling
+    /// at its position (so the reply equals the serial one); null: sampled requests decode serially.
+    draft_sampled: ?*const fn (*anyopaque, u32, []const u32, api.Sampling) anyerror!Batch = null,
     /// Called once before a drafted request's first batch with its prompt, token budget and stop tokens.
     draft_begin: ?*const fn (*anyopaque, []const u32, u32, []const u32) anyerror!void = null,
     /// Kept prompt states: a prompt resumes at its longest kept prefix (restored, not `reset`) and keeps marks.
@@ -237,7 +240,8 @@ pub const Host = struct {
         if (h.driver.cache) |store| store.report(first, plan.from, kept);
         emit(job, .{ .prefilled = plan.from });
         if (warm) return h.finish(job, if (first == request.prompt.len) .length else .cancelled, .{ .prefill_seconds = @as(f64, @floatFromInt(prefill_ns)) / 1e9 }, "");
-        if (h.driver.draft_batch != null and request.drafts and request.sampling == null and request.stop == null) return h.serveDrafted(job, prefill_ns);
+        const drafted = if (request.sampling == null) h.driver.draft_batch != null else h.driver.draft_sampled != null;
+        if (drafted and request.drafts and request.stop == null) return h.serveDrafted(job, prefill_ns);
         var emitted: std.ArrayList(u32) = .empty;
         defer emitted.deinit(h.gpa);
         const draw_start = std.Io.Clock.awake.now(h.io);
@@ -282,7 +286,9 @@ pub const Host = struct {
     }
     fn serveDrafted(h: *Host, job: *Job, prefill_ns: i96) !void {
         const request = job.request;
-        const run = h.driver.draft_batch orelse return error.BadDriver;
+        const run = h.driver.draft_batch;
+        const run_sampled = h.driver.draft_sampled;
+        if ((if (request.sampling == null) run == null else run_sampled == null)) return error.BadDriver;
         if (h.driver.draft_begin) |begin| try begin(h.driver.ctx, request.prompt, request.max_tokens, request.eos);
         var stats = api.Stats{ .prefill_seconds = @as(f64, @floatFromInt(prefill_ns)) / 1e9 };
         const start = std.Io.Clock.awake.now(h.io);
@@ -295,7 +301,7 @@ pub const Host = struct {
                 return;
             }
             const remaining = request.max_tokens - emitted;
-            const batch = try run(h.driver.ctx, remaining, request.eos);
+            const batch = if (request.sampling) |s| try run_sampled.?(h.driver.ctx, remaining, request.eos, s) else try run.?(h.driver.ctx, remaining, request.eos);
             if (batch.tokens.len == 0 or batch.tokens.len > @min(max_round, remaining)) return error.BadDraftBatch;
             for (batch.tokens, 0..) |token, index| {
                 if (std.mem.indexOfScalar(u32, request.eos, token) != null and index + 1 != batch.tokens.len) {
