@@ -318,6 +318,54 @@ fn multiTest(r: *q.Runner, prompt: []const u32, n: u32) !void {
         for (shared[k]) |t| std.debug.print(" {d}", .{t});
         std.debug.print("\n", .{});
     };
+    // shared windows of 4 rows: perfect drafts (the serial reply) for even slots, wrong ones for odd slots
+    var got: [q.MAX_SLOTS][steps + 8]u32 = undefined;
+    var have: [q.MAX_SLOTS]usize = @splat(0);
+    for (0..n) |k| {
+        try r.select(@intCast(k));
+        try r.reset();
+        try r.prompt(prompt[k % 8 ..], true);
+    }
+    var rounds: usize = 0;
+    while (true) {
+        var wins: [16]q.Runner.Win = undefined;
+        var ids: [16][4]u32 = undefined;
+        var nw: usize = 0;
+        var rows: usize = 0;
+        for (0..n) |k| {
+            if (have[k] >= steps or rows + 4 > 16) continue;
+            const pending = if (k == r.slot) r.last else r.seqs[k].last;
+            ids[k][0] = pending;
+            for (1..4) |j| ids[k][j] = if (k % 2 == 0 and have[k] + j < steps) serial[k][have[k] + j] else 0;
+            wins[nw] = .{ .slot = @intCast(k), .ids = &ids[k] };
+            nw += 1;
+            rows += 4;
+        }
+        if (nw == 0) break;
+        try r.verifyMulti(wins[0..nw]);
+        var keep: [16]u32 = undefined;
+        var row: usize = 0;
+        for (wins[0..nw], 0..) |w, i| {
+            var a: u32 = 0; // accepted drafts
+            while (a + 1 < 4 and r.block[row + a] == w.ids[a + 1]) a += 1;
+            keep[i] = a + 1;
+            const k = w.slot;
+            for (w.ids[0 .. a + 1]) |t| {
+                got[k][have[k]] = t;
+                have[k] += 1;
+            }
+            row += 4;
+        }
+        try r.keepMulti(keep[0..nw]);
+        rounds += 1;
+    }
+    var equal4 = true;
+    for (0..n) |k| equal4 = equal4 and std.mem.eql(u32, got[k][0..steps], &serial[k]);
+    std.debug.print("multi test: windows of 4 rows (perfect / wrong drafts), {d} rounds, equal to serial: {}\n", .{ rounds, equal4 });
+    if (!equal4) for (0..n) |k| {
+        const at = std.mem.indexOfDiff(u32, got[k][0..steps], &serial[k]);
+        if (at) |x| std.debug.print("  slot {d} differs at token {d}\n", .{ k, x });
+    };
     var m: u32 = 1;
     while (m <= n) : (m *= 2) {
         var best: f64 = 1e9;

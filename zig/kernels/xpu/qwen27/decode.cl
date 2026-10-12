@@ -26,15 +26,16 @@ static inline ushort f2bf(float f) {
 KERNEL(16) void gdn_step(global const ushort *Q, global const ushort *K, global const ushort *V, global const float *G,
                          global const float *BETA, global const float *S, global float *SO, global ushort *Y, int T,
                          global const int *ROWS, global const int *TREE, global float *SL, global const ulong *MT) {
-  // MT (si non nul) : plusieurs flux, une ligne chacun, grille (16, 48, T) : la ligne get_group_id(2) met à jour sur
-  // place l'état de son flux, MT[8t + 4]
+  // MT (si non nul) : plusieurs flux, grille (16, 48, lignes) : la première ligne t0 de chaque fenêtre (MT[8t + 6] = t,
+  // largeur MT[8t + 7]) part de l'état de son flux, MT[8t + 4], et écrit l'état après ses lignes en MT[8t + 5]
   const int vb = get_group_id(0), h = get_group_id(1), lane = get_sub_group_local_id(), kh = h / 3;
   int t0 = 0;
   if (MT) {
     t0 = get_group_id(2);
+    if ((int)MT[t0 * 8 + 6] != t0) return;            // not a window's first row
     S = (global const float *)MT[t0 * 8 + 4];
-    SO = (global float *)MT[t0 * 8 + 4];
-    T = t0 + 1;
+    SO = (global float *)MT[t0 * 8 + 5];
+    T = t0 + (int)MT[t0 * 8 + 7];
   }
   float s[8][8];
   for (int r = 0; r < 8; r++)

@@ -43,7 +43,7 @@ extern "c" fn close(fd: c_int) c_int;
 extern "c" fn lseek(fd: c_int, off: i64, whence: c_int) i64;
 extern "c" fn mmap(addr: ?*anyopaque, len: usize, prot: c_int, flags: c_int, fd: c_int, off: i64) ?*anyopaque;
 
-pub const Tensor = struct { name: []const u8, dtype: []const u8, shape: [4]u64, rank: usize, bytes: []const u8 };
+pub const Tensor = struct { name: []const u8, dtype: []const u8, shape: [8]u64, rank: usize, bytes: []const u8 };
 
 pub const Checkpoint = struct {
     tensors: std.ArrayList(Tensor) = .empty,
@@ -64,6 +64,7 @@ pub const Checkpoint = struct {
             if (std.mem.eql(u8, e.key_ptr.*, "__metadata__")) continue;
             const o = e.value_ptr.object;
             var t: Tensor = .{ .name = e.key_ptr.*, .dtype = o.get("dtype").?.string, .shape = @splat(1), .rank = 0, .bytes = &.{} };
+            if (o.get("shape").?.array.items.len > t.shape.len) return error.TensorRank; // the vision tower's conv is 5-D
             for (o.get("shape").?.array.items, 0..) |d, i| t.shape[i] = @intCast(d.integer);
             t.rank = o.get("shape").?.array.items.len;
             const span = o.get("data_offsets").?.array.items;
@@ -90,6 +91,7 @@ pub const Dev = struct {
     g: ze.Gpu,
     list: ze.H,
     staging: []u8 = &.{}, // USM host memory: the driver cannot copy from file-backed mmap pages directly
+    allocated: usize = 0, // device bytes allocated (frees not counted: buffers live as long as the runner)
     k: struct {
         embed: ze.H, add_rmsnorm: ze.H, gdn_pre: ze.H, gdn_pre_rows: ze.H, gated_norm: ze.H, attn_prep: ze.H, attn_gate: ze.H,
         swiglu: ze.H, argmax: ze.H, argmax_part: ze.H, tap: ze.H, conv_commit: ze.H, repack: ze.H, gdn_step: ze.H, attn_decode: ze.H, attn_merge: ze.H, kv_move: ze.H,
@@ -108,6 +110,7 @@ pub const Dev = struct {
     }
 
     pub fn alloc_(d: *Dev, bytes: usize) !*anyopaque {
+        d.allocated += @max(bytes, 64);
         return d.g.deviceAlloc(@max(bytes, 64));
     }
 
@@ -230,6 +233,7 @@ const Layer = struct {
     vc: ?*anyopaque = null,
     // rec, conv, conv_cur, kc and vc above are the selected slot's (Runner.select); each slot's own are kept here
     slot_rec: [MAX_SLOTS]?*anyopaque = @splat(null),
+    slot_save: [MAX_SLOTS]?*anyopaque = @splat(null),
     slot_conv: [MAX_SLOTS][2]?*anyopaque = @splat(.{ null, null }),
     slot_cur: [MAX_SLOTS]u1 = @splat(0),
     slot_kc: [MAX_SLOTS]?*anyopaque = @splat(null),
@@ -868,8 +872,12 @@ pub const Runner = struct {
     tree_host: [16 * 17]i32 = @splat(0),
     path_host: [16]i32 = @splat(0),
     slot: u32 = 0, // the selected sequence (select)
-    mt_host: [LAYERS * 16 * 8]u64 = @splat(0), // stepMulti's per-row state addresses, by layer
+    mt_host: [LAYERS * 16 * 8]u64 = @splat(0), // verifyMulti's per-row state addresses, by layer
     pos_host: [16]i32 = @splat(0),
+    win_host: [32]i32 = @splat(0), // and each window's first row and width (keepMulti)
+    ids_host: [16]u32 = @splat(0),
+    multi_slots: [16]u32 = @splat(0), // the last verifyMulti's slots, by window
+    multi_count: u32 = 0,
     seqs: [MAX_SLOTS]struct { pos: u32 = 0, last: u32 = 0 } = @splat(.{}),
     /// Target hidden states for a drafter: when on, every forward fills acts.taps and calls `on_taps` with its rows.
     taps_on: bool = false,
@@ -939,6 +947,8 @@ pub const Runner = struct {
             .gdn_out = try d.kernel(mgd, "gdn_out", 128), .ngen_wide = try d.kernel(mw, "w4g_dpb", 256),
             .ngen_narrow = try d.kernel(mn, "w4g_s4dpb", 256), .prompt_attn = try d.kernel(mpa, "_prompt", 512),
         };
+        // the shared rounds' kernels reach each slot's states through the per-row table (acts.mt)
+        for ([_]ze.H{ d.k.attn_prep, d.k.attn_decode, d.k.gdn_pre, d.k.gdn_step }) |k| try d.g.indirect(k);
         if (std.c.getenv("XPU_PROFILE") != null) {
             prof.on = true;
             prof.events = try d.g.events(4096);
@@ -970,6 +980,7 @@ pub const Runner = struct {
                 l.vc = l.slot_vc[slot];
             } else {
                 l.rec = l.slot_rec[slot];
+                l.rec_save = l.slot_save[slot];
                 l.conv = l.slot_conv[slot];
                 l.conv_cur = l.slot_cur[slot];
             }
@@ -981,52 +992,105 @@ pub const Runner = struct {
         r.tree_on = false;
     }
 
-    /// One token for each of several slots in one forward (`slots[i]` takes `tokens[i]` at its position); each slot's
-    /// next greedy token in `seqs[slot].last` (and its logits row i, for `rowLogits`). Bits per row equal a lone step.
-    pub fn stepMulti(r: *Runner, slots: []const u32, tokens: []const u32) !void {
-        const T = slots.len;
-        if (T == 0 or T > 16 or tokens.len != T) return error.BadBlock;
+    /// A window of a shared verify: `ids` (the slot's pending token, then its drafts as a chain) from its position.
+    pub const Win = struct { slot: u32, ids: []const u32 };
+
+    /// Every window in one forward (16 rows at most, one window a slot): each row's greedy token in `block`, its
+    /// logits row for `rowLogits`; nothing moves until `keepMulti`. Bits per row equal the slot's one-token steps.
+    pub fn verifyMulti(r: *Runner, wins: []const Win) !void {
+        if (wins.len == 0 or wins.len > 16) return error.BadBlock;
         r.store();
+        var T: usize = 0;
         var max_pos: u32 = 0;
-        for (slots, 0..) |sl, t| {
-            for (slots[0..t]) |o| if (o == sl) return error.SlotTwice;
-            const p = r.seqs[sl].pos;
-            if (p + 1 > r.context) return error.ContextFull;
-            r.pos_host[t] = @intCast(p);
-            max_pos = @max(max_pos, p);
+        for (wins, 0..) |w, i| {
+            for (wins[0..i]) |o| if (o.slot == w.slot) return error.SlotTwice;
+            if (w.ids.len == 0 or T + w.ids.len > 16) return error.BadBlock;
+            const p = r.seqs[w.slot].pos;
+            if (p + w.ids.len > r.context) return error.ContextFull;
+            r.win_host[2 * i] = @intCast(T);
+            r.win_host[2 * i + 1] = @intCast(w.ids.len);
+            for (w.ids, 0..) |id, j| {
+                r.pos_host[T + j] = @intCast(p + j);
+                r.ids_host[T + j] = id;
+            }
+            max_pos = @max(max_pos, p + @as(u32, @intCast(w.ids.len)) - 1);
+            T += w.ids.len;
         }
-        for (&r.model.layers, 0..) |*l, i| for (slots, 0..) |sl, t| {
-            const e = r.mt_host[(i * 16 + t) * 8 ..][0..8];
-            e.* = @splat(0);
-            if (l.attn) {
-                e[0] = @intFromPtr(l.slot_kc[sl].?);
-                e[1] = @intFromPtr(l.slot_vc[sl].?);
-            } else {
-                const cur = l.slot_cur[sl];
-                e[2] = @intFromPtr(l.slot_conv[sl][cur].?);
-                e[3] = @intFromPtr(l.slot_conv[sl][1 - cur].?);
-                e[4] = @intFromPtr(l.slot_rec[sl].?);
+        for (&r.model.layers, 0..) |*l, i| for (wins, 0..) |w, wi| {
+            const first: usize = @intCast(r.win_host[2 * wi]);
+            for (0..w.ids.len) |j| {
+                const e = r.mt_host[(i * 16 + first + j) * 8 ..][0..8];
+                e.* = @splat(0);
+                e[6] = first;
+                e[7] = w.ids.len;
+                if (l.attn) {
+                    e[0] = @intFromPtr(l.slot_kc[w.slot].?);
+                    e[1] = @intFromPtr(l.slot_vc[w.slot].?);
+                } else {
+                    const cur = l.slot_cur[w.slot];
+                    e[2] = @intFromPtr(l.slot_conv[w.slot][cur].?);
+                    e[3] = @intFromPtr(l.slot_conv[w.slot][1 - cur].?);
+                    e[4] = @intFromPtr(l.slot_rec[w.slot].?);
+                    e[5] = @intFromPtr(l.slot_save[w.slot].?);
+                }
             }
         };
-        try ze.check(r.d.g.api.zeCommandListAppendMemoryCopy(r.d.list, r.acts.mt, &r.mt_host, LAYERS * 16 * 8 * 8, null, 0, null));
-        try ze.check(r.d.g.api.zeCommandListAppendMemoryCopy(r.d.list, r.acts.mpos, &r.pos_host, T * 4, null, 0, null));
-        _ = try forward(&r.d, &r.model, &r.acts, @ptrCast(tokens), 0, .{ .want = .rows, .multi = .{ .mt = r.acts.mt, .pos = r.acts.mpos, .max_pos = max_pos } });
+        const d = &r.d;
+        try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, r.acts.mt, &r.mt_host, LAYERS * 16 * 8 * 8, null, 0, null));
+        try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, r.acts.mpos, &r.pos_host, T * 4, null, 0, null));
+        _ = try forward(d, &r.model, &r.acts, @ptrCast(r.ids_host[0..T]), 0, .{ .want = .rows, .stash = true, .multi = .{ .mt = r.acts.mt, .pos = r.acts.mpos, .max_pos = max_pos } });
         var toks: [16]i32 = undefined;
-        try ze.check(r.d.g.api.zeCommandListAppendMemoryCopy(r.d.list, &toks, r.acts.tok, T * 4, null, 0, null));
-        try r.d.sync();
-        for (slots, 0..) |sl, t| {
-            r.seqs[sl].pos += 1;
-            r.seqs[sl].last = @intCast(toks[t]);
+        try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, &toks, r.acts.tok, T * 4, null, 0, null));
+        try d.sync();
+        for (r.block[0..T], toks[0..T]) |*o, t| o.* = @intCast(t);
+        for (wins, 0..) |w, i| r.multi_slots[i] = w.slot;
+        r.multi_count = @intCast(wins.len);
+    }
+
+    /// Keeps the first `keep[i]` rows of window i of the last verifyMulti: a whole window takes the state its forward
+    /// wrote, a shorter one replays its kept rows from the stash; each slot moves on by its kept rows.
+    pub fn keepMulti(r: *Runner, keep: []const u32) !void {
+        if (keep.len != r.multi_count) return error.BadCommit;
+        const d = &r.d;
+        const nul: ?*anyopaque = null;
+        for (keep, 0..) |k, i| {
+            const sl = r.multi_slots[i];
+            const first: u32 = @intCast(r.win_host[2 * i]);
+            const width: u32 = @intCast(r.win_host[2 * i + 1]);
+            if (k == 0 or k > width) return error.BadCommit;
             for (&r.model.layers) |*l| if (!l.attn) {
-                l.slot_cur[sl] = 1 - l.slot_cur[sl];
+                const cur = l.slot_cur[sl];
+                if (k == width) {
+                    std.mem.swap(?*anyopaque, &l.slot_rec[sl], &l.slot_save[sl]);
+                } else {
+                    const st = l.stash.?;
+                    try d.launch(d.k.gdn_step, .{ .x = 16, .y = 48 }, .{ off(st, ST_Q + first * 16 * 128 * 2), off(st, ST_K + first * 16 * 128 * 2), off(st, ST_V + first * 48 * 128 * 2), off(st, ST_G + first * 48 * 4), off(st, ST_B + first * 48 * 4), l.slot_rec[sl].?, l.slot_rec[sl].?, r.acts.y, @as(i32, @intCast(k)), nul, nul, nul, nul });
+                    try d.launch(d.k.conv_commit, .{ .x = 40 }, .{ l.slot_conv[sl][cur].?, off(st, ST_P + first * GDN_IN * 2), l.slot_conv[sl][1 - cur].?, @as(i32, @intCast(k)), nul });
+                }
+                l.slot_cur[sl] = 1 - cur;
             };
+            r.seqs[sl].pos += k;
+            r.seqs[sl].last = r.block[first + k - 1];
         }
+        r.multi_count = 0;
         // the selected slot's views follow its arrays
         for (&r.model.layers) |*l| if (!l.attn) {
+            l.rec = l.slot_rec[r.slot];
+            l.rec_save = l.slot_save[r.slot];
             l.conv_cur = l.slot_cur[r.slot];
         };
         r.pos = r.seqs[r.slot].pos;
         r.last = r.seqs[r.slot].last;
+    }
+
+    /// One token for each of several slots: a verifyMulti of one-row windows, all kept.
+    pub fn stepMulti(r: *Runner, slots: []const u32, tokens: []const u32) !void {
+        var wins: [16]Win = undefined;
+        if (slots.len > 16 or tokens.len != slots.len) return error.BadBlock;
+        for (slots, tokens, 0..) |sl, *t, i| wins[i] = .{ .slot = sl, .ids = t[0..1] };
+        try r.verifyMulti(wins[0..slots.len]);
+        const ones: [16]u32 = @splat(1);
+        try r.keepMulti(ones[0..slots.len]);
     }
 
     /// The selected slot's state pointers back into its slot arrays (a verify's commit may have swapped them).
@@ -1037,6 +1101,7 @@ pub const Runner = struct {
                 l.slot_vc[r.slot] = l.vc;
             } else {
                 l.slot_rec[r.slot] = l.rec;
+                l.slot_save[r.slot] = l.rec_save;
                 l.slot_conv[r.slot] = l.conv;
                 l.slot_cur[r.slot] = l.conv_cur;
             }
@@ -1047,7 +1112,7 @@ pub const Runner = struct {
     /// Bytes a slot's states take: GDN and convolution states, and the K/V cache of `context` positions.
     pub fn slotBytes(r: *const Runner) usize {
         _ = r;
-        return 48 * (48 * 128 * 128 * 4 + 2 * 3 * 10240 * 2) + 16 * 2 * @as(usize, MAX_CTX) * 4 * 256 * 2;
+        return 48 * (2 * 48 * 128 * 128 * 4 + 2 * 3 * 10240 * 2) + 16 * 2 * @as(usize, MAX_CTX) * 4 * 256 * 2;
     }
 
     /// `slot`'s states, allocated (zero) on its first use.
@@ -1061,6 +1126,7 @@ pub const Runner = struct {
             } else {
                 if (l.slot_rec[slot] != null) continue;
                 l.slot_rec[slot] = try d.alloc_(48 * 128 * 128 * 4);
+                l.slot_save[slot] = try d.alloc_(48 * 128 * 128 * 4);
                 try d.fill(l.slot_rec[slot].?, @as(u32, 0), 48 * 128 * 128 * 4);
                 for (&l.slot_conv[slot]) |*cv| {
                     cv.* = try d.alloc_(3 * 10240 * 2);

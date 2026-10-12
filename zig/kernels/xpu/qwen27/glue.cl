@@ -151,8 +151,9 @@ KERNEL(256) void gdn_pre(global const half *P, global const half *CIN, global ha
                          global const ushort *ALOG, global const ushort *DT, global ushort *Q, global ushort *K,
                          global ushort *V, global float *G, global float *BETA, int T, global const int *TREE,
                          global const ulong *MT) {
-  // MT (si non nul) : plusieurs flux, une ligne chacun ; la ligne t lit son état d'entrée en MT[8t + 2] et écrit son
-  // état de sortie en MT[8t + 3]
+  // MT (si non nul) : plusieurs flux, chacun une chaîne de lignes ; la ligne t, j-ième de sa fenêtre (première ligne
+  // MT[8t + 6], largeur MT[8t + 7]), lit l'état d'entrée de son flux en MT[8t + 2] et écrit son état après la fenêtre
+  // en MT[8t + 3]
   local float cv[256];
   const int t = get_group_id(0), blk = get_group_id(1), lid = get_local_id(0), sg = get_sub_group_id();
   const int lane = get_sub_group_local_id(), c = blk * 256 + lid;
@@ -161,18 +162,19 @@ KERNEL(256) void gdn_pre(global const half *P, global const half *CIN, global ha
     CIN = (global const half *)MT[t * 8 + 2];
     COUT = (global half *)MT[t * 8 + 3];
   }
-  const int dep = MT ? 0 : TREE ? TREE[t * 17] & 255 : t;
+  const int wf = MT ? (int)MT[t * 8 + 6] : 0, ww = MT ? (int)MT[t * 8 + 7] : T;
+  const int dep = MT ? t - wf : TREE ? TREE[t * 17] & 255 : t;
   for (int j = 0; j < 4; j++) {
     const int dd = dep - 3 + j;                       // profondeur de l'entrée (négative : l'état d'entrée)
-    const int row = MT ? t : dd < 0 ? 0 : (TREE ? TREE[t * 17 + 1 + dd] : dd);
+    const int row = MT ? wf + dd : dd < 0 ? 0 : (TREE ? TREE[t * 17 + 1 + dd] : dd);
     const float x = dd < 0 ? (float)CIN[(3 + dd) * NCONV + c] : (float)P[(long)row * 16640 + c];
     s += x * bf2f(CW[c * 4 + j]);
   }
   cv[lid] = rbf(silu(s));
-  if (MT) {
-    COUT[c] = CIN[NCONV + c];
-    COUT[NCONV + c] = CIN[2 * NCONV + c];
-    COUT[2 * NCONV + c] = P[(long)t * 16640 + c];
+  if (MT) {                                            // la fenêtre comme un bloc de ww lignes
+    if (dep >= ww - 3) COUT[(dep - (ww - 3)) * NCONV + c] = P[(long)t * 16640 + c];
+    if (ww < 3 && dep == 0)
+      for (int r = 0; r < 3 - ww; r++) COUT[r * NCONV + c] = CIN[(r + ww) * NCONV + c];
   } else {
     if (t >= T - 3) COUT[(t - (T - 3)) * NCONV + c] = P[(long)t * 16640 + c];
     if (T < 3 && t == 0)                                // l'état garde une partie de l'ancien

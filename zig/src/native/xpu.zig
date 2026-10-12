@@ -1,10 +1,13 @@
-//! XPU engines (Intel Xe2 over Level Zero): Qwen3.8-27B, MLX affine 4/64, behind the shared native serial host.
+//! XPU engines (Intel Xe2 over Level Zero): Qwen3.8-27B (MLX affine 4/64, GPTQ 4/128) behind the native serial host
+//! (`--parallel 1`) or the lane host (`--parallel N`: shared rounds across N streams, xpu_lanes.zig).
 const std = @import("std");
 const api = @import("engine_api");
 const xq = @import("xpu_qwen27");
 const Drafter = xq.drafter.Drafter;
 const Serial = api.serial_host;
-const sampling = @import("lanes").sampling;
+const lanes = @import("lanes");
+const sampling = lanes.sampling;
+const XpuLanes = @import("xpu_lanes.zig").Lanes;
 const Allocator = std.mem.Allocator;
 
 pub const backends: []const []const u8 = &.{"xpu"};
@@ -72,7 +75,14 @@ const Host = struct {
     /// The serial draw of `row`'s logits at `position`: `Serial.choose` over the top `top_k` candidates only (the
     /// draw reads no other: same candidates, same order by value then id, same keyed noise), not the whole vocabulary.
     fn pick(h: *Host, row: []const f32, position: u64, s: api.Sampling) !u32 {
-        if (s.temperature <= 0 or s.top_k == 0 or s.top_k > 256) return Serial.choose(h.gpa, .{ .f32 = row }, position, s);
+        return pickRow(h.gpa, row, position, s);
+    }
+    fn pickCtx(ctx: *anyopaque, row: []const f32, position: u64, s: api.Sampling) !u32 {
+        const gpa: *const Allocator = @ptrCast(@alignCast(ctx));
+        return pickRow(gpa.*, row, position, s);
+    }
+    fn pickRow(gpa: Allocator, row: []const f32, position: u64, s: api.Sampling) !u32 {
+        if (s.temperature <= 0 or s.top_k == 0 or s.top_k > 256) return Serial.choose(gpa, .{ .f32 = row }, position, s);
         const k: usize = s.top_k;
         var vals: [256]f64 = undefined;
         var ids: [256]u64 = undefined;
@@ -90,7 +100,7 @@ const Host = struct {
             vals[j] = v;
             ids[j] = i;
         }
-        return @intCast(try sampling.choose(h.gpa, vals[0..n], ids[0..n], position, s));
+        return @intCast(try sampling.choose(gpa, vals[0..n], ids[0..n], position, s));
     }
     fn draw(ptr: *anyopaque, s: ?api.Sampling) !u32 {
         const h = self(ptr);
@@ -175,6 +185,57 @@ fn close(ptr: *anyopaque) void {
     h.gpa.destroy(h);
 }
 
+/// `--parallel N`: the lane host over N runner slots.
+const LaneServed = struct {
+    gpa: Allocator,
+    back: XpuLanes,
+    cfg: lanes.Config,
+    wall: lanes.backend.WallClock,
+    core: lanes.Engine,
+    host: api.LaneHost,
+
+    fn close(ptr: *anyopaque) void {
+        const h: *LaneServed = @ptrCast(@alignCast(ptr));
+        h.host.stop();
+        h.core.deinit();
+        h.cfg.deinit(h.gpa);
+        for (h.back.first_logits) |l| if (l) |x| h.gpa.free(x);
+        h.gpa.destroy(@as(*Allocator, @ptrCast(@alignCast(h.back.pick_ctx))));
+        h.gpa.destroy(h);
+    }
+};
+
+/// Slots the card holds beside what is loaded: each a GDN state and a K/V cache of `context` tokens.
+fn slotsThatFit(runner: *xq.Runner, want: u32) u32 {
+    const card: usize = 31 << 30; // the B70's 32 GiB, less the driver's share
+    const margin: usize = 2 << 30; // activations of later chunks, the drafter's growth
+    const free = card -| runner.d.allocated -| margin;
+    const more: u32 = @intCast(@min(free / runner.slotBytes(), xq.MAX_SLOTS - 1));
+    return @max(1, @min(want, 1 + more));
+}
+
+fn openLanes(gpa: Allocator, io: std.Io, runner: *xq.Runner, drafter: ?*Drafter, o: api.Open, context: u32) !api.Opened {
+    const slots = slotsThatFit(runner, @min(o.lanes, xq.MAX_SLOTS));
+    const h = try gpa.create(LaneServed);
+    errdefer gpa.destroy(h);
+    const gpa_box = try gpa.create(Allocator);
+    gpa_box.* = gpa;
+    h.gpa = gpa;
+    h.back = .{ .gpa = gpa, .runner = runner, .drafter = drafter, .pick = Host.pickCtx, .pick_ctx = gpa_box, .slots = slots };
+    if (std.c.getenv("XPU_BLOCK")) |v| h.back.block = std.fmt.parseInt(u32, std.mem.span(v), 10) catch 8;
+    if (std.c.getenv("XPU_TREE")) |v| h.back.nodes = std.fmt.parseInt(u32, std.mem.span(v), 10) catch 15;
+    h.cfg = try lanes.Config.init(gpa, h.back.facts(), 16, 15);
+    errdefer h.cfg.deinit(gpa);
+    h.wall = .{ .io = io };
+    h.core = lanes.Engine.init(gpa, &h.cfg, h.back.backend(), h.wall.clock());
+    errdefer h.core.deinit();
+    h.host = api.LaneHost.init(gpa, io, &h.core, .{ .name = "qwen27-xpu", .lanes = slots, .context_window = context, .prefill_step = 1024 });
+    if (drafter != null) h.host.lone = .{ .ctx = &h.back, .run = XpuLanes.lone, .sampled = true };
+    try h.host.start();
+    std.log.info("qwen27-xpu: {d} streams of {d} tokens{s}", .{ slots, context, if (drafter != null) ", DFlash2 trees for a lone stream" else "" });
+    return .{ .engine = h.host.engine(), .close = LaneServed.close, .ctx = h };
+}
+
 pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]const u8) !?api.Opened {
     if (!std.mem.eql(u8, o.model_type, "qwen3_5")) {
         problem.* = try std.fmt.allocPrint(a, "the XPU engine serves Qwen3.8-27B (qwen3_5, MLX affine 4/64 or symmetric GPTQ 4/128) only, not {s}", .{o.model_type});
@@ -185,6 +246,17 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
         problem.* = try std.fmt.allocPrint(a, "the XPU engine could not load {s}: {s}", .{ o.dir, @errorName(err) });
         return null;
     };
+    if (o.lanes > 1) {
+        var dr: ?*Drafter = null;
+        if (o.drafts) if (o.drafter) |dir| {
+            dr = Drafter.init(runner, dir) catch |err| {
+                problem.* = try std.fmt.allocPrint(a, "the XPU engine could not load the drafter {s}: {s}", .{ dir, @errorName(err) });
+                return null;
+            };
+            runner.on_taps = .{ .ctx = dr.?, .f = Host.onTaps };
+        };
+        return try openLanes(gpa, io, runner, dr, o, context);
+    }
     const h = try gpa.create(Host);
     h.* = .{ .gpa = gpa, .runner = runner, .serial = undefined };
     h.serial = try Serial.Host.init(gpa, io, .{

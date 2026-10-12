@@ -29,6 +29,7 @@ pub const Api = struct {
     zeKernelCreate: *const fn (H, *const KernelDesc, *H) callconv(.c) u32,
     zeKernelSetGroupSize: *const fn (H, u32, u32, u32) callconv(.c) u32,
     zeKernelSetArgumentValue: *const fn (H, u32, usize, ?*const anyopaque) callconv(.c) u32,
+    zeKernelSetIndirectAccess: *const fn (H, u32) callconv(.c) u32,
     zeKernelGetProperties: *const fn (H, *KernelProperties) callconv(.c) u32,
     zeEventPoolCreate: *const fn (H, *const EventPoolDesc, u32, ?[*]H, *H) callconv(.c) u32,
     zeEventCreate: *const fn (H, *const EventDesc, *H) callconv(.c) u32,
@@ -209,6 +210,12 @@ pub const Gpu = struct {
         try check(g.api.zeKernelGetProperties(k, &kp));
         if (kp.spillMemSize != 0) std.debug.print("warning: {s} spills {d} bytes of registers\n", .{ name, kp.spillMemSize });
         return k;
+    }
+
+    /// The kernel reads device memory through addresses held in buffers (not only its arguments): the driver keeps
+    /// every device allocation resident while it runs.
+    pub fn indirect(g: *Gpu, k: H) Error!void {
+        try check(g.api.zeKernelSetIndirectAccess(k, 1 << 1)); // ZE_KERNEL_INDIRECT_ACCESS_FLAG_DEVICE
     }
 
     pub fn arg(g: *Gpu, k: H, i: u32, v: anytype) Error!void {
