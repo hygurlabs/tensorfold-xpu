@@ -95,7 +95,7 @@ pub const Dev = struct {
         swiglu: ze.H, argmax: ze.H, argmax_part: ze.H, tap: ze.H, conv_commit: ze.H, repack: ze.H, gdn_step: ze.H, attn_decode: ze.H, attn_merge: ze.H, kv_move: ze.H,
         embed_dense: ze.H, dense_rows: ze.H, repack_gptq: ze.H, quantize_mlx: ze.H,
         dec_wide_g128: ze.H, dec_wide64_g128: ze.H, dec_narrow_g128: ze.H, ngen_wide_g128: ze.H, ngen_narrow_g128: ze.H,
-        ngen_swiglu: ze.H, ngen_swiglu_g128: ze.H, rowsums_ff: ze.H,
+        ngen_swiglu: ze.H, ngen_swiglu_g128: ze.H, rowsums_ff: ze.H, fakequant_rows: ze.H,
         dec_wide: ze.H, dec_wide64: ze.H, dec_narrow: ze.H, gdn_prep: ze.H, gdn_state: ze.H, gdn_out: ze.H, ngen_wide: ze.H,
         ngen_narrow: ze.H, prompt_attn: ze.H,
     },
@@ -653,6 +653,16 @@ fn dumpBuf(d: *Dev, name: []const u8, p: *anyopaque, n: usize, kind: enum { f16,
 /// What a forward leaves: nothing, the last row's logits and greedy token, or every row's (verification, ≤ 16 rows).
 pub const Want = enum { none, last, rows };
 var dump_h: ?c_int = null;
+/// W4A8 study (XPU_A8 = 128: int8 activations by groups of 128; "token": one scale a row): prompt GEMM inputs quantized
+/// and dequantized in place before each projection. 0: off.
+var a8_group: u32 = 0;
+var a8_sites: u32 = 15; // XPU_A8_SITES: 1 mixer in, 2 mixer out, 4 gate|up, 8 down
+
+fn a8(d: *Dev, a: *Acts, x: *anyopaque, K: u32, T: u32, site: u32) !void {
+    if (a8_group == 0 or T <= 16 or a8_sites & site == 0) return;
+    const qg = if (a8_group == std.math.maxInt(u32)) K else a8_group;
+    try d.launch(d.k.fakequant_rows, .{ .x = T }, .{ x, a.ahi, a.alo, @as(i32, @intCast(K)), @as(i32, @intCast(qg)), @as(i32, @intCast(GS)) });
+}
 /// tree: the rows form a tree (acts.tree), each seeing its ancestors only; their GDN states land in acts.sl.
 pub const Mode = struct { want: Want = .last, stash: bool = false, taps: bool = false, tree: bool = false };
 
@@ -674,7 +684,11 @@ fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mode) 
         try d.launch(d.k.add_rmsnorm, .{ .x = T }, .{ a.x, a.r, l.in_norm, a.h, a.ahi, a.alo, @as(i32, D), EPS, @as(i32, if (i == 0) 0 else 1), gs });
         const probe = p0 == 0 and i == 0;
         if (probe) try dumpBuf(d, "h0", a.h, T * D, .f16);
-        try gemm(d, a.pscr, a.h, a.ahi, a.alo, l.mixer_in, a.p, T);
+        // W4A8 study: the GEMM reads a quantized copy (in r, free until mixer_out); the dense a/b gates read h as is
+        const min_in = if (a8_group != 0 and T > 16 and a8_sites & 1 != 0) a.r else a.h;
+        if (min_in != a.h) try copy(d, a.r, a.h, T * D * 2);
+        try a8(d, a, min_in, D, T, 1);
+        try gemm(d, a.pscr, min_in, a.ahi, a.alo, l.mixer_in, a.p, T);
         if (l.ab) |ab| try d.launch(d.k.dense_rows, .{ .x = (T + 15) / 16, .y = 96 / 16 }, .{ a.h, ab, a.p, t32, @as(i32, GDN_IN), @as(i32, 16384) });
         if (probe) try dumpBuf(d, "p0", a.p, T * GDN_IN, .f16);
         if (l.attn) {
@@ -741,10 +755,13 @@ fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mode) 
             try d.launch(d.k.gated_norm, .{ .x = T }, .{ a.y, a.p, l.gnorm.?, a.h, a.ahi, a.alo, EPS, gs });
             if (probe) try dumpBuf(d, "o0", a.h, T * 6144, .f16);
         }
+        try a8(d, a, a.h, 6144, T, 2);
         try gemm(d, a.pscr, a.h, a.ahi, a.alo, l.mixer_out, a.r, T);
         if (probe) try dumpBuf(d, "r0", a.r, T * D, .f16);
         try d.launch(d.k.add_rmsnorm, .{ .x = T }, .{ a.x, a.r, l.post_norm, a.h, a.ahi, a.alo, @as(i32, D), EPS, @as(i32, 1), gs });
+        try a8(d, a, a.h, D, T, 4);
         const act = try mlpIn(d, a, l.gu, T, gs);
+        try a8(d, a, act, 17408, T, 8);
         try gemm(d, a.pscr, act, a.ahi, a.alo, l.down, a.r, T);
         if (p0 == 0 and i < 4) try dump(d, a, T, try std.fmt.allocPrint(alloc, "{d}", .{i}), true);
         if (mode.taps) for (TAP_LAYERS, 0..) |tl, slot| if (tl == i)
@@ -804,6 +821,8 @@ pub const Runner = struct {
     /// Loads `dir` (MLX affine 4/64) onto the first B70 with room for `context` positions.
     pub fn init(dir: []const u8, context: u32) !*Runner {
         if (std.c.getenv("XPU_DUMP")) |v| dump_dir = std.mem.span(v);
+        if (std.c.getenv("XPU_A8_SITES")) |v| a8_sites = try std.fmt.parseInt(u32, std.mem.span(v), 10);
+        if (std.c.getenv("XPU_A8")) |v| a8_group = if (std.mem.eql(u8, std.mem.span(v), "token")) std.math.maxInt(u32) else try std.fmt.parseInt(u32, std.mem.span(v), 10);
         if (std.c.getenv("XPU_DUMP_H")) |v| dump_h = open(v, 0o2101, @as(c_uint, 0o644)); // O_WRONLY | O_CREAT | O_APPEND
         if (std.c.getenv("XPU_CHUNK")) |v| CHUNK = try std.fmt.parseInt(u32, std.mem.span(v), 10);
         MAX_CTX = context;
@@ -854,7 +873,7 @@ pub const Runner = struct {
             .ngen_wide_g128 = try d.kernel(mw128, "w4g_dpb", 256), .ngen_narrow_g128 = try d.kernel(mn128, "w4g_s4dpb", 256),
             .ngen_swiglu = try d.kernel(try d.g.module(&kb.ngen_swiglu), "w4g_dpb_swiglu", 256),
             .ngen_swiglu_g128 = try d.kernel(try d.g.module(&kb.ngen_swiglu128), "w4g_dpb_swiglu", 256),
-            .rowsums_ff = try d.kernel(mg, "rowsums_ff", 256),
+            .rowsums_ff = try d.kernel(mg, "rowsums_ff", 256), .fakequant_rows = try d.kernel(mg, "fakequant_rows", 256),
             .dec_wide = try d.kernel(mm, "w4k1_decode", 64), .dec_wide64 = try d.kernel(mm, "w4k1_d64", 64), .dec_narrow = try d.kernel(mm, "w4k_dsplit", 64),
             .gdn_prep = try d.kernel(mgd, "gdn_prep", 64), .gdn_state = try d.kernel(mgd, "gdn_state", 256),
             .gdn_out = try d.kernel(mgd, "gdn_out", 128), .ngen_wide = try d.kernel(mw, "w4g_dpb", 256),

@@ -339,6 +339,28 @@ KERNEL(256) void rowsums_ff(global const half *H, global half *AHI, global half 
   rowsums(hl, 17408, AHI, ALO, t, gs);
 }
 
+// Étude W4A8 (quantification simulée) : chaque ligne de X fp16 [T, K] quantifiée en int8 symétrique par groupes de qg
+// (échelle = max |x| / 127), remise en fp16 sur place, puis ses sommes de ligne par groupe de gs recalculées.
+KERNEL(256) void fakequant_rows(global half *X, global half *AHI, global half *ALO, int K, int qg, int gs) {
+  local half hl[17408];
+  const int t = get_group_id(0), lane = get_sub_group_local_id();
+  for (int e = get_local_id(0) * 4; e < K; e += 1024) vstore4(vload4(0, X + (long)t * K + e), 0, hl + e);
+  barrier(CLK_LOCAL_MEM_FENCE);
+  for (int g = get_sub_group_id(); g < K / qg; g += get_num_sub_groups()) {
+    float m = 0.0f;
+    for (int k = lane; k < qg; k += 16) m = fmax(m, fabs((float)hl[g * qg + k]));
+    m = sub_group_reduce_max(m);
+    const float s = m > 0.0f ? m / 127.0f : 1.0f;
+    for (int k = lane; k < qg; k += 16) {
+      const float q = clamp(rint((float)hl[g * qg + k] / s), -127.0f, 127.0f);
+      hl[g * qg + k] = convert_half_rte(q * s);
+    }
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  for (int e = get_local_id(0) * 4; e < K; e += 1024) vstore4(vload4(0, hl + e), 0, X + (long)t * K + e);
+  rowsums(hl, K, AHI, ALO, t, gs);
+}
+
 // Arg max de chaque ligne de logits fp16 [T, V] (le premier indice en cas d'égalité), en deux noyaux : maxima
 // partiels de 256 groupes par ligne (grille (256, T) ; PV, PI [T, 256]), puis le maximum des partiels (grille T).
 KERNEL(256) void argmax_part(global const half *L, int V, global float *PV, global int *PI) {
