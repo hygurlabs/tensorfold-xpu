@@ -684,8 +684,8 @@ var a8_group: u32 = 0;
 /// K/V cache study (XPU_KV8): 1 q, k, v rotated by Hadamard (the output rotated back), 2 k, v quantized to int8 by
 /// (token, head) and back, 3 both.
 var kv8: i32 = 0;
-/// The prompt attention: our DPAS kernel (attn_prompt) instead of the port's Triton one (XPU_ATTN_OWN=1).
-var attn_own = false;
+/// The prompt attention: our DPAS kernel (attn_prompt), or the port's Triton one with XPU_ATTN_TRITON=1.
+var attn_own = true;
 /// W4A8 prompt GEMMs (XPU_PREFILL_INT8, local option, GPTQ g128 only): int8 activations by (row, group of 128).
 pub var prefill_int8 = false;
 /// add_rmsnorm without the fused W4A8 quantization (its A8 and SA arguments).
@@ -895,7 +895,7 @@ pub const Runner = struct {
     pub fn init(dir: []const u8, context: u32) !*Runner {
         if (std.c.getenv("XPU_DUMP")) |v| dump_dir = std.mem.span(v);
         if (std.c.getenv("XPU_PREFILL_INT8") != null) prefill_int8 = true;
-        if (std.c.getenv("XPU_ATTN_OWN") != null) attn_own = true;
+        if (std.c.getenv("XPU_ATTN_TRITON") != null) attn_own = false;
         if (std.c.getenv("XPU_KV8")) |v| kv8 = try std.fmt.parseInt(i32, std.mem.span(v), 10);
         if (std.c.getenv("XPU_A8_SITES")) |v| a8_sites = try std.fmt.parseInt(u32, std.mem.span(v), 10);
         if (std.c.getenv("XPU_A8")) |v| a8_group = if (std.mem.eql(u8, std.mem.span(v), "token")) std.math.maxInt(u32) else try std.fmt.parseInt(u32, std.mem.span(v), 10);
