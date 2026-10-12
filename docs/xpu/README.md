@@ -12,7 +12,7 @@ DFlash2 en arbre.
 | Modèle | Qwen3.8-27B (`model_type` `qwen3_5` : 48 couches GDN + 16 d'attention) |
 | Formats | MLX affine 4 bits groupes de 64 (`mlx-q4g64`), GPTQ symétrique 4 bits groupes de 128 (`gptq-int4-g128`) |
 | Brouillons | DFlash2 (`--drafter`), arbre best-first de 15 nœuds, glouton et échantillonné |
-| Service | un flux à la fois (`serial_host`) ; multi-flux et MoE : voir [plan-multiflux-moe.md](plan-multiflux-moe.md) |
+| Service | plusieurs flux (`--parallel N`, 8 par défaut, hôte « lanes » du moteur) : tours partagés, un flux seul en arbre DFlash2 ; `--parallel 1` : hôte série. MoE : voir [plan-multiflux-moe.md](plan-multiflux-moe.md) |
 
 Au format GPTQ, les couches sont en int4 g128 telles que stockées. Les portes `in_proj_a/b` du GDN restent en fp16
 dense, comme le checkpoint, et l'embedding est fp16. La tête de sortie est requantifiée au chargement en affine
@@ -35,8 +35,15 @@ ISA par nGEN au moment du build (`zig/tools/xpu/w4_ngen.cpp`) ; tout est embarqu
 ## Lancer
 
 ```sh
-tensorfold-native serve MODELE --drafter DFLASH2 --context 16384 --host 127.0.0.1 --port 8081
+tensorfold-native serve MODELE --drafter DFLASH2 --parallel 8 --context 16384 --host 127.0.0.1 --port 8081
 ```
+
+Avec `--parallel N` (N > 1), chaque flux a son emplacement sur la carte : état GDN (2 × 151 Mo, l'état et sa
+sauvegarde pour la vérification) et cache K/V (64 Ko par jeton de `--context`). Le nombre d'emplacements est borné
+par la mémoire restante après le chargement (`slotsThatFit`). Un flux seul qui demande des brouillons tourne en
+arbre DFlash2 dans l'emplacement 0. Dès qu'un autre arrive, le cœur le reprend dans des tours partagés : un
+forward pour les fenêtres de tous les flux (chacune une chaîne, le jeton en attente puis les copies du contexte),
+16 lignes au plus.
 
 Options par variables d'environnement :
 
@@ -67,6 +74,9 @@ pas aux 2 600 du DPAS pur. Le GEMM gate|up seul tient 146 TFLOPS fp16 et ~209 TO
   jetons), en MLX et en GPTQ, avec et sans W4A8.
 - **Drafté == série** : bit à bit, avec des brouillons parfaits, faux et réels, en chaîne et en arbre, en glouton
   et en échantillonné (`xpu-qwen27` avec `XPU_VERIFY_TEST`, et `bench_concurrent --alone --serial` sur le serveur).
+- **Plusieurs flux == un seul** : bit à bit, jusqu'à 16 emplacements, avec des fenêtres de 1 et 4 lignes et des
+  conservations partielles (`XPU_MULTI_TEST`), et chaque réponse concurrente égale à la même requête seule
+  (`bench_concurrent --alone`).
 - **W4A8** : perplexité sur trois textes bruts (anglais, code, français) +0,04 à +0,13 %, KL ≈ 3e-3 face au fp16 ;
   pour comparaison, MLX et GPTQ s'écartent l'un de l'autre de 0,06 à 0,11 en KL
   (`tools/xpu/a8_study.py`).
@@ -78,9 +88,10 @@ pas aux 2 600 du DPAS pur. Le GEMM gate|up seul tient 146 TFLOPS fp16 et ~209 TO
 | Fichier | Rôle |
 |---|---|
 | `zig/src/xpu/ze.zig` | Accès à Level Zero : mémoire, modules, noyaux, listes de commandes |
-| `zig/src/xpu/qwen27.zig` | Le modèle : chargement (MLX, GPTQ), forward couche par couche, `Runner` (`prompt`, `step`, `verify`, `verifyTree`, `commit`, `commitPath`) |
+| `zig/src/xpu/qwen27.zig` | Le modèle : chargement (MLX, GPTQ), forward couche par couche, `Runner` (`prompt`, `step`, `verify`, `verifyTree`, `commit`, `commitPath` ; emplacements `select`, `verifyMulti`, `keepMulti`) |
 | `zig/src/xpu/drafter.zig` | DFlash2 : contexte de taps, bloc proposé, sélecteur, arbre best-first, `treeRound` |
-| `zig/src/native/xpu.zig` | La prise sur le serveur (`serial_host`) : prompt, tirage, tours draftés |
+| `zig/src/native/xpu.zig` | La prise sur le serveur : hôte série (`--parallel 1`) ou hôte « lanes » |
+| `zig/src/native/xpu_lanes.zig` | Le backend `lanes` : emplacements, tours partagés (`verifyMulti`, `keepMulti`), flux seul en arbre (`lone`) |
 | `zig/src/xpu/qwen27_main.zig` | Exécutable de test : oracle, contrats, profils, sondes |
 | `zig/kernels/xpu/qwen27/*.cl` | Noyaux OpenCL C : GEMM int4 du décodage, GDN par morceaux et en série, attention de décodage, normes, SwiGLU, quantification int8, brouillonneur |
 | `zig/kernels/xpu/qwen27/triton/prompt_attention.spv` | Attention du prompt (noyau Triton du portage Python, en SPIR-V) |
@@ -101,6 +112,8 @@ xpu-qwen27 MODELE --bench=4096 2      # prompt synthétique de 4 096 jetons (att
 |---|---|
 | `XPU_DRAFTER=DIR`, `XPU_TREE`, `XPU_BLOCK` | tours draftés, comparés à la série |
 | `XPU_VERIFY_TEST=1` | contrat drafté == série avec des brouillons parfaits et faux |
+| `XPU_MULTI_TEST=N` | contrat multi-flux : N emplacements, tours partagés (une ligne, puis fenêtres de 4 lignes) == série, et débit agrégé |
+| `XPU_ROWS_PROBE=1` | coût d'un forward de 1 à 16 lignes |
 | `XPU_PROFILE=1` | temps GPU par noyau |
 | `XPU_DUMP_H=FICHIER` | états cachés finaux de chaque ligne (études de justesse) |
 | `XPU_A8=128` ou `token`, `XPU_A8_SITES` | étude W4A8 : quantification simulée des entrées des GEMM du prompt |
@@ -111,6 +124,7 @@ xpu-qwen27 MODELE --bench=4096 2      # prompt synthétique de 4 096 jetons (att
 
 - Un seul modèle : les dimensions du 27B sont des constantes (`qwen27.zig`) et certaines formes sont écrites dans
   les noyaux (GDN de 128, attention de 256, rapport de têtes 6).
-- Un flux à la fois ; pas encore de cache de préfixes ni de reprise de réponse (`decode_chunk`).
+- En multi-flux, seul un flux seul drafte (arbre DFlash2) ; dans les tours partagés, les brouillons sont les
+  copies du contexte. Pas encore de cache de préfixes ni de reprise de réponse (`decode_chunk`).
 - Formats 4 bits seulement (MLX g64, GPTQ g128 symétrique). Le W4A8 demande le GPTQ g128.
 - Les commentaires des noyaux sont en français : à passer en anglais avant toute proposition amont.

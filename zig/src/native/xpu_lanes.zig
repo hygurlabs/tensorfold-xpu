@@ -42,6 +42,14 @@ pub const Lanes = struct {
         return .{ .exact_width = 16, .mtp = false, .speculate = false, .speculate_early = false, .drafts = 0, .hidden_rows = true, .streams_exact = true, .batch_rows = 16, .max_streams = b.slots, .lone_copies = false };
     }
 
+    /// A verify whose rows all stayed: the core calls keep only to drop rows, so the next call keeps them all first.
+    fn settle(b: *Lanes) !void {
+        if (b.count == 0) return;
+        const n = b.count;
+        b.count = 0;
+        try b.runner.keepMulti(b.widths[0..n]);
+    }
+
     fn slotOf(b: *const Lanes, s: *const lanes.Stream) ?u32 {
         for (b.owners[0..b.slots], 0..) |o, i| if (o == s) return @intCast(i);
         return null;
@@ -98,7 +106,7 @@ pub const Lanes = struct {
 
     fn prefillFn(ptr: *anyopaque, s: *lanes.Stream) anyerror!void {
         const b = self(ptr);
-        b.count = 0;
+        try b.settle();
         const slot = b.slotOf(s) orelse (b.freeSlot() orelse return error.NoFreeSlot);
         b.owners[slot] = s;
         errdefer b.owners[slot] = null;
@@ -119,7 +127,7 @@ pub const Lanes = struct {
     fn queueFn(ptr: *anyopaque, s: *lanes.Stream, feed: be.Feed, position: u64) anyerror!u64 {
         const b = self(ptr);
         const slot = b.slotOf(s) orelse return error.UnknownStream;
-        if (b.count != 0) return error.UnkeptVerify;
+        try b.settle();
         const r = b.runner;
         try r.select(slot);
         try r.step(try b.value(feed));
@@ -135,6 +143,7 @@ pub const Lanes = struct {
     fn verifyFn(ptr: *anyopaque, windows: []const be.Window, out: []be.Verified) anyerror!void {
         const b = self(ptr);
         if (windows.len == 0 or windows.len > 16 or windows.len != out.len) return error.BadWindows;
+        try b.settle();
         var wins: [16]xq.Runner.Win = undefined;
         var total: usize = 0;
         for (windows, 0..) |w, i| {
@@ -181,6 +190,7 @@ pub const Lanes = struct {
 
     fn releaseFn(ptr: *anyopaque, s: *lanes.Stream) void {
         const b = self(ptr);
+        b.settle() catch {};
         const slot = b.slotOf(s) orelse return;
         b.owners[slot] = null;
     }
@@ -190,6 +200,7 @@ pub const Lanes = struct {
     pub fn lone(ctx: *anyopaque, s: *lanes.Stream, hooks: api.LoneHooks) anyerror!bool {
         const b = self(ctx);
         const d = b.drafter orelse return error.DraftNotAttached;
+        try b.settle();
         if (b.owners[0] != null) return error.StreamBusy;
         b.owners[0] = s;
         var handed = false;

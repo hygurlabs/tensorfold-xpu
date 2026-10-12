@@ -49,8 +49,12 @@ agrégés, contre 34 pour un flux seul. L'attention grandit avec le contexte de 
 sur de longs contextes. Avec des brouillons, les lignes se partagent entre flux : les noyaux de décodage s'arrêtent
 à 16 lignes par forward. Au-delà, il faut des noyaux de décodage à 32-64 lignes, ou passer au chemin prompt.
 
-**Ordre** : (1) emplacements et forward multi-flux sans brouillons, contrat « seul == parmi d'autres » ;
-(2) fenêtres draftées par flux ; (3) bancs `bench_concurrent --levels 1,2,4,8`.
+**Ordre** : (1) emplacements et forward multi-flux, contrat « seul == parmi d'autres » ; (2) fenêtres draftées par
+flux ; (3) bancs `bench_concurrent --levels 1,2,4,8`.
+
+**État (2026-10-12)** : (1) fait, avec les fenêtres en chaîne (copies du contexte) et la conservation partielle par
+flux (`verifyMulti`, `keepMulti`, `native/xpu_lanes.zig`). Un flux seul garde l'arbre DFlash2. Reste (2) : le
+brouillonneur pour chaque flux dans les tours partagés (taps par emplacement, arbres par fenêtre).
 
 ## 2. MoE
 
