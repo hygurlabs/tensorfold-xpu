@@ -49,6 +49,30 @@ static void rowsums(local const half *hl, int K, global half *AHI, global half *
   }
 }
 
+// Poids tournés (checkpoint marqué hadamard128, tools/xpu/rotate_w4.py) : chaque bloc de 128 d'une entrée de GEMM est
+// tourné par Hadamard (Sylvester, normé 1/√128 ; élément 16 i + couloir du bloc au couloir), en mémoire locale, par les
+// sous-groupes du groupe ; l'appelant met les barrières autour.
+static void rot128_local(local half *hl, int K) {
+  const int lane = get_sub_group_local_id();
+  for (int b = get_sub_group_id(); b < K / 128; b += get_num_sub_groups()) {
+    float v[8];
+    for (int i = 0; i < 8; i++) v[i] = (float)hl[b * 128 + i * 16 + lane];
+    for (int m = 1; m < 16; m <<= 1)
+      for (int i = 0; i < 8; i++) {
+        const float o = sub_group_shuffle_xor(v[i], m);
+        v[i] = (lane & m) ? o - v[i] : v[i] + o;
+      }
+    for (int m = 1; m < 8; m <<= 1)
+      for (int i = 0; i < 8; i++)
+        if (!(i & m)) {
+          const float x = v[i], y = v[i | m];
+          v[i] = x + y;
+          v[i | m] = x - y;
+        }
+    for (int i = 0; i < 8; i++) hl[b * 128 + i * 16 + lane] = convert_half_rte(v[i] * 0.08838834764831845f);
+  }
+}
+
 // Plongement : x = bf16(q·s + b) (MLX affine 4 bits, groupe 64 ; mots [V, D/8], quartet j = élément 8w + j).
 KERNEL(256) void embed(global const int *IDS, global const uint *W, global const ushort *S, global const ushort *B,
                        global float *X, int D) {
@@ -103,7 +127,7 @@ KERNEL(256) void dense_rows(global const half *H, global const half *W, global h
 // sommes partielles dans l'ordre.
 KERNEL(128) void add_rmsnorm(global float *X, global const half *R, global const ushort *WN, global half *H,
                               global half *AHI, global half *ALO, int D, float eps, int has_r, int gs,
-                              global char *A8, global float *SA, int MS) {
+                              global char *A8, global float *SA, int MS, int rot) {
   // 128 fils par ligne (plusieurs groupes par cœur Xe en mode 256 registres), 4 éléments consécutifs par lecture :
   // le fil prend les éléments 4 (128 i + fil) … + 3 ; D multiple de 512, au plus 5 120.
   local float red[8];
@@ -133,10 +157,15 @@ KERNEL(128) void add_rmsnorm(global float *X, global const half *R, global const
     const ushort4 w = vload4(0, WN + e);
     const half4 v = (half4)(convert_half_rte(rbf(xv[i].s0 * inv * bf2f(w.s0))), convert_half_rte(rbf(xv[i].s1 * inv * bf2f(w.s1))),
                             convert_half_rte(rbf(xv[i].s2 * inv * bf2f(w.s2))), convert_half_rte(rbf(xv[i].s3 * inv * bf2f(w.s3))));
-    vstore4(v, 0, H + (long)t * D + e);
+    if (!rot) vstore4(v, 0, H + (long)t * D + e);
     vstore4(v, 0, hl + e);
   }
   barrier(CLK_LOCAL_MEM_FENCE);
+  if (rot) {
+    rot128_local(hl, D);
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int e = lid * 4; e < D; e += 512) vstore4(vload4(0, hl + e), 0, H + (long)t * D + e);
+  }
   if (A8)                                             // W4A8 : h quantifié pour la projection suivante
     quant_row(hl, D, A8, SA, MS, AHI, ALO, t);
   else
@@ -147,7 +176,7 @@ KERNEL(128) void add_rmsnorm(global float *X, global const half *R, global const
 // plus de fils.
 KERNEL(512) void add_rmsnorm_dec(global float *X, global const half *R, global const ushort *WN, global half *H,
                                   global half *AHI, global half *ALO, int D, float eps, int has_r, int gs,
-                                  global char *A8, global float *SA, int MS) {
+                                  global char *A8, global float *SA, int MS, int rot) {
   local float red[32];
   local half hl[5120];
   const int t = get_group_id(0), lid = get_local_id(0);
@@ -172,10 +201,15 @@ KERNEL(512) void add_rmsnorm_dec(global float *X, global const half *R, global c
     const int e = lid + i * 512;
     if (e >= D) continue;
     const half v = convert_half_rte(rbf(xv[i] * inv * bf2f(WN[e])));
-    H[(long)t * D + e] = v;
+    if (!rot) H[(long)t * D + e] = v;
     hl[e] = v;
   }
   barrier(CLK_LOCAL_MEM_FENCE);
+  if (rot) {
+    rot128_local(hl, D);
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int e = lid; e < D; e += 512) H[(long)t * D + e] = hl[e];
+  }
   if (A8)                                             // W4A8 : h quantifié pour la projection suivante
     quant_row(hl, D, A8, SA, MS, AHI, ALO, t);
   else
@@ -306,7 +340,7 @@ KERNEL(256) void gdn_pre_rows(global const half *P, global const half *CIN, glob
 // Après la récurrence : out = fp16(bf16(SiLU(z)·rms(y)·w)) par tête de 128, et ses sommes de ligne (K = 6 144).
 // Y : sortie du GDN bf16 [T, 48, 128] ; z dans P (colonnes 10 240 + …). Un groupe de 256 par jeton.
 KERNEL(256) void gated_norm(global const ushort *Y, global const half *P, global const ushort *WN, global half *H,
-                            global half *AHI, global half *ALO, float eps, int gs) {
+                            global half *AHI, global half *ALO, float eps, int gs, int rot) {
   local half hl[6144];
   const int t = get_group_id(0), sg = get_sub_group_id(), lane = get_sub_group_local_id();
   for (int hh = sg; hh < 48; hh += 16) {
@@ -321,11 +355,16 @@ KERNEL(256) void gated_norm(global const ushort *Y, global const half *P, global
       const float yn = v[i] * inv * bf2f(WN[i * 16 + lane]);
       const float z = (float)P[(long)t * 16640 + 10240 + e];
       const half o = convert_half_rte(rbf(silu(z) * yn));
-      H[(long)t * 6144 + e] = o;
+      if (!rot) H[(long)t * 6144 + e] = o;
       hl[e] = o;
     }
   }
   barrier(CLK_LOCAL_MEM_FENCE);
+  if (rot) {
+    rot128_local(hl, 6144);
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int e = get_local_id(0) * 4; e < 6144; e += 1024) vstore4(vload4(0, hl + e), 0, H + (long)t * 6144 + e);
+  }
   rowsums(hl, 6144, AHI, ALO, t, gs);
 }
 
@@ -442,24 +481,30 @@ KERNEL(256) void attn_prep(global const half *P, global const ushort *QN, global
 
 // Sortie de l'attention : fp16(bf16(o·σ(porte))) [T, 6 144] et ses sommes de ligne. O bf16 [T, 24, 256].
 KERNEL(256) void attn_gate(global const ushort *O, global const half *P, global half *H, global half *AHI,
-                           global half *ALO, int gs) {
+                           global half *ALO, int gs, int rot) {
   local half hl[6144];
   const int t = get_group_id(0);
   for (int e = get_local_id(0); e < 6144; e += 256) {
     const int hh = e / 256, d = e % 256;
     const float g = (float)P[(long)t * 14336 + hh * 512 + 256 + d];
     const half o = convert_half_rte(rbf(bf2f(O[(long)t * 6144 + e]) * sigmoid_f(g)));
-    H[(long)t * 6144 + e] = o;
+    if (!rot) H[(long)t * 6144 + e] = o;
     hl[e] = o;
   }
   barrier(CLK_LOCAL_MEM_FENCE);
+  if (rot) {
+    rot128_local(hl, 6144);
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int e = get_local_id(0) * 4; e < 6144; e += 1024) vstore4(vload4(0, hl + e), 0, H + (long)t * 6144 + e);
+  }
   rowsums(hl, 6144, AHI, ALO, t, gs);
 }
 
 // SwiGLU : GU fp16 [T, 34 816] = gate (17 408) | up (17 408) ; act = fp16(bf16(SiLU(g)·u)) et ses sommes de ligne.
 // Grille (T, 17) : un groupe de 256 par bloc de 1 024 colonnes (1 024 / gs groupes de sommes).
 // ilv : gate|up entrelacés par blocs de 16 (gate de la colonne c en (c / 16)·32 + c % 16, up 16 plus loin).
-KERNEL(256) void swiglu(global const half *GU, global half *H, global half *AHI, global half *ALO, int gs, int ilv) {
+KERNEL(256) void swiglu(global const half *GU, global half *H, global half *AHI, global half *ALO, int gs, int ilv,
+                        int rot) {
   local half hl[1024];
   const int t = get_group_id(0), blk = get_group_id(1), lid = get_local_id(0);
   {                                                   // 4 colonnes consécutives par fil, lectures et écriture vectorielles
@@ -468,10 +513,15 @@ KERNEL(256) void swiglu(global const half *GU, global half *H, global half *AHI,
     const half4 gv = vload4(0, GU + (long)t * 34816 + gc), uv = vload4(0, GU + (long)t * 34816 + uc);
     half4 o;
     for (int i = 0; i < 4; i++) o[i] = convert_half_rte(rbf(silu((float)gv[i]) * (float)uv[i]));
-    vstore4(o, 0, H + (long)t * 17408 + c);
+    if (!rot) vstore4(o, 0, H + (long)t * 17408 + c);
     vstore4(o, 0, hl + e);
   }
   barrier(CLK_LOCAL_MEM_FENCE);
+  if (rot) {                                          // les 8 blocs de 128 de ces 1 024 colonnes
+    rot128_local(hl, 1024);
+    barrier(CLK_LOCAL_MEM_FENCE);
+    vstore4(vload4(0, hl + lid * 4), 0, H + (long)t * 17408 + blk * 1024 + lid * 4);
+  }
   const int lane = get_sub_group_local_id(), per = gs / 16, ng = 1024 / gs;
   for (int g = get_sub_group_id(); g < ng; g += 16) {
     float s = 0.0f;
@@ -486,10 +536,41 @@ KERNEL(256) void swiglu(global const half *GU, global half *H, global half *AHI,
 }
 
 // Sommes de ligne de l'activation écrite par l'épilogue SwiGLU (H fp16 [T, 17 408]) : grille T, groupes de 256.
-KERNEL(128) void rowsums_ff(global const half *H, global half *AHI, global half *ALO, int gs) {
+KERNEL(128) void rowsums_ff(global half *H, global half *AHI, global half *ALO, int gs, int rot) {
   // les sommes de rowsums lues directement en mémoire globale (mêmes additions, même ordre : mêmes bits)
   const int t = get_group_id(0), lane = get_sub_group_local_id(), per = gs / 16;
-  global const half *h = H + (long)t * 17408;
+  global half *h = H + (long)t * 17408;
+  if (rot) {                                          // poids tournés (gs = 128) : chaque bloc tourné sur place, puis sa somme
+    for (int b = get_sub_group_id(); b < 17408 / 128; b += get_num_sub_groups()) {
+      float v[8];
+      for (int i = 0; i < 8; i++) v[i] = (float)h[b * 128 + i * 16 + lane];
+      for (int m = 1; m < 16; m <<= 1)
+        for (int i = 0; i < 8; i++) {
+          const float o = sub_group_shuffle_xor(v[i], m);
+          v[i] = (lane & m) ? o - v[i] : v[i] + o;
+        }
+      for (int m = 1; m < 8; m <<= 1)
+        for (int i = 0; i < 8; i++)
+          if (!(i & m)) {
+            const float x = v[i], y = v[i | m];
+            v[i] = x + y;
+            v[i | m] = x - y;
+          }
+      float s = 0.0f;
+      for (int i = 0; i < 8; i++) {
+        const half o = convert_half_rte(v[i] * 0.08838834764831845f);
+        h[b * 128 + i * 16 + lane] = o;
+        s += (float)o;
+      }
+      s = sub_group_reduce_add(s) * (1.0f / 128);
+      if (lane == 0) {
+        const half hi = convert_half_rte(s);
+        AHI[(long)t * 136 + b] = hi;
+        ALO[(long)t * 136 + b] = convert_half_rte(s - (float)hi);
+      }
+    }
+    return;
+  }
   for (int g = get_sub_group_id(); g < 17408 / gs; g += get_num_sub_groups()) {
     float s = 0.0f;
     if (per == 8) {
@@ -589,11 +670,15 @@ static void quant_row(local const half *hl, int K, global char *A8, global float
 
 // La quantification seule, ligne X fp16 [T, K] : un groupe de 256 par ligne.
 KERNEL(256) void quant_a8(global const half *X, global char *A8, global float *SA, global half *AHI, global half *ALO,
-                          int K, int MS) {
+                          int K, int MS, int rot) {
   local half hl[17408];
   const int t = get_group_id(0);
   for (int e = get_local_id(0) * 4; e < K; e += 1024) vstore4(vload4(0, X + (long)t * K + e), 0, hl + e);
   barrier(CLK_LOCAL_MEM_FENCE);
+  if (rot) {                                          // l'entrée de down (sortie SwiGLU de l'épilogue du GEMM)
+    rot128_local(hl, K);
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
   quant_row(hl, K, A8, SA, MS, AHI, ALO, t);
 }
 

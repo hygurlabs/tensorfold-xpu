@@ -1,8 +1,10 @@
 """Checkpoint GPTQ int4 symétrique g128 pour l'étude W4A4 du backend XPU : chaque projection quantifiée du checkpoint GPTQ
 de référence est refaite depuis les poids bf16 d'origine, éventuellement tournée (W·H par blocs de 128 le long de K,
 Hadamard de Sylvester normé ; le moteur tourne les activations de même, XPU_A8_ROT=1), puis arrondie au plus près
-(RTN : échelle 2·max|w| / 15 par groupe de 128, zéro 8, comme le GPTQ symétrique que le moteur lit). Les autres
-tenseurs (plongement, normes, portes a/b, convolution, tête, MTP, vision) sont repris tels quels du checkpoint GPTQ.
+(RTN : échelle 2·max|w| / 15 par groupe de 128, zéro 8, comme le GPTQ symétrique que le moteur lit). Avec rotation,
+les portes a/b du GDN (fp16, même entrée que in_proj_qkv) sont tournées de même et le fichier repère `hadamard128` est
+écrit : le moteur tourne alors chaque entrée de GEMM là où elle est produite. Les autres tenseurs (plongement, normes,
+convolution, tête, MTP, vision) sont repris tels quels du checkpoint GPTQ.
 
     python rotate_w4.py BF16_DIR GPTQ_DIR SORTIE_DIR rot|norot
 """
@@ -61,6 +63,9 @@ for shard in sorted(set(gidx.values())):
                 assert qw.shape == ref.shape, (n, qw.shape, ref.shape)
                 out[n] = qw
                 out[base + ".scales"] = sc
+            elif rot and (n.endswith("in_proj_a.weight") or n.endswith("in_proj_b.weight")):
+                w = f.get_tensor(n).float()
+                out[n] = (w.view(w.shape[0], -1, 128) @ H).view(w.shape).to(torch.float16)
             else:
                 out[n] = f.get_tensor(n)
     save_file(out, f"{out_dir}/{shard}", metadata={"format": "pt"})
@@ -69,4 +74,6 @@ for shard in sorted(set(gidx.values())):
 for fn in os.listdir(gptq_dir):
     if not fn.endswith(".safetensors") and os.path.isfile(f"{gptq_dir}/{fn}"):
         shutil.copy(f"{gptq_dir}/{fn}", f"{out_dir}/{fn}")
+if rot:
+    open(f"{out_dir}/hadamard128", "w").write("Hadamard 128 (Sylvester, 1/sqrt(128)) le long de K, RTN int4 g128\n")
 print("fait", out_dir)

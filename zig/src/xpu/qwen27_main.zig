@@ -248,7 +248,7 @@ fn a8Loop(r: *q.Runner, path: []const u8) !void {
     const w = if (std.mem.eql(u8, which, "in")) l0.mixer_in else if (std.mem.eql(u8, which, "out")) l0.mixer_out else if (std.mem.eql(u8, which, "down")) l0.down else l0.gu;
     const T = q.CHUNK;
     const tiles = (T + 63) / 64;
-    try d.launch(d.k.quant_a8, .{ .x = T }, .{ a.h, a.a8, a.sa, a.ahi, a.alo, @as(i32, @intCast(w.k)), @as(i32, @intCast(T + 32)) });
+    try d.launch(d.k.quant_a8, .{ .x = T }, .{ a.h, a.a8, a.sa, a.ahi, a.alo, @as(i32, @intCast(w.k)), @as(i32, @intCast(T + 32)), @as(i32, 0) });
     const args = .{ a.a8, w.w, w.s, w.bg, a.p, @as(i32, @intCast(T)), @as(i32, @intCast(w.n)), @as(i32, @intCast(w.k)), a.ahi, a.alo, @as(i32, @intCast(T + 32)), @as(i32, @intCast(w.k / 128)), a.sa };
     const groups: q.ze.GroupCount = .{ .x = 8, .y = w.n / 256, .z = (tiles + 7) / 8 };
     for (0..20) |_| try d.launch(k, groups, args);

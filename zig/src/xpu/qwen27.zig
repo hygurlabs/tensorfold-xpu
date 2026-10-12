@@ -568,7 +568,7 @@ fn chainTable() [16 * 17]i32 {
 /// the GEMM's SwiGLU epilogue writes it into P; decode rows: the GEMM into P, then `swiglu` into H.
 fn mlpIn(d: *Dev, a: *Acts, w: Proj, T: u32, gs: i32, pre: bool) !*anyopaque {
     if (prefill_int8 and T > 16 and w.ilv and w.gs == 128) { // W4A8: SwiGLU epilogue; down quantizes its own input
-        if (!pre) try quantA8(d, a, a.h, w.k, T);
+        if (!pre) try quantA8(d, a, a.h, w.k, T, 0);
         try d.launch(d.k.a8_swiglu, a8Groups(w, T), a8Args(a, w, a.p, T));
         return a.p;
     }
@@ -577,11 +577,11 @@ fn mlpIn(d: *Dev, a: *Acts, w: Proj, T: u32, gs: i32, pre: bool) !*anyopaque {
         const tiles = (T + 63) / 64;
         const k = if (w.gs == 128) d.k.ngen_swiglu_g128 else d.k.ngen_swiglu;
         try d.launch(k, .{ .x = 8, .y = w.n / 256, .z = (tiles + 7) / 8 }, .{ a.h, w.w, w.s, w.bg, a.p, M, @as(i32, @intCast(w.n)), @as(i32, @intCast(w.k)), a.ahi, a.alo, @as(i32, @intCast((T + 7) / 8 * 8)), @as(i32, @intCast(w.k / w.gs)) });
-        try d.launch(d.k.rowsums_ff, .{ .x = T }, .{ a.p, a.ahi, a.alo, gs });
+        try d.launch(d.k.rowsums_ff, .{ .x = T }, .{ a.p, a.ahi, a.alo, gs, rot_on });
         return a.p;
     }
     try gemm(d, a.pscr, a.h, a.ahi, a.alo, w, a.p, T);
-    try d.launch(d.k.swiglu, .{ .x = T, .y = 17 }, .{ a.p, a.h, a.ahi, a.alo, gs, @as(i32, @intFromBool(w.ilv)) });
+    try d.launch(d.k.swiglu, .{ .x = T, .y = 17 }, .{ a.p, a.h, a.ahi, a.alo, gs, @as(i32, @intFromBool(w.ilv)), rot_on });
     return a.h;
 }
 
@@ -689,6 +689,9 @@ var attn_own = true;
 /// The K/V cache in int8 (XPU_KV_INT8=1): per position and K/V head, 256 int8 then, after all MAX_CTX positions, a
 /// float scale (max |x| / 127); half the bf16 cache's bytes. The kernels get MAX_CTX as `cap` (0: bf16).
 var kv_i8 = false;
+/// Rotated weights (a `hadamard128` file in the checkpoint, tools/xpu/rotate_w4.py): every GEMM input rotated by blocks
+/// of 128 where it is made (norms, gates, SwiGLU), the residual stream and the head untouched.
+var rot_on: i32 = 0;
 fn kvBytes() usize {
     return @as(usize, MAX_CTX) * 4 * @as(usize, if (kv_i8) 256 + 4 else 256 * 2);
 }
@@ -702,13 +705,14 @@ pub const no_q8: ?*anyopaque = null;
 
 /// Prompt GEMM: W4A8 when the option is on and the rows are prompt rows, else the fp16 GEMM.
 /// `pre`: x is already quantized into acts.a8 (by the norm that produced it).
-fn pgemm(d: *Dev, a: *Acts, x: *anyopaque, w: Proj, out: *anyopaque, T: u32, pre: bool) !void {
+/// qrot: the input is rotated by quantA8 (down's, the GEMM epilogue's SwiGLU), not where it was made.
+fn pgemm(d: *Dev, a: *Acts, x: *anyopaque, w: Proj, out: *anyopaque, T: u32, pre: bool, qrot: i32) !void {
     if (!prefill_int8 or T <= 16 or w.gs != 128) return gemm(d, a.pscr, x, a.ahi, a.alo, w, out, T);
-    if (!pre) try quantA8(d, a, x, w.k, T);
+    if (!pre) try quantA8(d, a, x, w.k, T, qrot);
     try d.launch(d.k.a8, a8Groups(w, T), a8Args(a, w, out, T));
 }
-fn quantA8(d: *Dev, a: *Acts, x: *anyopaque, K: u32, T: u32) !void {
-    try d.launch(d.k.quant_a8, .{ .x = T }, .{ x, a.a8, a.sa, a.ahi, a.alo, @as(i32, @intCast(K)), @as(i32, @intCast(CHUNK + 32)) });
+fn quantA8(d: *Dev, a: *Acts, x: *anyopaque, K: u32, T: u32, rot: i32) !void {
+    try d.launch(d.k.quant_a8, .{ .x = T }, .{ x, a.a8, a.sa, a.ahi, a.alo, @as(i32, @intCast(K)), @as(i32, @intCast(CHUNK + 32)), rot });
 }
 fn a8Groups(w: Proj, T: u32) ze.GroupCount {
     const tiles = (T + 63) / 64;
@@ -753,14 +757,14 @@ fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mode) 
     try embedRows(d, m, a.ids, a.x, T);
     if (p0 == 0) try dump(d, a, T, "embed", false);
     for (&m.layers, 0..) |*l, i| {
-        try d.launch(if (T > 16) d.k.add_rmsnorm else d.k.add_rmsnorm_dec, .{ .x = T }, .{ a.x, a.r, l.in_norm, a.h, a.ahi, a.alo, @as(i32, D), EPS, @as(i32, if (i == 0) 0 else 1), gs, q8a, q8s, q8ms });
+        try d.launch(if (T > 16) d.k.add_rmsnorm else d.k.add_rmsnorm_dec, .{ .x = T }, .{ a.x, a.r, l.in_norm, a.h, a.ahi, a.alo, @as(i32, D), EPS, @as(i32, if (i == 0) 0 else 1), gs, q8a, q8s, q8ms, rot_on });
         const probe = p0 == 0 and i == 0;
         if (probe) try dumpBuf(d, "h0", a.h, T * D, .f16);
         // W4A8 study: the GEMM reads a quantized copy (in r, free until mixer_out); the dense a/b gates read h as is
         const min_in = if (a8_group != 0 and T > 16 and a8_sites & 1 != 0) a.r else a.h;
         if (min_in != a.h) try copy(d, a.r, a.h, T * D * 2);
         try a8(d, a, min_in, D, T, 1);
-        try pgemm(d, a, min_in, l.mixer_in, a.p, T, q8on);
+        try pgemm(d, a, min_in, l.mixer_in, a.p, T, q8on, 0);
         if (l.ab) |ab| try d.launch(d.k.dense_rows, .{ .x = (T + 15) / 16, .y = 96 / 16 }, .{ a.h, ab, a.p, t32, @as(i32, GDN_IN), @as(i32, 16384) });
         if (probe) try dumpBuf(d, "p0", a.p, T * GDN_IN, .f16);
         if (l.attn) {
@@ -779,7 +783,7 @@ fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mode) 
                 try d.launch(d.k.attn_merge, .{ .x = 24, .y = T }, .{ a.pm, a.pl, a.po, a.y, @as(i32, @intCast(p0)), @as(i32, @intCast(ns)), table, mpos });
             }
             if (kv8 & 1 != 0) try d.launch(d.k.rot_heads, .{ .x = T, .y = 24 }, .{a.y});
-            try d.launch(d.k.attn_gate, .{ .x = T }, .{ a.y, a.p, a.h, a.ahi, a.alo, gs });
+            try d.launch(d.k.attn_gate, .{ .x = T }, .{ a.y, a.p, a.h, a.ahi, a.alo, gs, rot_on });
         } else {
             const cin = l.conv[l.conv_cur].?;
             const cout = l.conv[1 - l.conv_cur].?;
@@ -831,17 +835,17 @@ fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mode) 
                 try dumpBuf(d, "beta0", a.beta, T * 48, .f32);
                 try dumpBuf(d, "y0", a.y, T * 6144, .bf16);
             }
-            try d.launch(d.k.gated_norm, .{ .x = T }, .{ a.y, a.p, l.gnorm.?, a.h, a.ahi, a.alo, EPS, gs });
+            try d.launch(d.k.gated_norm, .{ .x = T }, .{ a.y, a.p, l.gnorm.?, a.h, a.ahi, a.alo, EPS, gs, rot_on });
             if (probe) try dumpBuf(d, "o0", a.h, T * 6144, .f16);
         }
         try a8(d, a, a.h, 6144, T, 2);
-        try pgemm(d, a, a.h, l.mixer_out, a.r, T, false);
+        try pgemm(d, a, a.h, l.mixer_out, a.r, T, false, 0);
         if (probe) try dumpBuf(d, "r0", a.r, T * D, .f16);
-        try d.launch(if (T > 16) d.k.add_rmsnorm else d.k.add_rmsnorm_dec, .{ .x = T }, .{ a.x, a.r, l.post_norm, a.h, a.ahi, a.alo, @as(i32, D), EPS, @as(i32, 1), gs, q8a, q8s, q8ms });
+        try d.launch(if (T > 16) d.k.add_rmsnorm else d.k.add_rmsnorm_dec, .{ .x = T }, .{ a.x, a.r, l.post_norm, a.h, a.ahi, a.alo, @as(i32, D), EPS, @as(i32, 1), gs, q8a, q8s, q8ms, rot_on });
         try a8(d, a, a.h, D, T, 4);
         const act = try mlpIn(d, a, l.gu, T, gs, q8on);
         try a8(d, a, act, 17408, T, 8);
-        try pgemm(d, a, act, l.down, a.r, T, false);
+        try pgemm(d, a, act, l.down, a.r, T, false, if (act == a.p) rot_on else 0);
         if (p0 == 0 and i < 4) try dump(d, a, T, try std.fmt.allocPrint(alloc, "{d}", .{i}), true);
         if (mode.taps) for (TAP_LAYERS, 0..) |tl, slot| if (tl == i)
             try d.launch(d.k.tap, .{ .x = D / 256, .y = T }, .{ a.x, a.r, a.taps, @as(i32, D), @as(i32, @intCast(slot)) });
@@ -851,7 +855,7 @@ fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mode) 
         return null;
     }
     const hgs: i32 = @intCast(m.head.gs);
-    try d.launch(if (T > 16) d.k.add_rmsnorm else d.k.add_rmsnorm_dec, .{ .x = T }, .{ a.x, a.r, m.norm, a.h, a.ahi, a.alo, @as(i32, D), EPS, @as(i32, 1), hgs, no_q8, no_q8, @as(i32, 0) });
+    try d.launch(if (T > 16) d.k.add_rmsnorm else d.k.add_rmsnorm_dec, .{ .x = T }, .{ a.x, a.r, m.norm, a.h, a.ahi, a.alo, @as(i32, D), EPS, @as(i32, 1), hgs, no_q8, no_q8, @as(i32, 0), @as(i32, 0) });
     if (dump_h) |fd| {                               // XPU_DUMP_H: every row's final normed hidden state, appended
         const host = try alloc.alloc(u16, T * D);
         defer alloc.free(host);
@@ -920,6 +924,11 @@ pub const Runner = struct {
         if (std.c.getenv("XPU_DUMP_H")) |v| dump_h = open(v, 0o2101, @as(c_uint, 0o644)); // O_WRONLY | O_CREAT | O_APPEND
         if (std.c.getenv("XPU_CHUNK")) |v| CHUNK = try std.fmt.parseInt(u32, std.mem.span(v), 10);
         MAX_CTX = context;
+        {
+            const marker = try std.fmt.allocPrintSentinel(alloc, "{s}/hadamard128", .{dir}, 0);
+            const fd = open(marker.ptr, 0);
+            rot_on = if (fd >= 0) 1 else 0;
+        }
         var ckpt: Checkpoint = .{};
         {
             const index_path = try std.fmt.allocPrintSentinel(alloc, "{s}/model.safetensors.index.json", .{dir}, 0);
