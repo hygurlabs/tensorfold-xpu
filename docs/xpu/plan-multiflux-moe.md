@@ -135,3 +135,13 @@ de l'étude W4A8 (GPTQ), écart au cache bf16 :
 Le cache int8 est sans perte mesurable, rotation ou non ; la rotation divise par 2,4 l'erreur de l'int4, qui reste
 au-dessus du W4A8. Pour l'écrire vraiment en int8 il faut que l'attention du prompt lise l'int8 : le noyau Triton
 capturé ne le sait pas, d'où une attention de prompt maison.
+
+**Cache int8 réel (2026-10-12, `XPU_KV_INT8=1`)** : K et V en int8 par (position, tête K/V), échelle float après les
+positions ; Q quantifié par requête dans l'attention du prompt (DPAS int8 × int8), P·V en fp16 (int8 → fp16 exact en une
+instruction). Perplexité sur les trois textes : −0,02 / −0,02 / +0,04 % (KL 4,6-5,9e-4), contrats drafté == série et
+multi-flux == série tenus. Mémoire : 12 flux au lieu de 7 à 16 k jetons, 7 au lieu de 3 à 32 k. Vitesse : attention du
+prompt 163 ms contre 155 en bf16 (6,7 k jetons), décodage à 15 k inchangé (l'attention de décodage n'est pas bornée par la
+lecture du cache). La rotation de Hadamard n'est utile qu'en int4.
+
+Attention du prompt maison (`attn_prompt`, par défaut) : 155 ms contre 185 pour le noyau Triton sur 6,7 k jetons, mêmes
+jetons ; le sens de oneDNN (S = K·Qᵀ) supprime les échanges entre couloirs du softmax, qui coûtaient autant qu'un produit.

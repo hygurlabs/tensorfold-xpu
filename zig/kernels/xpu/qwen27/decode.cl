@@ -87,8 +87,9 @@ KERNEL(16) void gdn_step(global const ushort *Q, global const ushort *K, global 
 #define SPLIT 32
 KERNEL(16) void attn_decode(global const ushort *Q, global const ushort *KC, global const ushort *VC, global float *PM,
                             global float *PL, global float *PO, int p0, int NS, float scale, global const int *TREE,
-                            global const ulong *MT, global const int *POS) {
+                            global const ulong *MT, global const int *POS, int cap) {
   // MT (si non nul) : plusieurs flux, une ligne chacun : caches MT[8t], MT[8t + 1], clés 0 … POS[t] toutes en cache
+  // cap > 0 : cache en int8 (256 octets par rangée, échelles après cap · 4 rangées)
   const int sp = get_group_id(0), hk = get_group_id(1), t = get_group_id(2), lane = get_sub_group_local_id();
   if (MT) {
     KC = (global const ushort *)MT[t * 8];
@@ -107,14 +108,24 @@ KERNEL(16) void attn_decode(global const ushort *Q, global const ushort *KC, glo
   for (int j = j0; j < j1; j++) {
     const long kr = (MT || j < p0) ? j : p0 + ANC(t, j - p0); // rangée du cache de la clé j
     float kv[16];
-    for (int i = 0; i < 16; i++) kv[i] = bf2f(KC[(kr * 4 + hk) * 256 + i * 16 + lane]);
+    if (cap) {
+      const global char *k8 = (const global char *)KC + (kr * 4 + hk) * 256;
+      const float ks = ((const global float *)((const global char *)KC + (long)cap * 1024))[kr * 4 + hk];
+      for (int i = 0; i < 16; i++) kv[i] = (float)k8[i * 16 + lane] * ks;
+    } else
+      for (int i = 0; i < 16; i++) kv[i] = bf2f(KC[(kr * 4 + hk) * 256 + i * 16 + lane]);
     float sc[6];
     for (int a = 0; a < 6; a++) {
       float d = 0.0f;
       for (int i = 0; i < 16; i++) d += q[a][i] * kv[i];
       sc[a] = sub_group_reduce_add(d) * scale;
     }
-    for (int i = 0; i < 16; i++) kv[i] = bf2f(VC[(kr * 4 + hk) * 256 + i * 16 + lane]);
+    if (cap) {
+      const global char *v8 = (const global char *)VC + (kr * 4 + hk) * 256;
+      const float vs = ((const global float *)((const global char *)VC + (long)cap * 1024))[kr * 4 + hk];
+      for (int i = 0; i < 16; i++) kv[i] = (float)v8[i * 16 + lane] * vs;
+    } else
+      for (int i = 0; i < 16; i++) kv[i] = bf2f(VC[(kr * 4 + hk) * 256 + i * 16 + lane]);
     for (int a = 0; a < 6; a++) {
       const float mn = fmax(m[a], sc[a]);
       const float al = exp(m[a] - mn), p = exp(sc[a] - mn);
@@ -154,11 +165,25 @@ KERNEL(16) void attn_merge(global const float *PM, global const float *PL, globa
 // Commit d'un chemin gardé : les K, V de ses lignes (rangées p0 + ligne) vont aux positions p0 + profondeur, dans
 // l'ordre des profondeurs (une ligne du chemin n'est jamais avant sa profondeur : rien n'est écrasé avant d'être lu).
 // PATH [n] : lignes du chemin. Un groupe de 16 par tête K/V.
-KERNEL(16) void kv_move(global ushort *KC, global ushort *VC, int p0, global const int *PATH, int n) {
+KERNEL(16) void kv_move(global ushort *KC, global ushort *VC, int p0, global const int *PATH, int n, int cap) {
   const int hk = get_group_id(0), lane = get_sub_group_local_id();
   for (int d = 0; d < n; d++) {
     const long src = ((long)(p0 + PATH[d]) * 4 + hk) * 256, dst = ((long)(p0 + d) * 4 + hk) * 256;
     if (src == dst) continue;
+    if (cap) {                                         // int8 : 256 octets (16 par couloir) et l'échelle
+      global uint *k = (global uint *)KC, *v = (global uint *)VC;
+      for (int i = 0; i < 4; i++) {
+        k[dst / 4 + i * 16 + lane] = k[src / 4 + i * 16 + lane];
+        v[dst / 4 + i * 16 + lane] = v[src / 4 + i * 16 + lane];
+      }
+      if (lane == 0) {
+        global float *ks = (global float *)((global char *)KC + (long)cap * 1024),
+                     *vs = (global float *)((global char *)VC + (long)cap * 1024);
+        ks[dst / 256] = ks[src / 256];
+        vs[dst / 256] = vs[src / 256];
+      }
+      continue;
+    }
     for (int i = 0; i < 16; i++) {
       KC[dst + i * 16 + lane] = KC[src + i * 16 + lane];
       VC[dst + i * 16 + lane] = VC[src + i * 16 + lane];
@@ -335,3 +360,163 @@ kernel void attn_prompt(global const ushort *Q, global const ushort *KC, global 
       dst[16] = f2bf(o[i][1][r] * inv);
     }
 }
+
+// Attention du prompt sur le cache int8 (cap positions, échelles après cap · 4 rangées) : même découpage que
+// attn_prompt. Sᵀ = K·Qᵀ en DPAS int8 × int8 (K lu tel quel en paires d'octets ; Q quantifié par requête, max |q| / 127,
+// au début du noyau, en mémoire locale dans la disposition B), puis multiplié par l'échelle de la clé et celle de la
+// requête. O += P·V en fp16 : V converti au chargement (lecture 8 bits VNNI, 4 clés par mot ; int8 → fp16 exact, une
+// instruction), son échelle par clé repliée dans P.
+__attribute__((intel_reqd_sub_group_size(16))) __attribute__((reqd_work_group_size(128, 1, 1)))
+kernel void attn_prompt8(global const ushort *Q, global const char *KC, global const char *VC, global ushort *O,
+                         int p0, int T, float scale, int cap) {
+  local ushort P[6 * 8 * 128];
+  local uint QI[3 * 8 * 8 * 16];                       // (groupe, 32 dimensions, mot) × couloir : Q en int8, 4 par mot
+  local float MX[3][2][16], SM[3][2][16], A[48], QS[48];
+  const int t0 = get_group_id(0) * 8, hk = get_group_id(1), sg = get_sub_group_id(), lane = get_sub_group_local_id();
+  const int nkeys = p0 + min(t0 + 7, T - 1) + 1;
+  const bool qk = sg < 6;
+  const int g = sg / 2, kh = sg % 2;
+  const int tq = lane % 8, hq = 2 * g + lane / 8;
+  const int qpos = p0 + t0 + tq;
+  const bool qok = t0 + tq < T;
+  global const float *KS = (global const float *)(KC + (long)cap * 1024), *VS = (global const float *)(VC + (long)cap * 1024);
+  if (qk && kh == 0) {                                 // Q de la requête du couloir en int8
+    global const ushort *qrow = Q + ((long)(t0 + tq) * 24 + hk * 6 + hq) * 256;
+    float mq = 0.0f;
+    if (qok)
+      for (int e = 0; e < 16; e++) {
+        const ushort16 x = vload16(e, qrow);
+        for (int b = 0; b < 16; b++) mq = fmax(mq, fabs(bf2f(x[b])));
+      }
+    const float qs = mq > 0.0f ? mq / 127.0f : 1.0f, iq = 1.0f / qs;
+    for (int e = 0; e < 16; e++) {                     // 16 dimensions : 4 mots
+      const ushort16 x = qok ? vload16(e, qrow) : (ushort16)(0);
+      for (int j = 0; j < 4; j++) {
+        uint u = 0;
+        for (int b = 0; b < 4; b++) u |= ((uint)(uchar)(char)rint(bf2f(x[j * 4 + b]) * iq)) << (8 * b);
+        const int w = e * 4 + j;
+        QI[((g * 8 + w / 8) * 8 + w % 8) * 16 + lane] = u;
+      }
+    }
+    QS[hq * 8 + tq] = qs;
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  const float qsl = qk ? QS[hq * 8 + tq] * scale * M_LOG2E_F : 0.0f;
+  float8 o[6][2];
+  for (int i = 0; i < 6; i++) o[i][0] = o[i][1] = 0.0f;
+  float m = -INFINITY, l = 0.0f;
+  for (int k0 = 0; k0 < nkeys; k0 += 128) {
+    if (qk) {
+      const int kb = k0 + kh * 64;
+      int8 si[8];
+      for (int b = 0; b < 8; b++) si[b] = 0;
+      for (int ds = 0; ds < 8; ds++) {                 // pas de 32 dimensions
+        const int8 qb = as_int8(intel_sub_group_block_read8(QI + (g * 8 + ds) * 128));
+        __attribute__((opencl_unroll_hint))
+        for (int h2 = 0; h2 < 2; h2++) {
+          ushort ka[32];                               // 32 clés × 32 octets : 4 tuiles A de 8 clés
+          intel_sub_group_2d_block_read_16b_32r16x1c((global void *)(KC + hk * 256), 256, nkeys, 4 * 256,
+                                                     (int2)(ds * 16, kb + h2 * 32), ka);
+          __attribute__((opencl_unroll_hint))
+          for (int b = 0; b < 4; b++) {
+            short8 a;
+            for (int r = 0; r < 8; r++) a[r] = (short)ka[b * 8 + r];
+            si[h2 * 4 + b] = intel_sub_group_i8_i8_matrix_mad_k32(a, qb, si[h2 * 4 + b]);
+          }
+        }
+      }
+      float ksc[4];                                    // échelles des 64 clés, 4 par couloir
+      for (int c = 0; c < 4; c++) {
+        const int key = kb + c * 16 + lane;
+        ksc[c] = key < nkeys ? KS[(long)key * 4 + hk] : 0.0f;
+      }
+      float8 s[8];
+      float mx = -INFINITY;
+      __attribute__((opencl_unroll_hint))
+      for (int b = 0; b < 8; b++)
+        __attribute__((opencl_unroll_hint))
+        for (int r = 0; r < 8; r++) {
+          const int kk = b * 8 + r;
+          const float ks = sub_group_broadcast(ksc[kk / 16], kk % 16);
+          const float x = kb + kk > qpos ? -INFINITY : (float)si[b][r] * ks * qsl;
+          s[b][r] = x;
+          mx = fmax(mx, x);
+        }
+      MX[g][kh][lane] = mx;
+      barrier(CLK_LOCAL_MEM_FENCE);
+      const float mn = fmax(m, fmax(mx, MX[g][kh ^ 1][lane]));
+      const float alpha = mn == -INFINITY ? 1.0f : native_exp2(m - mn);
+      float vsc[4];
+      for (int c = 0; c < 4; c++) {
+        const int key = kb + c * 16 + lane;
+        vsc[c] = key < nkeys ? VS[(long)key * 4 + hk] : 0.0f;
+      }
+      float sum = 0.0f;
+      local ushort *pt = P + (hq * 8) * 128 + tq * 16;
+      __attribute__((opencl_unroll_hint))
+      for (int b = 0; b < 8; b++)
+        __attribute__((opencl_unroll_hint))
+        for (int r = 0; r < 8; r++) {
+          const int kk = b * 8 + r;
+          const float p = mn == -INFINITY ? 0.0f : native_exp2(s[b][r] - mn);
+          sum += p;
+          const int key = kh * 64 + kk;
+          pt[(key / 16) * 128 + key % 16] = as_ushort(convert_half(p * sub_group_broadcast(vsc[kk / 16], kk % 16)));
+        }
+      SM[g][kh][lane] = sum;
+      if (kh == 0) A[hq * 8 + tq] = alpha;
+      m = mn;
+      barrier(CLK_LOCAL_MEM_FENCE);
+      l = l * alpha + SM[g][0][lane] + SM[g][1][lane];
+    } else {
+      barrier(CLK_LOCAL_MEM_FENCE);
+      barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    __attribute__((opencl_unroll_hint))
+    for (int i = 0; i < 6; i++)
+      __attribute__((opencl_unroll_hint))
+      for (int r = 0; r < 8; r++) {
+        const float al = A[i * 8 + r];
+        o[i][0][r] *= al;
+        o[i][1][r] *= al;
+      }
+    for (int c2 = 0; c2 < 4; c2++) {                   // 32 clés à la fois
+      if (k0 + c2 * 32 >= nkeys) break;
+      __attribute__((opencl_unroll_hint))
+      for (int dt = 0; dt < 2; dt++) {
+        uint w8[8];                                    // couloir : dimension 16 (2 sg + dt) + couloir ; mot j : clés 4j … 4j + 3
+        intel_sub_group_2d_block_read_transform_8b_32r16x1c((global void *)(VC + hk * 256), 256, nkeys, 4 * 256,
+                                                            (int2)((sg * 2 + dt) * 16, k0 + c2 * 32), w8);
+        __attribute__((opencl_unroll_hint))
+        for (int hc = 0; hc < 2; hc++) {               // 16 clés : 8 paires fp16 (clés 2j, 2j + 1), int8 → fp16 exact
+          uint8 vw;
+          __attribute__((opencl_unroll_hint))
+          for (int j = 0; j < 4; j++) {
+            const half4 h = convert_half4(as_char4(w8[hc * 4 + j]));
+            vw[2 * j] = as_uint(h.s01);
+            vw[2 * j + 1] = as_uint(h.s23);
+          }
+          __attribute__((opencl_unroll_hint))
+          for (int i = 0; i < 6; i++) {
+            const short8 pa = as_short8(intel_sub_group_block_read_us8(P + (i * 8 + c2 * 2 + hc) * 128));
+            o[i][dt] = intel_sub_group_f16_f16_matrix_mad_k16(pa, as_int8(vw), o[i][dt]);
+          }
+        }
+      }
+    }
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  if (qk && kh == 0) A[hq * 8 + tq] = 1.0f / l;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  __attribute__((opencl_unroll_hint))
+  for (int i = 0; i < 6; i++)
+    __attribute__((opencl_unroll_hint))
+    for (int r = 0; r < 8; r++) {
+      if (t0 + r >= T) break;
+      const float inv = A[i * 8 + r];
+      global ushort *dst = O + ((long)(t0 + r) * 24 + hk * 6 + i) * 256 + sg * 32 + lane;
+      dst[0] = f2bf(o[i][0][r] * inv);
+      dst[16] = f2bf(o[i][1][r] * inv);
+    }
+}
+

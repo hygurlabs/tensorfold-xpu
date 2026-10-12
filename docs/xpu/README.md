@@ -49,6 +49,8 @@ Options par variables d'environnement :
 
 | Variable | Effet |
 |---|---|
+| `XPU_KV_INT8=1` | Cache K/V en int8 (échelle par position et tête K/V) : moitié de la mémoire, 12 flux au lieu de 7 à 16 k jetons, 7 au lieu de 3 à 32 k ; perplexité inchangée (±0,04 %). Attention du prompt `attn_prompt8` : Q·Kᵀ en DPAS int8, P·V en fp16. |
+| `XPU_ATTN_TRITON=1` | Attention du prompt par le noyau Triton du portage Python au lieu de la nôtre (`attn_prompt`) |
 | `XPU_PREFILL_INT8=1` | **Option locale** : GEMM du prompt en W4A8, activations int8 par (ligne, groupe de 128), GPTQ seulement. Le décodage reste en fp16. |
 | `XPU_TREE=N` | Nœuds de l'arbre DFlash2 par tour (15 par défaut ; 0 : une chaîne) |
 | `XPU_BLOCK=N` | Lignes du bloc du brouillonneur (8) |
@@ -101,7 +103,8 @@ pas aux 2 600 du DPAS pur. Le GEMM gate|up seul tient 146 TFLOPS fp16 et ~209 TO
 | `zig/src/native/xpu_lanes.zig` | Le backend `lanes` : emplacements, tours partagés (`verifyMulti`, `keepMulti`), flux seul en arbre (`lone`) |
 | `zig/src/xpu/qwen27_main.zig` | Exécutable de test : oracle, contrats, profils, sondes |
 | `zig/kernels/xpu/qwen27/*.cl` | Noyaux OpenCL C : GEMM int4 du décodage, GDN par morceaux et en série, attention de décodage, normes, SwiGLU, quantification int8, brouillonneur |
-| `zig/kernels/xpu/qwen27/triton/prompt_attention.spv` | Attention du prompt (noyau Triton du portage Python, en SPIR-V) |
+| `zig/kernels/xpu/qwen27/decode.cl` (`attn_prompt`, `attn_prompt8`) | Attention du prompt : FlashAttention-2 sur DPAS dans le sens de oneDNN (S = K·Qᵀ, une requête par couloir, softmax dans le couloir) ; cache bf16 ou int8 |
+| `zig/kernels/xpu/qwen27/triton/prompt_attention.spv` | Ancienne attention du prompt (noyau Triton du portage Python, en SPIR-V), avec `XPU_ATTN_TRITON=1` |
 | `zig/tools/xpu/w4_ngen.cpp` | Générateur nGEN des GEMM du prompt : int4 fp16 (`w4g_dpb`, `w4g_s4dpb`, épilogue SwiGLU) et W4A8 (`w4a8`) |
 | `zig/build/xpu.zig` | Étapes de build |
 

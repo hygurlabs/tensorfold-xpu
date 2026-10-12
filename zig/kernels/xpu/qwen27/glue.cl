@@ -313,9 +313,24 @@ KERNEL(16) void rot_heads(global ushort *O) {
   for (int i = 0; i < 16; i++) o[i * 16 + lane] = f2bf(v[i]);
 }
 
+// Une tête de K ou de V dans le cache int8 (cap positions) : 256 int8 à la rangée row, l'échelle max |x| / 127 après les
+// cap · 4 rangées.
+static void store_kv8(global ushort *C, long row, int h, const float v[16], int cap) {
+  const int lane = get_sub_group_local_id();
+  float m = 0.0f;
+  for (int i = 0; i < 16; i++) m = fmax(m, fabs(v[i]));
+  m = sub_group_reduce_max(m);
+  const float s = m > 0.0f ? m / 127.0f : 1.0f;
+  global char *c = (global char *)C + (row * 4 + h) * 256;
+  for (int i = 0; i < 16; i++) c[i * 16 + lane] = (char)rint(v[i] / s);
+  if (lane == 0) ((global float *)((global char *)C + (long)cap * 1024))[row * 4 + h] = s;
+}
+
 KERNEL(256) void attn_prep(global const half *P, global const ushort *QN, global const ushort *KN,
                            global const float *INVF, global ushort *Q, global ushort *KC, global ushort *VC, int p0,
-                           float eps, global const int *TREE, global const ulong *MT, global const int *POS, int kv8) {
+                           float eps, global const int *TREE, global const ulong *MT, global const int *POS, int kv8,
+                           int cap) {
+  // cap > 0 : cache K/V en int8 (store_kv8)
   // kv8 (étude du cache K/V) : & 1 q, k, v tournés par Hadamard ; & 2 k, v quantifiés par (jeton, tête), en int8, ou
   // en int4 avec & 4
   // TREE (si non nul) : la position de la ligne t est p0 + sa profondeur ; ses K, V restent rangés à p0 + t.
@@ -333,7 +348,10 @@ KERNEL(256) void attn_prep(global const half *P, global const ushort *QN, global
       for (int i = 0; i < 16; i++) vv[i] = (float)P[(long)t * 14336 + 13312 + (hh - 28) * 256 + i * 16 + lane];
       if (kv8 & 1) fwht256(vv);
       if (kv8 & 2) quant8_head(vv, (kv8 & 4) ? 7.0f : 127.0f);
-      for (int i = 0; i < 16; i++) VC[(krow * 4 + hh - 28) * 256 + i * 16 + lane] = f2bf(vv[i]);
+      if (cap)
+        store_kv8(VC, krow, hh - 28, vv, cap);
+      else
+        for (int i = 0; i < 16; i++) VC[(krow * 4 + hh - 28) * 256 + i * 16 + lane] = f2bf(vv[i]);
       continue;
     }
     const bool isq = hh < 24;
@@ -354,6 +372,10 @@ KERNEL(256) void attn_prep(global const half *P, global const ushort *QN, global
     }
     if (kv8 & 1) fwht256(v);
     if ((kv8 & 2) && !isq) quant8_head(v, (kv8 & 4) ? 7.0f : 127.0f);
+    if (!isq && cap) {
+      store_kv8(KC, krow, hh - 24, v, cap);
+      continue;
+    }
     global ushort *dst = isq ? Q + ((long)t * 24 + hh) * 256 : KC + (krow * 4 + hh - 24) * 256;
     for (int i = 0; i < 16; i++) dst[i * 16 + lane] = f2bf(v[i]);
   }
