@@ -216,3 +216,120 @@ KERNEL(16) void exl3_gemv(global const ushort *TR, global const half *X, global 
     }
   }
 }
+
+// Attention du prompt (FlashAttention-2 sur DPAS bf16), causale, têtes de 256, 6 têtes de requête par tête K/V.
+// Q bf16 [T, 24, 256] (ligne t à la position p0 + t) ; caches KC, VC bf16 [L, 4, 256] (clés 0 … p0 + T − 1 écrites) ;
+// O bf16 [T, 24, 256]. Un groupe de travail : une tête K/V et 8 jetons, soit 48 lignes (6 tuiles de 8, une par tête de
+// requête), 8 sous-groupes ; grille (⌈T/8⌉, 4). Q est copié une fois en mémoire locale. Par bloc de 64 clés :
+// - S = Q·Kᵀ : le sous-groupe sg prend les clés 16 (sg % 4) … + 15 de 3 tuiles de lignes (sg / 4) : chaque tuile K sert
+//   3 fois ; S en mémoire locale ;
+// - softmax en ligne : 6 lignes par sous-groupe (max, somme, facteur de rattrapage), P en bf16 en mémoire locale, dans la
+//   disposition des DPAS ;
+// - O += P·V : le sous-groupe sg tient les dimensions 32 sg … + 31 des 48 lignes : chaque tuile V sert 6 fois.
+// L'ordre des clés est fixe : une ligne a les mêmes bits quel que soit T ou son morceau.
+#pragma OPENCL EXTENSION cl_intel_subgroup_matrix_multiply_accumulate : enable
+__attribute__((intel_reqd_sub_group_size(16))) __attribute__((reqd_work_group_size(128, 1, 1)))
+kernel void attn_prompt(global const ushort *Q, global const ushort *KC, global const ushort *VC, global ushort *O,
+                        int p0, int T, float scale) {
+  local float S[48 * 64];
+  local ushort P[6 * 4 * 128];                         // tuiles A des DPAS : (tuile de lignes, 16 clés), r × 16 + couloir
+  local ushort QL[6 * 16 * 128];                       // Q des 48 lignes, même disposition par (tuile, 16 dimensions)
+  local float A[48];
+  const int t0 = get_group_id(0) * 8, hk = get_group_id(1), sg = get_sub_group_id(), lane = get_sub_group_local_id();
+  const int nkeys = p0 + min(t0 + 7, T - 1) + 1;
+  const int kt = sg % 4, rh = sg / 4;
+  float8 o[6][2];
+  for (int i = 0; i < 6; i++) o[i][0] = o[i][1] = 0.0f;
+  float m[6], l[6];
+  for (int j = 0; j < 6; j++) {
+    m[j] = -INFINITY;
+    l[j] = 0.0f;
+  }
+  for (int e = sg; e < 96; e += 8) {                   // Q lu une fois : 96 tuiles de 8 lignes × 16 dimensions
+    const int i = e / 16, ds = e % 16;
+    short8 qa;
+    intel_sub_group_2d_block_read_16b_8r16x1c((global void *)(Q + (hk * 6 + i) * 256), 256 * 2, T, 24 * 256 * 2,
+                                              (int2)(ds * 16, t0), (private ushort *)&qa);
+    intel_sub_group_block_write_us8(QL + e * 128, as_ushort8(qa));
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  for (int k0 = 0; k0 < nkeys; k0 += 64) {
+    float8 s[3] = {0.0f, 0.0f, 0.0f};
+    for (int ds = 0; ds < 16; ds++) {
+      // 16 clés × 16 dimensions, transposées par paires de bf16 : le couloir reçoit sa clé (hors des clés écrites : 0)
+      uint8 kw;
+      intel_sub_group_2d_block_read_transpose_32b_16r8x1c((global void *)(KC + hk * 256), 256 * 2, nkeys, 4 * 256 * 2,
+                                                          (int2)(ds * 8, k0 + kt * 16), (private uint *)&kw);
+      __attribute__((opencl_unroll_hint))
+      for (int i = 0; i < 3; i++) {
+        const short8 qa = as_short8(intel_sub_group_block_read_us8(QL + ((rh * 3 + i) * 16 + ds) * 128));
+        s[i] = intel_sub_group_bf16_bf16_matrix_mad_k16(qa, as_int8(kw), s[i]);
+      }
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);                      // le bloc précédent a fini de lire P
+    __attribute__((opencl_unroll_hint))
+    for (int i = 0; i < 3; i++)
+      __attribute__((opencl_unroll_hint))
+      for (int r = 0; r < 8; r++) S[((rh * 3 + i) * 8 + r) * 64 + kt * 16 + lane] = s[i][r] * scale;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    __attribute__((opencl_unroll_hint))
+    for (int j = 0; j < 6; j++) {
+      const int R = sg * 6 + j, qpos = p0 + t0 + R % 8;
+      float x[4], mx = -INFINITY;
+      for (int c = 0; c < 4; c++) {
+        const int key = k0 + c * 16 + lane;
+        x[c] = key > qpos ? -INFINITY : S[R * 64 + c * 16 + lane];
+        mx = fmax(mx, x[c]);
+      }
+      mx = sub_group_reduce_max(mx);
+      const float mn = fmax(m[j], mx);
+      const float alpha = mn == -INFINITY ? 1.0f : exp(m[j] - mn);
+      float sum = 0.0f;
+      for (int c = 0; c < 4; c++) {
+        const float p = mn == -INFINITY ? 0.0f : exp(x[c] - mn);
+        P[((R / 8) * 4 + c) * 128 + (R % 8) * 16 + lane] = f2bf(p);
+        sum += p;
+      }
+      l[j] = l[j] * alpha + sub_group_reduce_add(sum);
+      m[j] = mn;
+      if (lane == 0) A[R] = alpha;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    __attribute__((opencl_unroll_hint))
+    for (int i = 0; i < 6; i++)
+      __attribute__((opencl_unroll_hint))
+      for (int r = 0; r < 8; r++) {
+        const float al = A[i * 8 + r];
+        o[i][0][r] *= al;
+        o[i][1][r] *= al;
+      }
+    for (int c = 0; c < 4; c++) {
+      short8 pa[6];
+      __attribute__((opencl_unroll_hint))
+      for (int i = 0; i < 6; i++) pa[i] = as_short8(intel_sub_group_block_read_us8(P + (i * 4 + c) * 128));
+      __attribute__((opencl_unroll_hint))
+      for (int dt = 0; dt < 2; dt++) {
+        uint8 vw;
+        intel_sub_group_2d_block_read_transform_16b_16r16x1c((global void *)(VC + hk * 256), 256 * 2, nkeys,
+                                                             4 * 256 * 2, (int2)((sg * 2 + dt) * 16, k0 + c * 16),
+                                                             (private uint *)&vw);
+        __attribute__((opencl_unroll_hint))
+        for (int i = 0; i < 6; i++) o[i][dt] = intel_sub_group_bf16_bf16_matrix_mad_k16(pa[i], as_int8(vw), o[i][dt]);
+      }
+    }
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  if (lane == 0)
+    for (int j = 0; j < 6; j++) A[sg * 6 + j] = 1.0f / l[j];
+  barrier(CLK_LOCAL_MEM_FENCE);
+  __attribute__((opencl_unroll_hint))
+  for (int i = 0; i < 6; i++)
+    __attribute__((opencl_unroll_hint))
+    for (int r = 0; r < 8; r++) {
+      if (t0 + r >= T) break;
+      const float inv = A[i * 8 + r];
+      global ushort *dst = O + ((long)(t0 + r) * 24 + hk * 6 + i) * 256 + sg * 32 + lane;
+      dst[0] = f2bf(o[i][0][r] * inv);
+      dst[16] = f2bf(o[i][1][r] * inv);
+    }
+}

@@ -94,7 +94,7 @@ pub const Dev = struct {
     allocated: usize = 0, // device bytes allocated (frees not counted: buffers live as long as the runner)
     k: struct {
         embed: ze.H, add_rmsnorm: ze.H, gdn_pre: ze.H, gdn_pre_rows: ze.H, gated_norm: ze.H, attn_prep: ze.H, attn_gate: ze.H,
-        swiglu: ze.H, argmax: ze.H, argmax_part: ze.H, tap: ze.H, conv_commit: ze.H, repack: ze.H, gdn_step: ze.H, attn_decode: ze.H, attn_merge: ze.H, kv_move: ze.H, exl3_gemv: ze.H, rot_heads: ze.H,
+        swiglu: ze.H, argmax: ze.H, argmax_part: ze.H, tap: ze.H, conv_commit: ze.H, repack: ze.H, gdn_step: ze.H, attn_decode: ze.H, attn_merge: ze.H, kv_move: ze.H, exl3_gemv: ze.H, rot_heads: ze.H, attn_prompt: ze.H,
         embed_dense: ze.H, dense_rows: ze.H, repack_gptq: ze.H, quantize_mlx: ze.H,
         dec_wide_g128: ze.H, dec_wide64_g128: ze.H, dec_narrow_g128: ze.H, ngen_wide_g128: ze.H, ngen_narrow_g128: ze.H,
         ngen_swiglu: ze.H, ngen_swiglu_g128: ze.H, rowsums_ff: ze.H, fakequant_rows: ze.H,
@@ -684,6 +684,8 @@ var a8_group: u32 = 0;
 /// K/V cache study (XPU_KV8): 1 q, k, v rotated by Hadamard (the output rotated back), 2 k, v quantized to int8 by
 /// (token, head) and back, 3 both.
 var kv8: i32 = 0;
+/// The prompt attention: our DPAS kernel (attn_prompt) instead of the port's Triton one (XPU_ATTN_OWN=1).
+var attn_own = false;
 /// W4A8 prompt GEMMs (XPU_PREFILL_INT8, local option, GPTQ g128 only): int8 activations by (row, group of 128).
 pub var prefill_int8 = false;
 /// add_rmsnorm without the fused W4A8 quantization (its A8 and SA arguments).
@@ -754,7 +756,9 @@ fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mode) 
             const mt: ?*anyopaque = if (mode.multi) |mm| off(mm.mt, i * 16 * 8 * 8) else null;
             const ns = (ctx + SPLIT - 1) / SPLIT;
             try d.launch(d.k.attn_prep, .{ .x = T }, .{ a.p, l.qn.?, l.kn.?, m.invf, a.q, l.kc.?, l.vc.?, @as(i32, @intCast(p0)), EPS, tree, mt, mpos, kv8 });
-            if (T > 16) {                                // the port's Triton prompt kernel: 256 rows a program
+            if (T > 16 and attn_own) {
+                try d.launch(d.k.attn_prompt, .{ .x = (T + 7) / 8, .y = 4 }, .{ a.q, l.kc.?, l.vc.?, a.y, @as(i32, @intCast(p0)), t32, @as(f32, 1.0 / 16.0) });
+            } else if (T > 16) {                         // the port's Triton prompt kernel: 256 rows a program
                 try d.launch(d.k.prompt_attn, .{ .x = (T + 255) / 256, .y = 24 }, .{ a.q, l.kc.?, l.vc.?, a.y, @as(i32, @intCast(p0)), t32, @as(i32, @intCast(ctx)), nul, nul });
             } else {
                 try d.launch(d.k.attn_decode, .{ .x = ns, .y = 4, .z = T }, .{ a.q, l.kc.?, l.vc.?, a.pm, a.pl, a.po, @as(i32, @intCast(p0)), @as(i32, @intCast(ns)), @as(f32, 1.0 / 16.0), table, mt, mpos });
@@ -891,6 +895,7 @@ pub const Runner = struct {
     pub fn init(dir: []const u8, context: u32) !*Runner {
         if (std.c.getenv("XPU_DUMP")) |v| dump_dir = std.mem.span(v);
         if (std.c.getenv("XPU_PREFILL_INT8") != null) prefill_int8 = true;
+        if (std.c.getenv("XPU_ATTN_OWN") != null) attn_own = true;
         if (std.c.getenv("XPU_KV8")) |v| kv8 = try std.fmt.parseInt(i32, std.mem.span(v), 10);
         if (std.c.getenv("XPU_A8_SITES")) |v| a8_sites = try std.fmt.parseInt(u32, std.mem.span(v), 10);
         if (std.c.getenv("XPU_A8")) |v| a8_group = if (std.mem.eql(u8, std.mem.span(v), "token")) std.math.maxInt(u32) else try std.fmt.parseInt(u32, std.mem.span(v), 10);
@@ -937,7 +942,7 @@ pub const Runner = struct {
             .attn_prep = try d.kernel(mg, "attn_prep", 256), .attn_gate = try d.kernel(mg, "attn_gate", 256),
             .swiglu = try d.kernel(mg, "swiglu", 256), .argmax = try d.kernel(mg, "argmax", 256), .argmax_part = try d.kernel(mg, "argmax_part", 256), .tap = try d.kernel(mg, "tap", 256), .conv_commit = try d.kernel(mg, "conv_commit", 256),
             .repack = try d.kernel(mg, "repack", 16), .gdn_step = try d.kernel(md, "gdn_step", 16),
-            .attn_decode = try d.kernel(md, "attn_decode", 16), .attn_merge = try d.kernel(md, "attn_merge", 16), .kv_move = try d.kernel(md, "kv_move", 16), .exl3_gemv = try d.kernel(md, "exl3_gemv", 16), .rot_heads = try d.kernel(mg, "rot_heads", 16),
+            .attn_decode = try d.kernel(md, "attn_decode", 16), .attn_merge = try d.kernel(md, "attn_merge", 16), .kv_move = try d.kernel(md, "kv_move", 16), .exl3_gemv = try d.kernel(md, "exl3_gemv", 16), .rot_heads = try d.kernel(mg, "rot_heads", 16), .attn_prompt = try d.kernel(md, "attn_prompt", 128),
             .embed_dense = try d.kernel(mg, "embed_dense", 256), .dense_rows = try d.kernel(mg, "dense_rows", 256),
             .repack_gptq = try d.kernel(mg, "repack_gptq", 16), .quantize_mlx = try d.kernel(mg, "quantize_mlx", 16),
             .dec_wide_g128 = try d.kernel(mm128, "w4k1_decode", 64), .dec_wide64_g128 = try d.kernel(mm128, "w4k1_d64", 64), .dec_narrow_g128 = try d.kernel(mm128, "w4k_dsplit", 64),
