@@ -26,9 +26,10 @@ suivre.
 
 ### Ce qu'il faut côté XPU
 
-1. **Emplacements par flux** : état GDN (151 Mo), état de convolution, cache KV (64 Ko par jeton). Avec 32 Go et
-   ~15 Go de poids GPTQ, la place restante couvre par exemple 4 flux à 16 k jetons (4 × (0,15 + 1) Go), ou 8 flux à
-   8 k. Le nombre d'emplacements découle de `--context` et de `--parallel`.
+1. **Emplacements par flux** : état GDN (151 Mo), état de convolution, cache KV (64 Ko par jeton, soit 1 Gio à
+   16 k jetons). Mesuré : le serveur chargé (GPTQ, DFlash2, un flux à 16 k) occupe 17,8 Gio sur 31,9 ; il reste
+   ~14 Gio, soit une douzaine de flux à 16 k ou une vingtaine à 8 k. Le nombre d'emplacements découle de
+   `--context` et de `--parallel`.
 2. **Forward multi-flux** : les lignes de plusieurs flux dans un même forward. Les GEMM n'y voient que des lignes :
    rien à changer jusqu'à 16 lignes (noyaux de décodage), puis le chemin prompt au-delà. Le reste reçoit une
    **table par ligne** : flux, position, ancêtres. C'est la généralisation directe de la table d'arbre déjà en
@@ -42,9 +43,11 @@ suivre.
 5. **Contrats** : réponse d'un flux seul == la même requête parmi d'autres (`bench_concurrent --alone`), et
    drafté == série (`--serial`), déjà outillés.
 
-**Gain attendu.** Le décodage est borné par la lecture des poids : 16 lignes coûtent à peine plus qu'une. Le
-débit agrégé devrait monter presque linéairement jusqu'à 4-8 flux. Le portage Python mesurait 146 tok/s à 4 flux ;
-en Zig, avec l'arbre DFlash2, viser 250-400 tok/s agrégés.
+**Gain attendu (mesuré).** Le décodage est borné par la lecture des poids. Un forward de 1 ligne coûte 29,1 ms,
+de 16 lignes 33,0 ms (`XPU_ROWS_PROBE`, contexte court) : seize flux à une ligne par tour donneraient ~485 tok/s
+agrégés, contre 34 pour un flux seul. L'attention grandit avec le contexte de chaque flux, ce qui réduira ce gain
+sur de longs contextes. Avec des brouillons, les lignes se partagent entre flux : les noyaux de décodage s'arrêtent
+à 16 lignes par forward. Au-delà, il faut des noyaux de décodage à 32-64 lignes, ou passer au chemin prompt.
 
 **Ordre** : (1) emplacements et forward multi-flux sans brouillons, contrat « seul == parmi d'autres » ;
 (2) fenêtres draftées par flux ; (3) bancs `bench_concurrent --levels 1,2,4,8`.
