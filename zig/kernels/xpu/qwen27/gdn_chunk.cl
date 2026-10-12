@@ -41,7 +41,8 @@ KERNEL_WG(64) void gdn_prep(global const ushort *K, global const ushort *V, glob
   float carry = 0.0f;
   for (int b = 0; b < CK / 16 && sg == 0; b++) {
     const int t = c * CK + b * 16 + lane;
-    const float s = sub_group_scan_inclusive_add(log(G[(long)t * HV + h])) + carry;
+    // g sous-normal ou nul (porte très forte) : log g borné, sinon −∞ − (−∞) = NaN plus bas ; e^−87 < 1e−37
+    const float s = sub_group_scan_inclusive_add(fmax(log(G[(long)t * HV + h]), -87.0f)) + carry;
     const float bt = BETA[(long)t * HV + h];
     la[b * 16 + lane] = s;
     be[b * 16 + lane] = bt;
