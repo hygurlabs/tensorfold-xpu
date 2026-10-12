@@ -50,6 +50,8 @@ pub fn main(init: std.process.Init) !void {
     const t2 = q.now();
     q.profReport("decode");
     if (std.c.getenv("XPU_OVERLAP_PROBE") != null) try overlapProbe(r);
+    if (std.c.getenv("XPU_ROWS_PROBE") != null) try rowsProbe(r);
+    if (std.c.getenv("XPU_MULTI_TEST")) |v| try multiTest(r, ids.items, try std.fmt.parseInt(u32, std.mem.span(v), 10));
     if (std.c.getenv("XPU_GEMM_ZEBIN")) |path| try gemmLoop(r, std.mem.span(path));
     if (std.c.getenv("XPU_A8_ZEBIN")) |path| try a8Loop(r, std.mem.span(path));
     if (std.c.getenv("XPU_VERIFY_TEST") != null) try verifyTest(r, ids.items, out.items);
@@ -255,4 +257,77 @@ fn a8Loop(r: *q.Runner, path: []const u8) !void {
     const dt = (q.now() - t0) / 2000;
     const ops = 2.0 * @as(f64, @floatFromInt(T)) * @as(f64, @floatFromInt(w.n)) * @as(f64, @floatFromInt(w.k));
     std.debug.print("a8 loop {s} {s} (N {d}, K {d}): {d:.3} ms a call, {d:.1} TOPS\n", .{ path, which, w.n, w.k, dt * 1e3, ops / dt / 1e12 });
+}
+
+/// Multi-stream estimate: one forward of T rows (1 … 16, the decode kernels) as a verification block costs, ms; the
+/// state is left as it is (a probe after the run).
+fn rowsProbe(r: *q.Runner) !void {
+    var ids: [16]u32 = undefined;
+    for (&ids, 0..) |*x, i| x.* = @intCast(1000 + i);
+    for ([_]u32{ 1, 2, 4, 8, 12, 16 }) |T| {
+        var best: f64 = 1e9;
+        for (0..12) |_| {
+            const t0 = q.now();
+            _ = try r.verify(ids[0..T]);
+            best = @min(best, q.now() - t0);
+            r.block_rows = 0;
+        }
+        std.debug.print("rows probe: {d:2} rows {d:6.2} ms ({d:5.1} rows/s at one row a stream)\n", .{ T, best * 1e3, @as(f64, @floatFromInt(T)) / best });
+    }
+}
+
+/// Multi-stream contract and throughput: `n` slots, slot k prompted with the prompt from its k-th token on (different
+/// lengths, so different positions), 24 greedy tokens each decoded serially, then the same in shared stepMulti rounds:
+/// every slot's tokens must be equal. Then the shared round's time for 1 … n slots.
+fn multiTest(r: *q.Runner, prompt: []const u32, n: u32) !void {
+    const steps = 24;
+    var serial: [q.MAX_SLOTS][steps]u32 = undefined;
+    for (0..n) |k| {
+        try r.select(@intCast(k));
+        try r.reset();
+        try r.prompt(prompt[k % 8 ..], true);
+        for (0..steps) |j| {
+            serial[k][j] = r.last;
+            try r.step(r.last);
+        }
+    }
+    var shared: [q.MAX_SLOTS][steps]u32 = undefined;
+    var slots: [q.MAX_SLOTS]u32 = undefined;
+    var toks: [q.MAX_SLOTS]u32 = undefined;
+    for (0..n) |k| {
+        try r.select(@intCast(k));
+        try r.reset();
+        try r.prompt(prompt[k % 8 ..], true);
+        slots[k] = @intCast(k);
+    }
+    for (0..steps) |j| {
+        for (0..n) |k| {
+            toks[k] = r.seqs[k].last;
+            if (k == r.slot) toks[k] = r.last;
+            shared[k][j] = toks[k];
+        }
+        try r.stepMulti(slots[0..n], toks[0..n]);
+    }
+    var equal = true;
+    for (0..n) |k| equal = equal and std.mem.eql(u32, &serial[k], &shared[k]);
+    std.debug.print("multi test: {d} slots, {d} tokens each, shared rounds equal to serial: {}\n", .{ n, steps, equal });
+    if (!equal) for (0..n) |k| {
+        std.debug.print("  slot {d} serial:", .{k});
+        for (serial[k]) |t| std.debug.print(" {d}", .{t});
+        std.debug.print("\n  slot {d} shared:", .{k});
+        for (shared[k]) |t| std.debug.print(" {d}", .{t});
+        std.debug.print("\n", .{});
+    };
+    var m: u32 = 1;
+    while (m <= n) : (m *= 2) {
+        var best: f64 = 1e9;
+        for (0..8) |_| {
+            for (0..m) |k| toks[k] = r.seqs[k].last;
+            toks[r.slot] = r.last;
+            const t0 = q.now();
+            try r.stepMulti(slots[0..m], toks[0..m]);
+            best = @min(best, q.now() - t0);
+        }
+        std.debug.print("multi rounds: {d:2} slots {d:6.2} ms a round, {d:6.1} tok/s together\n", .{ m, best * 1e3, @as(f64, @floatFromInt(m)) / best });
+    }
 }

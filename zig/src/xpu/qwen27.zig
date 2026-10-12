@@ -228,7 +228,16 @@ const Layer = struct {
     kn: ?*anyopaque = null,
     kc: ?*anyopaque = null, // bf16 [MAX_CTX, 4, 256]
     vc: ?*anyopaque = null,
+    // rec, conv, conv_cur, kc and vc above are the selected slot's (Runner.select); each slot's own are kept here
+    slot_rec: [MAX_SLOTS]?*anyopaque = @splat(null),
+    slot_conv: [MAX_SLOTS][2]?*anyopaque = @splat(.{ null, null }),
+    slot_cur: [MAX_SLOTS]u1 = @splat(0),
+    slot_kc: [MAX_SLOTS]?*anyopaque = @splat(null),
+    slot_vc: [MAX_SLOTS]?*anyopaque = @splat(null),
 };
+
+/// Sequences a runner holds at most (one a stream of the lane host).
+pub const MAX_SLOTS = 16;
 
 pub const Model = struct {
     embed_w: *anyopaque, // MLX: words [V, D/8] ; GPTQ: the fp16 table [V, D]
@@ -514,6 +523,8 @@ pub const Acts = struct {
     tree: *anyopaque, // i32 [16, 17]: the verified block's tree table (decode.cl, DEPTH and ANC)
     path: *anyopaque, // i32 [16]: the rows of the kept path
     sl: *anyopaque, // fp32 [16, 48, 128, 128]: GDN state after each row of a verified tree
+    mt: *anyopaque, // u64 [LAYERS, 16, 8]: stepMulti's per-row state addresses
+    mpos: *anyopaque, // i32 [16]: and positions
     a8: *anyopaque, // W4A8 prompt: activations int8 [CHUNK, FF] (permuted by blocks of 8) …
     sa: *anyopaque, // … and their scales fp32 [FF / 128, CHUNK + 32]
 
@@ -533,6 +544,7 @@ pub const Acts = struct {
             .zeros = try d.alloc_(CHUNK * 48 * 128 * 2), .ones = try d.alloc_(CHUNK * 48 * 4),
             .chain = try d.upload(std.mem.sliceAsBytes(&chainTable())), .tree = try d.alloc_(16 * 17 * 4), .path = try d.alloc_(16 * 4),
             .sl = try d.alloc_(16 * 48 * 128 * 128 * 4),
+            .mt = try d.alloc_(LAYERS * 16 * 8 * 8), .mpos = try d.alloc_(16 * 4),
             .a8 = try d.alloc_(CHUNK * FF), .sa = try d.alloc_((FF / 128) * (CHUNK + 32) * 4),
         };
     }
@@ -695,7 +707,9 @@ fn a8(d: *Dev, a: *Acts, x: *anyopaque, K: u32, T: u32, site: u32) !void {
     try d.launch(d.k.fakequant_rows, .{ .x = T }, .{ x, a.ahi, a.alo, @as(i32, @intCast(K)), @as(i32, @intCast(qg)), @as(i32, @intCast(GS)) });
 }
 /// tree: the rows form a tree (acts.tree), each seeing its ancestors only; their GDN states land in acts.sl.
-pub const Mode = struct { want: Want = .last, stash: bool = false, taps: bool = false, tree: bool = false };
+/// multi: each row a different slot's next token (Runner.stepMulti): `mt` its states' addresses by layer, `pos` its
+/// position.
+pub const Mode = struct { want: Want = .last, stash: bool = false, taps: bool = false, tree: bool = false, multi: ?struct { mt: *anyopaque, pos: *anyopaque, max_pos: u32 } = null };
 
 /// One forward over `ids` (≤ CHUNK rows) at positions p0..; the greedy token of the last row (or rows: a.tok).
 /// Up to 16 rows the GDN runs serially (gdn_step), as decode does, so a verified row equals the serial one.
@@ -713,6 +727,7 @@ fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mode) 
     const q8s: ?*anyopaque = if (q8on) a.sa else null;
     const q8ms: i32 = @intCast(CHUNK + 32);
     const table = if (mode.tree) a.tree else a.chain;
+    const mpos: ?*anyopaque = if (mode.multi) |mm| mm.pos else null;
     try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, a.ids, ids.ptr, ids.len * 4, null, 0, null));
     try embedRows(d, m, a.ids, a.x, T);
     if (p0 == 0) try dump(d, a, T, "embed", false);
@@ -728,24 +743,26 @@ fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mode) 
         if (l.ab) |ab| try d.launch(d.k.dense_rows, .{ .x = (T + 15) / 16, .y = 96 / 16 }, .{ a.h, ab, a.p, t32, @as(i32, GDN_IN), @as(i32, 16384) });
         if (probe) try dumpBuf(d, "p0", a.p, T * GDN_IN, .f16);
         if (l.attn) {
-            const ctx = p0 + T; // a tree's rows see fewer: the slices past their depth are empty
+            const ctx = if (mode.multi) |mm| mm.max_pos + 1 else p0 + T; // a tree's rows see fewer: the slices past their depth are empty
+            const mt: ?*anyopaque = if (mode.multi) |mm| off(mm.mt, i * 16 * 8 * 8) else null;
             const ns = (ctx + SPLIT - 1) / SPLIT;
-            try d.launch(d.k.attn_prep, .{ .x = T }, .{ a.p, l.qn.?, l.kn.?, m.invf, a.q, l.kc.?, l.vc.?, @as(i32, @intCast(p0)), EPS, tree });
+            try d.launch(d.k.attn_prep, .{ .x = T }, .{ a.p, l.qn.?, l.kn.?, m.invf, a.q, l.kc.?, l.vc.?, @as(i32, @intCast(p0)), EPS, tree, mt, mpos });
             if (T > 16) {                                // the port's Triton prompt kernel: 256 rows a program
                 try d.launch(d.k.prompt_attn, .{ .x = (T + 255) / 256, .y = 24 }, .{ a.q, l.kc.?, l.vc.?, a.y, @as(i32, @intCast(p0)), t32, @as(i32, @intCast(ctx)), nul, nul });
             } else {
-                try d.launch(d.k.attn_decode, .{ .x = ns, .y = 4, .z = T }, .{ a.q, l.kc.?, l.vc.?, a.pm, a.pl, a.po, @as(i32, @intCast(p0)), @as(i32, @intCast(ns)), @as(f32, 1.0 / 16.0), table });
-                try d.launch(d.k.attn_merge, .{ .x = 24, .y = T }, .{ a.pm, a.pl, a.po, a.y, @as(i32, @intCast(p0)), @as(i32, @intCast(ns)), table });
+                try d.launch(d.k.attn_decode, .{ .x = ns, .y = 4, .z = T }, .{ a.q, l.kc.?, l.vc.?, a.pm, a.pl, a.po, @as(i32, @intCast(p0)), @as(i32, @intCast(ns)), @as(f32, 1.0 / 16.0), table, mt, mpos });
+                try d.launch(d.k.attn_merge, .{ .x = 24, .y = T }, .{ a.pm, a.pl, a.po, a.y, @as(i32, @intCast(p0)), @as(i32, @intCast(ns)), table, mpos });
             }
             try d.launch(d.k.attn_gate, .{ .x = T }, .{ a.y, a.p, a.h, a.ahi, a.alo, gs });
         } else {
             const cin = l.conv[l.conv_cur].?;
             const cout = l.conv[1 - l.conv_cur].?;
-            l.conv_cur = 1 - l.conv_cur;
+            const gmt: ?*anyopaque = if (mode.multi) |mm| off(mm.mt, i * 16 * 8 * 8) else null;
+            if (mode.multi == null) l.conv_cur = 1 - l.conv_cur; // multi: each slot's flips after the forward
             if (T > 16)
                 try d.launch(d.k.gdn_pre_rows, .{ .x = T }, .{ a.p, cin, cout, l.conv_w.?, l.alog.?, l.dt.?, a.q, a.k, a.v, a.g, a.beta, t32 })
             else
-                try d.launch(d.k.gdn_pre, .{ .x = T, .y = 40 }, .{ a.p, cin, cout, l.conv_w.?, l.alog.?, l.dt.?, a.q, a.k, a.v, a.g, a.beta, t32, tree });
+                try d.launch(d.k.gdn_pre, .{ .x = T, .y = 40 }, .{ a.p, cin, cout, l.conv_w.?, l.alog.?, l.dt.?, a.q, a.k, a.v, a.g, a.beta, t32, tree, gmt });
             if (T > 16 and tp > T) {                     // neutral padding rows: the state does not move
                 const pad = tp - T;
                 const cp = struct {
@@ -770,7 +787,7 @@ fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mode) 
                 }
                 // verification: the state after the block goes to rec_save, rec keeps the entry for the replay
                 // a tree: each row's state to acts.sl, rec untouched
-                try d.launch(d.k.gdn_step, .{ .x = 16, .y = 48 }, .{ a.q, a.k, a.v, a.g, a.beta, l.rec.?, if (mode.stash) l.rec_save.? else l.rec.?, a.y, t32, nul, tree, a.sl });
+                try d.launch(d.k.gdn_step, .{ .x = 16, .y = 48, .z = if (mode.multi != null) T else 1 }, .{ a.q, a.k, a.v, a.g, a.beta, l.rec.?, if (mode.stash) l.rec_save.? else l.rec.?, a.y, t32, nul, tree, a.sl, gmt });
             } else {
                 const nc: i32 = @intCast(tp / 64);
                 const ncu: u32 = tp / 64;
@@ -850,6 +867,10 @@ pub const Runner = struct {
     tree_on: bool = false, // the last verified block was a tree (commitPath)
     tree_host: [16 * 17]i32 = @splat(0),
     path_host: [16]i32 = @splat(0),
+    slot: u32 = 0, // the selected sequence (select)
+    mt_host: [LAYERS * 16 * 8]u64 = @splat(0), // stepMulti's per-row state addresses, by layer
+    pos_host: [16]i32 = @splat(0),
+    seqs: [MAX_SLOTS]struct { pos: u32 = 0, last: u32 = 0 } = @splat(.{}),
     /// Target hidden states for a drafter: when on, every forward fills acts.taps and calls `on_taps` with its rows.
     taps_on: bool = false,
     on_taps: ?struct { ctx: *anyopaque, f: *const fn (*anyopaque, *anyopaque, u32) anyerror!void } = null,
@@ -928,10 +949,127 @@ pub const Runner = struct {
         r.model = try load(d, &ckpt);
         prof.on = prof_on;
         r.acts = try Acts.init(d);
+        r.store(); // slot 0: the states the load allocated
         try d.fill(r.acts.zeros, @as(u16, 0), CHUNK * 48 * 128 * 2);
         try d.fill(r.acts.ones, @as(f32, 1.0), CHUNK * 48 * 4);
         r.host_logits = try alloc.alloc(f32, VOCAB);
         return r;
+    }
+
+    /// Makes `slot` the one every call works on (its states allocated on first use); the previous slot's states and
+    /// position are kept for it.
+    pub fn select(r: *Runner, slot: u32) !void {
+        if (slot >= MAX_SLOTS) return error.NoSuchSlot;
+        if (slot == r.slot) return;
+        try r.ensure(slot);
+        r.store();
+        r.seqs[r.slot] = .{ .pos = r.pos, .last = r.last };
+        for (&r.model.layers) |*l| {
+            if (l.attn) {
+                l.kc = l.slot_kc[slot];
+                l.vc = l.slot_vc[slot];
+            } else {
+                l.rec = l.slot_rec[slot];
+                l.conv = l.slot_conv[slot];
+                l.conv_cur = l.slot_cur[slot];
+            }
+        }
+        r.pos = r.seqs[slot].pos;
+        r.last = r.seqs[slot].last;
+        r.slot = slot;
+        r.block_rows = 0;
+        r.tree_on = false;
+    }
+
+    /// One token for each of several slots in one forward (`slots[i]` takes `tokens[i]` at its position); each slot's
+    /// next greedy token in `seqs[slot].last` (and its logits row i, for `rowLogits`). Bits per row equal a lone step.
+    pub fn stepMulti(r: *Runner, slots: []const u32, tokens: []const u32) !void {
+        const T = slots.len;
+        if (T == 0 or T > 16 or tokens.len != T) return error.BadBlock;
+        r.store();
+        var max_pos: u32 = 0;
+        for (slots, 0..) |sl, t| {
+            for (slots[0..t]) |o| if (o == sl) return error.SlotTwice;
+            const p = r.seqs[sl].pos;
+            if (p + 1 > r.context) return error.ContextFull;
+            r.pos_host[t] = @intCast(p);
+            max_pos = @max(max_pos, p);
+        }
+        for (&r.model.layers, 0..) |*l, i| for (slots, 0..) |sl, t| {
+            const e = r.mt_host[(i * 16 + t) * 8 ..][0..8];
+            e.* = @splat(0);
+            if (l.attn) {
+                e[0] = @intFromPtr(l.slot_kc[sl].?);
+                e[1] = @intFromPtr(l.slot_vc[sl].?);
+            } else {
+                const cur = l.slot_cur[sl];
+                e[2] = @intFromPtr(l.slot_conv[sl][cur].?);
+                e[3] = @intFromPtr(l.slot_conv[sl][1 - cur].?);
+                e[4] = @intFromPtr(l.slot_rec[sl].?);
+            }
+        };
+        try ze.check(r.d.g.api.zeCommandListAppendMemoryCopy(r.d.list, r.acts.mt, &r.mt_host, LAYERS * 16 * 8 * 8, null, 0, null));
+        try ze.check(r.d.g.api.zeCommandListAppendMemoryCopy(r.d.list, r.acts.mpos, &r.pos_host, T * 4, null, 0, null));
+        _ = try forward(&r.d, &r.model, &r.acts, @ptrCast(tokens), 0, .{ .want = .rows, .multi = .{ .mt = r.acts.mt, .pos = r.acts.mpos, .max_pos = max_pos } });
+        var toks: [16]i32 = undefined;
+        try ze.check(r.d.g.api.zeCommandListAppendMemoryCopy(r.d.list, &toks, r.acts.tok, T * 4, null, 0, null));
+        try r.d.sync();
+        for (slots, 0..) |sl, t| {
+            r.seqs[sl].pos += 1;
+            r.seqs[sl].last = @intCast(toks[t]);
+            for (&r.model.layers) |*l| if (!l.attn) {
+                l.slot_cur[sl] = 1 - l.slot_cur[sl];
+            };
+        }
+        // the selected slot's views follow its arrays
+        for (&r.model.layers) |*l| if (!l.attn) {
+            l.conv_cur = l.slot_cur[r.slot];
+        };
+        r.pos = r.seqs[r.slot].pos;
+        r.last = r.seqs[r.slot].last;
+    }
+
+    /// The selected slot's state pointers back into its slot arrays (a verify's commit may have swapped them).
+    pub fn store(r: *Runner) void {
+        for (&r.model.layers) |*l| {
+            if (l.attn) {
+                l.slot_kc[r.slot] = l.kc;
+                l.slot_vc[r.slot] = l.vc;
+            } else {
+                l.slot_rec[r.slot] = l.rec;
+                l.slot_conv[r.slot] = l.conv;
+                l.slot_cur[r.slot] = l.conv_cur;
+            }
+        }
+        r.seqs[r.slot] = .{ .pos = r.pos, .last = r.last };
+    }
+
+    /// Bytes a slot's states take: GDN and convolution states, and the K/V cache of `context` positions.
+    pub fn slotBytes(r: *const Runner) usize {
+        _ = r;
+        return 48 * (48 * 128 * 128 * 4 + 2 * 3 * 10240 * 2) + 16 * 2 * @as(usize, MAX_CTX) * 4 * 256 * 2;
+    }
+
+    /// `slot`'s states, allocated (zero) on its first use.
+    pub fn ensure(r: *Runner, slot: u32) !void {
+        const d = &r.d;
+        for (&r.model.layers) |*l| {
+            if (l.attn) {
+                if (l.slot_kc[slot] != null) continue;
+                l.slot_kc[slot] = try d.alloc_(@as(usize, MAX_CTX) * 4 * 256 * 2);
+                l.slot_vc[slot] = try d.alloc_(@as(usize, MAX_CTX) * 4 * 256 * 2);
+            } else {
+                if (l.slot_rec[slot] != null) continue;
+                l.slot_rec[slot] = try d.alloc_(48 * 128 * 128 * 4);
+                try d.fill(l.slot_rec[slot].?, @as(u32, 0), 48 * 128 * 128 * 4);
+                for (&l.slot_conv[slot]) |*cv| {
+                    cv.* = try d.alloc_(3 * 10240 * 2);
+                    try d.fill(cv.*.?, @as(u16, 0), 3 * 10240 * 2);
+                }
+                l.slot_cur[slot] = 0;
+            }
+        }
+        try d.sync();
     }
 
     /// A fresh sequence: GDN and convolution states to zero (the KV cache is overwritten position by position).
@@ -992,7 +1130,7 @@ pub const Runner = struct {
                 continue;
             }
             const st = l.stash.?;
-            try r.d.launch(r.d.k.gdn_step, .{ .x = 16, .y = 48 }, .{ off(st, ST_Q), off(st, ST_K), off(st, ST_V), off(st, ST_G), off(st, ST_B), l.rec.?, l.rec.?, r.acts.y, @as(i32, @intCast(keep)), nul, nul, nul });
+            try r.d.launch(r.d.k.gdn_step, .{ .x = 16, .y = 48 }, .{ off(st, ST_Q), off(st, ST_K), off(st, ST_V), off(st, ST_G), off(st, ST_B), l.rec.?, l.rec.?, r.acts.y, @as(i32, @intCast(keep)), nul, nul, nul, nul });
             // the block's forward flipped conv_cur: conv[cur] is the state after all rows, conv[1 - cur] the entry
             try r.d.launch(r.d.k.conv_commit, .{ .x = 40 }, .{ l.conv[1 - l.conv_cur].?, off(st, ST_P), l.conv[l.conv_cur].?, @as(i32, @intCast(keep)), nul });
         };
@@ -1058,7 +1196,7 @@ pub const Runner = struct {
                 continue;
             }
             const st = l.stash.?;
-            try r.d.launch(r.d.k.gdn_step, .{ .x = 16, .y = 48 }, .{ off(st, ST_Q), off(st, ST_K), off(st, ST_V), off(st, ST_G), off(st, ST_B), l.rec.?, l.rec.?, r.acts.y, keep, r.acts.path, nul, nul });
+            try r.d.launch(r.d.k.gdn_step, .{ .x = 16, .y = 48 }, .{ off(st, ST_Q), off(st, ST_K), off(st, ST_V), off(st, ST_G), off(st, ST_B), l.rec.?, l.rec.?, r.acts.y, keep, r.acts.path, nul, nul, nul });
             try r.d.launch(r.d.k.conv_commit, .{ .x = 40 }, .{ l.conv[1 - l.conv_cur].?, off(st, ST_P), l.conv[l.conv_cur].?, keep, r.acts.path });
         }
         if (r.taps_on and !straight) for (path, 0..) |row, dd| if (row != dd)

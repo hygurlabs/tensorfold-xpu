@@ -25,12 +25,21 @@ static inline ushort f2bf(float f) {
 // racine ; SO n'est pas écrit (le commit rejoue le chemin gardé).
 KERNEL(16) void gdn_step(global const ushort *Q, global const ushort *K, global const ushort *V, global const float *G,
                          global const float *BETA, global const float *S, global float *SO, global ushort *Y, int T,
-                         global const int *ROWS, global const int *TREE, global float *SL) {
+                         global const int *ROWS, global const int *TREE, global float *SL, global const ulong *MT) {
+  // MT (si non nul) : plusieurs flux, une ligne chacun, grille (16, 48, T) : la ligne get_group_id(2) met à jour sur
+  // place l'état de son flux, MT[8t + 4]
   const int vb = get_group_id(0), h = get_group_id(1), lane = get_sub_group_local_id(), kh = h / 3;
+  int t0 = 0;
+  if (MT) {
+    t0 = get_group_id(2);
+    S = (global const float *)MT[t0 * 8 + 4];
+    SO = (global float *)MT[t0 * 8 + 4];
+    T = t0 + 1;
+  }
   float s[8][8];
   for (int r = 0; r < 8; r++)
     for (int i = 0; i < 8; i++) s[r][i] = S[((long)h * 128 + vb * 8 + r) * 128 + i * 16 + lane];
-  for (int t = 0; t < T; t++) {
+  for (int t = t0; t < T; t++) {
     const int row = ROWS ? ROWS[t] : t;
     if (TREE && DEPTH(t) > 0 && LOAD(t)) {              // l'état du parent, depuis son emplacement
       const int par = ANC(t, DEPTH(t) - 1);
@@ -77,9 +86,15 @@ KERNEL(16) void gdn_step(global const ushort *Q, global const ushort *K, global 
 // PO [T, 24, NS, 256] fp32.
 #define SPLIT 32
 KERNEL(16) void attn_decode(global const ushort *Q, global const ushort *KC, global const ushort *VC, global float *PM,
-                            global float *PL, global float *PO, int p0, int NS, float scale, global const int *TREE) {
+                            global float *PL, global float *PO, int p0, int NS, float scale, global const int *TREE,
+                            global const ulong *MT, global const int *POS) {
+  // MT (si non nul) : plusieurs flux, une ligne chacun : caches MT[8t], MT[8t + 1], clés 0 … POS[t] toutes en cache
   const int sp = get_group_id(0), hk = get_group_id(1), t = get_group_id(2), lane = get_sub_group_local_id();
-  const int last = p0 + DEPTH(t), j0 = sp * SPLIT, j1 = min(j0 + SPLIT, last + 1);
+  if (MT) {
+    KC = (global const ushort *)MT[t * 8];
+    VC = (global const ushort *)MT[t * 8 + 1];
+  }
+  const int last = MT ? POS[t] : p0 + DEPTH(t), j0 = sp * SPLIT, j1 = min(j0 + SPLIT, last + 1);
   float q[6][16], o[6][16], m[6], l[6];
   for (int a = 0; a < 6; a++) {
     for (int i = 0; i < 16; i++) {
@@ -90,7 +105,7 @@ KERNEL(16) void attn_decode(global const ushort *Q, global const ushort *KC, glo
     l[a] = 0.0f;
   }
   for (int j = j0; j < j1; j++) {
-    const long kr = j < p0 ? j : p0 + ANC(t, j - p0); // rangée du cache de la clé j
+    const long kr = (MT || j < p0) ? j : p0 + ANC(t, j - p0); // rangée du cache de la clé j
     float kv[16];
     for (int i = 0; i < 16; i++) kv[i] = bf2f(KC[(kr * 4 + hk) * 256 + i * 16 + lane]);
     float sc[6];
@@ -120,9 +135,9 @@ KERNEL(16) void attn_decode(global const ushort *Q, global const ushort *KC, glo
 
 // Fusion des tranches, dans l'ordre : O bf16 [T, 24, 256]. Un sous-groupe par (tête, ligne).
 KERNEL(16) void attn_merge(global const float *PM, global const float *PL, global const float *PO, global ushort *O,
-                           int p0, int NS, global const int *TREE) {
+                           int p0, int NS, global const int *TREE, global const int *POS) {
   const int hh = get_group_id(0), t = get_group_id(1), lane = get_sub_group_local_id();
-  const int used = (p0 + DEPTH(t)) / SPLIT + 1;        // tranches non vides de la ligne t
+  const int used = (POS ? POS[t] : p0 + DEPTH(t)) / SPLIT + 1; // tranches non vides de la ligne t
   const long base = ((long)t * 24 + hh) * NS;
   float m = -INFINITY;
   for (int s = 0; s < used; s++) m = fmax(m, PM[base + s]);

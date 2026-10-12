@@ -149,22 +149,35 @@ KERNEL(512) void add_rmsnorm(global float *X, global const half *R, global const
 // Grille (T, 40) : un groupe de 256 par bloc de 256 canaux (deux têtes de 128) ; le bloc 0 calcule aussi g et β.
 KERNEL(256) void gdn_pre(global const half *P, global const half *CIN, global half *COUT, global const ushort *CW,
                          global const ushort *ALOG, global const ushort *DT, global ushort *Q, global ushort *K,
-                         global ushort *V, global float *G, global float *BETA, int T, global const int *TREE) {
+                         global ushort *V, global float *G, global float *BETA, int T, global const int *TREE,
+                         global const ulong *MT) {
+  // MT (si non nul) : plusieurs flux, une ligne chacun ; la ligne t lit son état d'entrée en MT[8t + 2] et écrit son
+  // état de sortie en MT[8t + 3]
   local float cv[256];
   const int t = get_group_id(0), blk = get_group_id(1), lid = get_local_id(0), sg = get_sub_group_id();
   const int lane = get_sub_group_local_id(), c = blk * 256 + lid;
   float s = 0.0f;
-  const int dep = TREE ? TREE[t * 17] & 255 : t;
+  if (MT) {
+    CIN = (global const half *)MT[t * 8 + 2];
+    COUT = (global half *)MT[t * 8 + 3];
+  }
+  const int dep = MT ? 0 : TREE ? TREE[t * 17] & 255 : t;
   for (int j = 0; j < 4; j++) {
     const int dd = dep - 3 + j;                       // profondeur de l'entrée (négative : l'état d'entrée)
-    const int row = dd < 0 ? 0 : (TREE ? TREE[t * 17 + 1 + dd] : dd);
+    const int row = MT ? t : dd < 0 ? 0 : (TREE ? TREE[t * 17 + 1 + dd] : dd);
     const float x = dd < 0 ? (float)CIN[(3 + dd) * NCONV + c] : (float)P[(long)row * 16640 + c];
     s += x * bf2f(CW[c * 4 + j]);
   }
   cv[lid] = rbf(silu(s));
-  if (t >= T - 3) COUT[(t - (T - 3)) * NCONV + c] = P[(long)t * 16640 + c];
-  if (T < 3 && t == 0)                                  // l'état garde une partie de l'ancien
-    for (int r = 0; r < 3 - T; r++) COUT[r * NCONV + c] = CIN[(r + T) * NCONV + c];
+  if (MT) {
+    COUT[c] = CIN[NCONV + c];
+    COUT[NCONV + c] = CIN[2 * NCONV + c];
+    COUT[2 * NCONV + c] = P[(long)t * 16640 + c];
+  } else {
+    if (t >= T - 3) COUT[(t - (T - 3)) * NCONV + c] = P[(long)t * 16640 + c];
+    if (T < 3 && t == 0)                                // l'état garde une partie de l'ancien
+      for (int r = 0; r < 3 - T; r++) COUT[r * NCONV + c] = CIN[(r + T) * NCONV + c];
+  }
   barrier(CLK_LOCAL_MEM_FENCE);
   if (c < NQK * 2) {                                    // têtes q (0-15) et k (16-31) : deux par bloc
     if (sg < 2) {
@@ -261,14 +274,20 @@ KERNEL(256) void gated_norm(global const ushort *Y, global const half *P, global
 // θ^(−i/32)), arrondi bf16. Q [T, 24, 256] ; K, V écrits au cache [L, 4, 256] à la position p0 + t.
 KERNEL(256) void attn_prep(global const half *P, global const ushort *QN, global const ushort *KN,
                            global const float *INVF, global ushort *Q, global ushort *KC, global ushort *VC, int p0,
-                           float eps, global const int *TREE) {
-  // TREE (si non nul) : la position de la ligne t est p0 + sa profondeur ; ses K, V restent rangés à p0 + t
+                           float eps, global const int *TREE, global const ulong *MT, global const int *POS) {
+  // TREE (si non nul) : la position de la ligne t est p0 + sa profondeur ; ses K, V restent rangés à p0 + t.
+  // MT (si non nul) : plusieurs flux, une ligne chacun : caches MT[8t], MT[8t + 1], position POS[t], où K, V vont.
   const int t = get_group_id(0), sg = get_sub_group_id(), lane = get_sub_group_local_id();
-  const float pos = (float)(p0 + (TREE ? TREE[t * 17] & 255 : t));
+  const float pos = (float)(MT ? POS[t] : p0 + (TREE ? TREE[t * 17] & 255 : t));
+  const long krow = MT ? POS[t] : p0 + t;               // rangée du cache où vont K et V
+  if (MT) {
+    KC = (global ushort *)MT[t * 8];
+    VC = (global ushort *)MT[t * 8 + 1];
+  }
   for (int hh = sg; hh < 32; hh += 16) {               // 0-23 : q, 24-27 : k, 28-31 : v
     if (hh >= 28) {
       for (int i = 0; i < 16; i++)
-        VC[((long)(p0 + t) * 4 + hh - 28) * 256 + i * 16 + lane] = f2bf((float)P[(long)t * 14336 + 13312 + (hh - 28) * 256 + i * 16 + lane]);
+        VC[(krow * 4 + hh - 28) * 256 + i * 16 + lane] = f2bf((float)P[(long)t * 14336 + 13312 + (hh - 28) * 256 + i * 16 + lane]);
       continue;
     }
     const bool isq = hh < 24;
@@ -287,7 +306,7 @@ KERNEL(256) void attn_prep(global const half *P, global const ushort *QN, global
       v[i] = x1 * c - x2 * s;
       v[i + 2] = x2 * c + x1 * s;
     }
-    global ushort *dst = isq ? Q + ((long)t * 24 + hh) * 256 : KC + ((long)(p0 + t) * 4 + hh - 24) * 256;
+    global ushort *dst = isq ? Q + ((long)t * 24 + hh) * 256 : KC + (krow * 4 + hh - 24) * 256;
     for (int i = 0; i < 16; i++) dst[i * 16 + lane] = f2bf(v[i]);
   }
 }
