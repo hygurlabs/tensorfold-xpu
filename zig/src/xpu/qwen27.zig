@@ -718,11 +718,14 @@ fn a8Args(a: *Acts, w: Proj, out: *anyopaque, T: u32) struct { *anyopaque, *anyo
     return .{ a.a8, w.w, w.s, w.bg, out, @intCast(T), @intCast(w.n), @intCast(w.k), a.ahi, a.alo, @intCast(CHUNK + 32), @intCast(w.k / 128), a.sa };
 }
 var a8_sites: u32 = 15; // XPU_A8_SITES: 1 mixer in, 2 mixer out, 4 gate|up, 8 down
+var a8_rot: i32 = 0; // XPU_A8_ROT=1: Hadamard by blocks of 128 before the quantization (weights rotated too)
+var a8_levels: i32 = 127; // XPU_A8_BITS=4: int4 activations (7 levels a side)
+var a8_sites4: u32 = 15; // XPU_A8_SITES4: the sites in int4 when XPU_A8_BITS=4 (the others in int8)
 
 fn a8(d: *Dev, a: *Acts, x: *anyopaque, K: u32, T: u32, site: u32) !void {
     if (a8_group == 0 or T <= 16 or a8_sites & site == 0) return;
     const qg = if (a8_group == std.math.maxInt(u32)) K else a8_group;
-    try d.launch(d.k.fakequant_rows, .{ .x = T }, .{ x, a.ahi, a.alo, @as(i32, @intCast(K)), @as(i32, @intCast(qg)), @as(i32, @intCast(GS)) });
+    try d.launch(d.k.fakequant_rows, .{ .x = T }, .{ x, a.ahi, a.alo, @as(i32, @intCast(K)), @as(i32, @intCast(qg)), @as(i32, @intCast(GS)), a8_rot, if (a8_sites4 & site != 0) a8_levels else @as(i32, 127) });
 }
 /// tree: the rows form a tree (acts.tree), each seeing its ancestors only; their GDN states land in acts.sl.
 /// multi: each row a different slot's next token (Runner.stepMulti): `mt` its states' addresses by layer, `pos` its
@@ -909,6 +912,9 @@ pub const Runner = struct {
         if (std.c.getenv("XPU_ATTN_TRITON") != null) attn_own = false;
         if (std.c.getenv("XPU_KV_INT8") != null) kv_i8 = true;
         if (std.c.getenv("XPU_KV8")) |v| kv8 = try std.fmt.parseInt(i32, std.mem.span(v), 10);
+        if (std.c.getenv("XPU_A8_ROT") != null) a8_rot = 1;
+        if (std.c.getenv("XPU_A8_SITES4")) |v| a8_sites4 = try std.fmt.parseInt(u32, std.mem.span(v), 10);
+        if (std.c.getenv("XPU_A8_BITS")) |v| a8_levels = if (std.mem.eql(u8, std.mem.span(v), "4")) 7 else 127;
         if (std.c.getenv("XPU_A8_SITES")) |v| a8_sites = try std.fmt.parseInt(u32, std.mem.span(v), 10);
         if (std.c.getenv("XPU_A8")) |v| a8_group = if (std.mem.eql(u8, std.mem.span(v), "token")) std.math.maxInt(u32) else try std.fmt.parseInt(u32, std.mem.span(v), 10);
         if (std.c.getenv("XPU_DUMP_H")) |v| dump_h = open(v, 0o2101, @as(c_uint, 0o644)); // O_WRONLY | O_CREAT | O_APPEND

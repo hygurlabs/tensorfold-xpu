@@ -145,3 +145,28 @@ lecture du cache). La rotation de Hadamard n'est utile qu'en int4.
 
 Attention du prompt maison (`attn_prompt`, par défaut) : 155 ms contre 185 pour le noyau Triton sur 6,7 k jetons, mêmes
 jetons ; le sens de oneDNN (S = K·Qᵀ) supprime les échanges entre couloirs du softmax, qui coûtaient autant qu'un produit.
+
+## 6. W4A4 et poids tournés (étudié le 2026-10-12, poids bf16 d'origine)
+
+DPAS mesurés (`tools/xpu/dpas_types.cpp`) : fp16 183, int8 367, **int4 × int4 733 TOPS** (résultat vérifié) ; l'int2
+accepté par l'assembleur ne calcule que K = 64. Poids : `tools/xpu/rotate_w4.py` refait chaque projection depuis le bf16,
+RTN int4 g128 (format GPTQ du moteur), avec ou sans rotation de Hadamard par blocs de 128 le long de K ; le moteur tourne
+les activations de même (`XPU_A8_ROT=1`, `XPU_A8_BITS=4`, `XPU_A8_SITES4`). Perplexité face au GPTQ actuel (W4A16), doc /
+code / français :
+
+| | doc | code | français |
+|---|---|---|---|
+| GPTQ + int8 (W4A8 actuel) | +0,04 % | +0,10 % | +0,02 % |
+| GPTQ + int4, sans rotation | +12,8 % | +9,1 % | +20,1 % |
+| RTN sans rotation, W4A16 | +0,25 % | +0,57 % | +2,13 % |
+| **RTN tourné + int8** | **−0,23 %** | **−0,65 %** | **−0,52 %** |
+| RTN tourné + int4 partout | +2,77 % | +1,47 % | +4,01 % |
+| RTN tourné, int4 sur l'entrée de mixer seulement | +0,34 % | −0,40 % | +0,59 % |
+| RTN tourné, int4 sur la sortie de mixer seulement | +0,35 % | −0,13 % | +0,08 % |
+| RTN tourné, int4 sur gate\|up seulement | +1,01 % | −0,00 % | +1,74 % |
+| RTN tourné, int4 sur down seulement | +0,49 % | −0,61 % | +0,06 % |
+| RTN tourné, int4 sauf down | +2,25 % | +0,87 % | +2,92 % |
+
+Sans rotation, l'int4 des activations est inutilisable ; avec, la perte tombe à 1,5-4 %, portée surtout par gate|up.
+Les poids RTN tournés battent le GPTQ calibré, dès le W4A8. L'int4 sur down seul (ou sur les sorties de mixer) reste au
+niveau du GPTQ actuel.

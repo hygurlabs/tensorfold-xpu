@@ -510,18 +510,39 @@ KERNEL(128) void rowsums_ff(global const half *H, global half *AHI, global half 
 
 // Étude W4A8 (quantification simulée) : chaque ligne de X fp16 [T, K] quantifiée en int8 symétrique par groupes de qg
 // (échelle = max |x| / 127), remise en fp16 sur place, puis ses sommes de ligne par groupe de gs recalculées.
-KERNEL(256) void fakequant_rows(global half *X, global half *AHI, global half *ALO, int K, int qg, int gs) {
+// rot : chaque bloc de 128 de la ligne d'abord tourné par Hadamard (Sylvester, normé par 1/√128 ; les poids le sont
+// aussi, W·H, par le convertisseur tools/xpu/rotate_w4.py) ; levels : 127 (int8) ou 7 (int4, valeurs −8 … 7).
+KERNEL(256) void fakequant_rows(global half *X, global half *AHI, global half *ALO, int K, int qg, int gs, int rot,
+                                int levels) {
   local half hl[17408];
   const int t = get_group_id(0), lane = get_sub_group_local_id();
   for (int e = get_local_id(0) * 4; e < K; e += 1024) vstore4(vload4(0, X + (long)t * K + e), 0, hl + e);
+  barrier(CLK_LOCAL_MEM_FENCE);
+  for (int b = get_sub_group_id(); rot && b < K / 128; b += get_num_sub_groups()) {
+    float v[8];                                      // élément 16 i + couloir du bloc
+    for (int i = 0; i < 8; i++) v[i] = (float)hl[b * 128 + i * 16 + lane];
+    for (int m = 1; m < 16; m <<= 1)
+      for (int i = 0; i < 8; i++) {
+        const float o = sub_group_shuffle_xor(v[i], m);
+        v[i] = (lane & m) ? o - v[i] : v[i] + o;
+      }
+    for (int m = 1; m < 8; m <<= 1)
+      for (int i = 0; i < 8; i++)
+        if (!(i & m)) {
+          const float x = v[i], y = v[i | m];
+          v[i] = x + y;
+          v[i | m] = x - y;
+        }
+    for (int i = 0; i < 8; i++) hl[b * 128 + i * 16 + lane] = convert_half_rte(v[i] * 0.08838834764831845f);
+  }
   barrier(CLK_LOCAL_MEM_FENCE);
   for (int g = get_sub_group_id(); g < K / qg; g += get_num_sub_groups()) {
     float m = 0.0f;
     for (int k = lane; k < qg; k += 16) m = fmax(m, fabs((float)hl[g * qg + k]));
     m = sub_group_reduce_max(m);
-    const float s = m > 0.0f ? m / 127.0f : 1.0f;
+    const float s = m > 0.0f ? m / (float)levels : 1.0f;
     for (int k = lane; k < qg; k += 16) {
-      const float q = clamp(rint((float)hl[g * qg + k] / s), -127.0f, 127.0f);
+      const float q = clamp(rint((float)hl[g * qg + k] / s), -(float)levels - (levels == 7 ? 1.0f : 0.0f), (float)levels);
       hl[g * qg + k] = convert_half_rte(q * s);
     }
   }
