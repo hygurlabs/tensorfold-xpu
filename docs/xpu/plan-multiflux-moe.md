@@ -101,3 +101,19 @@ puis les brouillons, s'il existe un drafter pour ce modèle.
 - **Généraliser l'attention** : dimension de tête (64/128/256), rapport de têtes, RoPE partielle ou complète,
   normes q/k optionnelles.
 - **Commentaires des noyaux en anglais** avant toute discussion amont.
+
+## 4. EXL3 (mesuré le 2026-10-12, sans poids)
+
+Le décodage EXL3 (codebook `mul1`, `docs/recipes/exl3.md`) est procédural : sa vitesse se mesure sur des flux de bits
+aléatoires (`XPU_EXL3_PROBE`, noyau `exl3_gemv` de `decode.cl`). Sur gate|up (K 5 120, N 34 816), une ligne :
+
+| | ms | débit de poids |
+|---|---|---|
+| notre int4 (GEMV de décodage) | 0,172 | 517 Go/s |
+| EXL3 4 / 3 / 2 bits (sonde, tuile en registres) | 5,2 / 5,1 / 5,1 | 17 / 13 / 9 Go/s |
+
+Le temps ne baisse pas avec les bits : le décodage EXL3 est borné par le calcul vectoriel de la B70, pas par la
+mémoire. Même parfait (~15 opérations par poids, `dp4a` pour la somme des octets), il prendrait ~0,27 ms : environ
+1,6 fois notre int4, quelle que soit la largeur. Au prompt, son décodage par tuile est 10 à 15 fois plus coûteux que
+notre dépliage int4, sans voie int8 possible (valeurs fp16 non uniformes). **Pas de gain de vitesse sur cette
+carte** ; seul intérêt restant : la capacité (un 70B dense en 3 bits ≈ 26 Go) et la justesse aux bas débits.

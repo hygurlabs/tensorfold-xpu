@@ -51,6 +51,7 @@ pub fn main(init: std.process.Init) !void {
     q.profReport("decode");
     if (std.c.getenv("XPU_OVERLAP_PROBE") != null) try overlapProbe(r);
     if (std.c.getenv("XPU_ROWS_PROBE") != null) try rowsProbe(r);
+    if (std.c.getenv("XPU_EXL3_PROBE") != null) try exl3Probe(r);
     if (std.c.getenv("XPU_MULTI_TEST")) |v| try multiTest(r, ids.items, try std.fmt.parseInt(u32, std.mem.span(v), 10));
     if (std.c.getenv("XPU_GEMM_ZEBIN")) |path| try gemmLoop(r, std.mem.span(path));
     if (std.c.getenv("XPU_A8_ZEBIN")) |path| try a8Loop(r, std.mem.span(path));
@@ -377,5 +378,49 @@ fn multiTest(r: *q.Runner, prompt: []const u32, n: u32) !void {
             best = @min(best, q.now() - t0);
         }
         std.debug.print("multi rounds: {d:2} slots {d:6.2} ms a round, {d:6.1} tok/s together\n", .{ m, best * 1e3, @as(f64, @floatFromInt(m)) / best });
+    }
+}
+
+/// EXL3 speed probe (no weights: random trellis bits): the mul1 decode GEMV at 4, 3 and 2 bits against our int4
+/// decode GEMM on the same shapes (layer 0 gate|up and down), 1 and 8 rows; ms a call and weight GB/s.
+fn exl3Probe(r: *q.Runner) !void {
+    const d = &r.d;
+    const a = &r.acts;
+    const l0 = &r.model.layers[0];
+    for ([_]q.Proj{ l0.gu, l0.down }) |w| {
+        const K = w.k;
+        const N = if (w.ilv) w.n else w.n;
+        for ([_]u32{ 1, 8 }) |T| {
+            var best: f64 = 1e9;
+            for (0..200) |it| {
+                const t0 = q.now();
+                try q.gemm(d, a.pscr, a.h, a.ahi, a.alo, w, a.p, T);
+                try d.sync();
+                if (it > 10) best = @min(best, q.now() - t0);
+            }
+            const bytes4 = @as(f64, @floatFromInt(K)) * @as(f64, @floatFromInt(N)) / 2.0;
+            std.debug.print("int4 (ours)  K {d:5} N {d:5} rows {d:2}: {d:6.3} ms, {d:5.0} GB/s\n", .{ K, N, T, best * 1e3, bytes4 / best / 1e9 });
+            for ([_]u32{ 4, 3, 2 }) |bits| {
+                const bytes: usize = @as(usize, K / 16) * (N / 16) * 16 * bits * 2;
+                const tr = try d.alloc_(bytes);
+                const host = try alloc.alloc(u8, bytes);
+                defer alloc.free(host);
+                var prng = std.Random.DefaultPrng.init(bits);
+                prng.random().bytes(host);
+                try d.copyIn(tr, host);
+                const ks: u32 = if (N / 16 >= 2048) 1 else @max(1, 2048 / (N / 16));
+                var kslices = ks;
+                while ((K / 16) % kslices != 0) kslices -= 1;
+                var b2: f64 = 1e9;
+                for (0..100) |it| {
+                    const t0 = q.now();
+                    try d.launch(d.k.exl3_gemv, .{ .x = N / 16, .y = kslices }, .{ tr, a.h, a.pscr, @as(i32, @intCast(K)), @as(i32, @intCast(N)), @as(i32, @intCast(T)), @as(i32, @intCast(bits)), @as(i32, @intCast(kslices)) });
+                    try d.sync();
+                    if (it > 5) b2 = @min(b2, q.now() - t0);
+                }
+                std.debug.print("exl3 {d} bits  K {d:5} N {d:5} rows {d:2}: {d:6.3} ms, {d:5.0} GB/s ({d} K slices)\n", .{ bits, K, N, T, b2 * 1e3, @as(f64, @floatFromInt(bytes)) / b2 / 1e9, kslices });
+                d.g.free(tr);
+            }
+        }
     }
 }

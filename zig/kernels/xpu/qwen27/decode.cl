@@ -166,3 +166,53 @@ KERNEL(16) void kv_move(global ushort *KC, global ushort *VC, int p0, global con
     }
   }
 }
+
+// Sonde EXL3 (codebook mul1, docs/recipes/exl3.md) : Y[ks, T, N] fp32 = X[T, K] · W_q sur la tranche ks des tuiles K,
+// W_q décodé à la volée de TR [K/16, N/16, 16·bits] int16 (flux circulaire lu du bit de poids fort de chaque mot de
+// 32 bits). Un sous-groupe par (colonne de tuiles, tranche de K) ; le couloir décode les valeurs 16·couloir … + 15 de
+// chaque tuile, soit les colonnes couloir/2 et couloir/2 + 8 (disposition des fragments B). Mesure de vitesse seulement.
+KERNEL(16) void exl3_gemv(global const ushort *TR, global const half *X, global float *Y, int K, int N, int T, int bits,
+                          int kslices) {
+  // la tuile (8·bits mots de 32 bits, 4 bits : 32 mots) est lue une fois par le sous-groupe (deux mots par couloir) et
+  // distribuée par shuffle ; les activations de ses 16 lignes de K aussi (une par couloir et par ligne t)
+  const int nt = get_group_id(0), ks = get_group_id(1), lane = get_sub_group_local_id();
+  const int per = K / 16 / kslices, kt0 = ks * per, R = 256 * bits, nw = 8 * bits;
+  const float c1 = (float)as_half((ushort)0x1EEE), c0 = (float)as_half((ushort)0xC931);
+  float acc0[8], acc1[8];
+  for (int t = 0; t < 8; t++) acc0[t] = acc1[t] = 0.0f;
+  for (int kt = kt0; kt < kt0 + per; kt++) {
+    global const uint *tw = (global const uint *)(TR + ((long)kt * (N / 16) + nt) * 16 * bits);
+    const uint r0 = tw[lane], r1 = lane + 16 < nw ? tw[lane + 16] : 0u;
+    float xr[8];
+    for (int t = 0; t < 8; t++) xr[t] = t < T ? (float)X[(long)t * K + kt * 16 + lane] : 0.0f;
+    __attribute__((opencl_unroll_hint))
+    for (int v = 0; v < 16; v++) {
+      const int p = lane * 16 + v;
+      int a = (p + 1) * bits - 16;
+      a += a < 0 ? R : 0;
+      const int wi = a >> 5, wj = wi + 1 == nw ? 0 : wi + 1, sh = a & 31;
+      const uint w0a = sub_group_shuffle(r0, wi & 15), w0b = sub_group_shuffle(r1, wi & 15);
+      const uint w1a = sub_group_shuffle(r0, wj & 15), w1b = sub_group_shuffle(r1, wj & 15);
+      const uint w0 = wi < 16 ? w0a : w0b, w1 = wj < 16 ? w1a : w1b;
+      const uint hi = sh ? (w0 << sh) | (w1 >> (32 - sh)) : w0; // les 32 bits qui commencent au bit a
+      const uint s = hi >> 16;
+      const uint xx = s * 0x83DCD12Du;
+      const uint bs = (xx & 0x00FF00FFu) + ((xx >> 8) & 0x00FF00FFu);
+      const float w = (float)(1024u + (bs & 0xFFFFu) + (bs >> 16)) * c1 + c0;
+      const int l = p >> 3, j = p & 7, row = 2 * (l & 3) + (j & 1) + 8 * ((j >> 1) & 1);
+      for (int t = 0; t < 8; t++) {
+        if (t >= T) break;
+        const float xv = sub_group_shuffle(xr[t], row);
+        if (j >> 2) acc1[t] += xv * w; else acc0[t] += xv * w;
+      }
+    }
+  }
+  for (int t = 0; t < T && t < 8; t++) {
+    const float a0 = acc0[t] + sub_group_shuffle_xor(acc0[t], 1), a1 = acc1[t] + sub_group_shuffle_xor(acc1[t], 1);
+    if ((lane & 1) == 0) {
+      const long base = ((long)ks * T + t) * N + nt * 16 + lane / 2;
+      Y[base] = a0;
+      Y[base + 8] = a1;
+    }
+  }
+}
