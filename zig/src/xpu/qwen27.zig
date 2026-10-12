@@ -465,6 +465,7 @@ fn dumpBuf(d: *Dev, name: []const u8, p: *anyopaque, n: usize, kind: enum { f16,
 
 /// What a forward leaves: nothing, the last row's logits and greedy token, or every row's (verification, ≤ 16 rows).
 pub const Want = enum { none, last, rows };
+var dump_h: ?c_int = null;
 /// tree: the rows form a tree (acts.tree), each seeing its ancestors only; their GDN states land in acts.sl.
 pub const Mode = struct { want: Want = .last, stash: bool = false, taps: bool = false, tree: bool = false };
 
@@ -561,11 +562,19 @@ fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mode) 
         if (mode.taps) for (TAP_LAYERS, 0..) |tl, slot| if (tl == i)
             try d.launch(d.k.tap, .{ .x = D / 256, .y = T }, .{ a.x, a.r, a.taps, @as(i32, D), @as(i32, @intCast(slot)) });
     }
-    if (!want) {                                     // x is per token: nothing carries to the next chunk
+    if (!want and dump_h == null) {                  // x is per token: nothing carries to the next chunk
         try d.sync();
         return null;
     }
     try d.launch(d.k.add_rmsnorm, .{ .x = T }, .{ a.x, a.r, m.norm, a.h, a.ahi, a.alo, @as(i32, D), EPS, @as(i32, 1) });
+    if (dump_h) |fd| {                               // XPU_DUMP_H: every row's final normed hidden state, appended
+        const host = try alloc.alloc(u16, T * D);
+        defer alloc.free(host);
+        try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, host.ptr, a.h, T * D * 2, null, 0, null));
+        try d.sync();
+        _ = write(fd, @ptrCast(host.ptr), T * D * 2);
+        if (!want) return null;
+    }
     const first = if (mode.want == .rows) 0 else T - 1;
     const rows = T - first;
     try gemm(d, a.pscr, off(a.h, first * D * 2), off(a.ahi, first * (D / GS) * 2), off(a.alo, first * (D / GS) * 2), m.head, a.logits, rows);
@@ -606,6 +615,7 @@ pub const Runner = struct {
     /// Loads `dir` (MLX affine 4/64) onto the first B70 with room for `context` positions.
     pub fn init(dir: []const u8, context: u32) !*Runner {
         if (std.c.getenv("XPU_DUMP")) |v| dump_dir = std.mem.span(v);
+        if (std.c.getenv("XPU_DUMP_H")) |v| dump_h = open(v, 0o2101, @as(c_uint, 0o644)); // O_WRONLY | O_CREAT | O_APPEND
         if (std.c.getenv("XPU_CHUNK")) |v| CHUNK = try std.fmt.parseInt(u32, std.mem.span(v), 10);
         MAX_CTX = context;
         var ckpt: Checkpoint = .{};
