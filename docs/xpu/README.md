@@ -53,17 +53,24 @@ Options par variables d'environnement :
 | `XPU_TREE=N` | Nœuds de l'arbre DFlash2 par tour (15 par défaut ; 0 : une chaîne) |
 | `XPU_BLOCK=N` | Lignes du bloc du brouillonneur (8) |
 
-## Chiffres (B70 à 230 W, serveur, un flux)
+## Chiffres (B70 à 230 W, serveur `--parallel 8 --context 16384`, validation du 2026-10-12)
 
 | | MLX g64 | GPTQ g128 | GPTQ g128 + W4A8 |
 |---|---|---|---|
-| Préremplissage 1 k / 4 k / 8 k jetons | 1 612 / 1 600 / 1 566 tok/s | 1 765 / 1 747 / 1 710 tok/s | 2 218 / 2 337 / 2 294 tok/s |
-| Décodage série | 33,1 tok/s | 34,8 tok/s | 34,8 tok/s |
-| Arbre DFlash2, code / chat, glouton | 133,1 / 98,7 tok/s | 137,2 / 93,3 tok/s | 137,5 / 99,5 tok/s |
-| Arbre DFlash2, code / chat, température 1 | 123,4 / 96,9 tok/s | 117,1 / 93,6 tok/s | 117,5 / 93,8 tok/s |
+| Préremplissage 1 k / 4 k / 8 k jetons | 1 694 / 1 675 / 1 643 tok/s | 1 866 / 1 838 / 1 802 tok/s | 2 416 / 2 381 / 2 321 tok/s |
+| Un flux seul, arbre DFlash2, code / chat, glouton | 128,5 / 98,0 tok/s | 133,0 / 93,1 tok/s | 133,1 / 97,0 tok/s |
+| Un flux seul, arbre DFlash2, code / chat, température 1 | 119,4 / 94,3 tok/s | 114,1 / 91,6 tok/s | 114,1 / 91,5 tok/s |
+| 8 flux simultanés, code / chat, glouton (agrégé) | 210 / 203 tok/s | 183 / 166 tok/s | 183 / 170 tok/s |
+| Décodage `bench_openai`, 8 requêtes (agrégé) | 355 tok/s | 507 tok/s | 418 tok/s |
+| Tours partagés seuls, 1 / 8 flux (`XPU_MULTI_TEST`) | 32 / 219 tok/s | 34 / 227 tok/s | 34 / 227 tok/s |
+
+Validation : `zig build test`, oracle, drafté == série, multi-flux == série, et `bench_concurrent --alone --serial`
+sur 1, 2, 4 et 8 flux, en glouton et en échantillonné, pour les trois configurations : 48 cellules toutes égales, aucune
+erreur dans les journaux des serveurs.
 
 Bancs : `bench_openai.py` (préremplissage, décodage) et `bench_concurrent.py --alone --serial` (brouillons), dans
-`tools/` de la branche `main` de ce dépôt. Le débit drafté dépend du texte produit ; les deux formats n'écrivent pas le même.
+`tools/` de la branche `main` de ce dépôt. Le débit drafté dépend du texte produit ; les deux formats n'écrivent pas le
+même. Dans les tours partagés, chaque flux tourne à 25-32 tok/s : seul un flux seul drafte (arbre DFlash2).
 
 Le préremplissage est **borné par la puissance** : à 230 W, la carte tourne à ~2 180 MHz pendant un prompt (PL2),
 pas aux 2 600 du DPAS pur. Le GEMM gate|up seul tient 146 TFLOPS fp16 et ~209 TOPS en int8.
