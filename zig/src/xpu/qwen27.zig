@@ -961,7 +961,7 @@ pub const Runner = struct {
             .ngen_wide_g128 = try d.kernel(mw128, "w4g_dpb", 256), .ngen_narrow_g128 = try d.kernel(mn128, "w4g_s4dpb", 256),
             .ngen_swiglu = try d.kernel(try d.g.module(&kb.ngen_swiglu), "w4g_dpb_swiglu", 256),
             .ngen_swiglu_g128 = try d.kernel(try d.g.module(&kb.ngen_swiglu128), "w4g_dpb_swiglu", 256),
-            .rowsums_ff = try d.kernel(mg, "rowsums_ff", 256), .fakequant_rows = try d.kernel(mg, "fakequant_rows", 256),
+            .rowsums_ff = try d.kernel(mg, "rowsums_ff", 128), .fakequant_rows = try d.kernel(mg, "fakequant_rows", 256),
             .a8 = try d.kernel(try d.g.module(&kb.ngen_a8), "w4a8", 256), .a8_swiglu = try d.kernel(try d.g.module(&kb.ngen_a8_swiglu), "w4a8_swiglu", 256),
             .quant_a8 = try d.kernel(mg, "quant_a8", 256),
             .dec_wide = try d.kernel(mm, "w4k1_decode", 64), .dec_wide64 = try d.kernel(mm, "w4k1_d64", 64), .dec_narrow = try d.kernel(mm, "w4k_dsplit", 64),

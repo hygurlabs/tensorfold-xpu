@@ -471,12 +471,26 @@ KERNEL(256) void swiglu(global const half *GU, global half *H, global half *AHI,
 }
 
 // Sommes de ligne de l'activation écrite par l'épilogue SwiGLU (H fp16 [T, 17 408]) : grille T, groupes de 256.
-KERNEL(256) void rowsums_ff(global const half *H, global half *AHI, global half *ALO, int gs) {
-  local half hl[17408];
-  const int t = get_group_id(0);
-  for (int e = get_local_id(0) * 4; e < 17408; e += 1024) vstore4(vload4(0, H + (long)t * 17408 + e), 0, hl + e);
-  barrier(CLK_LOCAL_MEM_FENCE);
-  rowsums(hl, 17408, AHI, ALO, t, gs);
+KERNEL(128) void rowsums_ff(global const half *H, global half *AHI, global half *ALO, int gs) {
+  // les sommes de rowsums lues directement en mémoire globale (mêmes additions, même ordre : mêmes bits)
+  const int t = get_group_id(0), lane = get_sub_group_local_id(), per = gs / 16;
+  global const half *h = H + (long)t * 17408;
+  for (int g = get_sub_group_id(); g < 17408 / gs; g += get_num_sub_groups()) {
+    float s = 0.0f;
+    if (per == 8) {
+      const half8 x = vload8(0, h + g * gs + lane * 8);
+      for (int k = 0; k < 8; k++) s += (float)x[k];
+    } else {
+      const half4 x = vload4(0, h + g * gs + lane * 4);
+      for (int k = 0; k < 4; k++) s += (float)x[k];
+    }
+    s = sub_group_reduce_add(s) * (1.0f / gs);
+    if (lane == 0) {
+      const half hi = convert_half_rte(s);
+      AHI[(long)t * (17408 / gs) + g] = hi;
+      ALO[(long)t * (17408 / gs) + g] = convert_half_rte(s - (float)hi);
+    }
+  }
 }
 
 // Étude W4A8 (quantification simulée) : chaque ligne de X fp16 [T, K] quantifiée en int8 symétrique par groupes de qg
