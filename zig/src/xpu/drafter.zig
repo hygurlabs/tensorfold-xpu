@@ -10,7 +10,7 @@ const q = @import("qwen27.zig");
 
 const alloc = q.alloc;
 const D = q.D;
-const GS = q.GS;
+const GS = 64; // the drafter's projections: affine 4/64 whatever the target's format
 const HIDDEN_NORM_EPS: f32 = 1e-6;
 const LAYERS = 5;
 const NH = 32;
@@ -241,8 +241,36 @@ pub const Drafter = struct {
             .kc = try d.alloc_(@as(usize, NKV) * dr.cap * HD * 2),
             .vc = try d.alloc_(@as(usize, NKV) * dr.cap * HD * 2),
         };
-        // the head: the target's lm_head rows of the two spans (its own 4-bit rows, repacked)
-        {
+        // the head: the target's lm_head rows of the two spans (its own 4-bit rows, repacked; from a GPTQ target, its
+        // fp16 rows quantized as the target's head is, to the same values)
+        if (!r.ckpt.has("lm_head.scales")) {
+            const w = try r.ckpt.get("lm_head.weight");
+            const kk: u32 = @intCast(w.shape[1]);
+            const raw = try d.alloc_(32768 * @as(usize, kk) * 2);
+            defer d.g.free(raw);
+            var parts: [2]Mlx = undefined;
+            var at: usize = 0;
+            for ([_][2]u32{ .{ 0, SPAN_LO }, .{ SPAN_HI0, q.VOCAB } }, 0..) |span, j| {
+                const n = span[1] - span[0];
+                const pw = q.off(stage, at);
+                at += @as(usize, n) * (kk / 8) * 4;
+                const ps = q.off(stage, at);
+                at += @as(usize, n) * (kk / GS) * 2;
+                const pb = q.off(stage, at);
+                at += @as(usize, n) * (kk / GS) * 2;
+                at = (at + 4095) / 4096 * 4096;
+                var r0: u32 = 0;
+                while (r0 < n) : (r0 += 32768) {
+                    const nr = @min(32768, n - r0);
+                    const src = w.bytes[@as(usize, span[0] + r0) * kk * 2 ..][0 .. @as(usize, nr) * kk * 2];
+                    try d.copyIn(raw, src);
+                    try d.launch(d.k.quantize_mlx, .{ .x = (nr + 15) / 16, .y = kk / 64 }, .{ raw, @as(i32, @intCast(nr)), @as(i32, @intCast(kk)), q.off(pw, @as(usize, r0) * (kk / 8) * 4), q.off(ps, @as(usize, r0) * (kk / GS) * 2), q.off(pb, @as(usize, r0) * (kk / GS) * 2) });
+                    try d.sync();
+                }
+                parts[j] = .{ .w = pw, .s = ps, .b = pb, .n = n };
+            }
+            dr.head = try pack(d, &parts, kk, true);
+        } else {
             const w = try r.ckpt.get("lm_head.weight");
             const s = try r.ckpt.get("lm_head.scales");
             const b = try r.ckpt.get("lm_head.biases");
@@ -290,7 +318,7 @@ pub const Drafter = struct {
             try d.launch(dr.k.taps_in, .{ .x = rows }, .{ src, dr.h, dr.ahi, dr.alo });
             try q.gemm(d, dr.pscr, dr.h, dr.ahi, dr.alo, dr.fc, dr.r16, rows);
             try d.launch(dr.k.to_res, .{ .x = rows * D / 256 }, .{ dr.r16, dr.x });
-            try d.launch(d.k.add_rmsnorm, .{ .x = rows }, .{ dr.x, dr.r16, dr.hidden_norm, dr.h, dr.ahi, dr.alo, @as(i32, D), HIDDEN_NORM_EPS, @as(i32, 0) });
+            try d.launch(d.k.add_rmsnorm, .{ .x = rows }, .{ dr.x, dr.r16, dr.hidden_norm, dr.h, dr.ahi, dr.alo, @as(i32, D), HIDDEN_NORM_EPS, @as(i32, 0), @as(i32, GS) });
             for (&dr.layers) |*l| {
                 try q.gemm(d, dr.pscr, dr.h, dr.ahi, dr.alo, l.kv, dr.p, rows);
                 try d.launch(dr.k.dprep, .{ .x = rows, .y = 16 }, .{ dr.p, @as(i32, @intCast(l.kv.n)), @as(i32, -1), l.qn, l.kn, dr.invf, dr.qb, l.kc, l.vc, @as(i32, @intCast(dr.cap)), @as(i32, @intCast(dr.end + done)), HIDDEN_NORM_EPS });
@@ -384,12 +412,12 @@ pub const Drafter = struct {
         for (1..L) |i| tokens[i] = MASK_ID;
         try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, dr.ids, &tokens, L * 4, null, 0, null));
         const m = &dr.r.model;
-        try d.launch(d.k.embed, .{ .x = L }, .{ dr.ids, m.embed_w, m.embed_s, m.embed_b, dr.x, @as(i32, D) });
+        try q.embedRows(d, m, dr.ids, dr.x, L);
         const l32: i32 = @intCast(L);
         const end: i32 = @intCast(dr.end);
         const c0: i32 = @intCast(dr.end -| WIN);
         for (&dr.layers) |*l| {
-            try d.launch(d.k.add_rmsnorm, .{ .x = L }, .{ dr.x, dr.r16, l.in_norm, dr.h, dr.ahi, dr.alo, @as(i32, D), HIDDEN_NORM_EPS, @as(i32, 0) });
+            try d.launch(d.k.add_rmsnorm, .{ .x = L }, .{ dr.x, dr.r16, l.in_norm, dr.h, dr.ahi, dr.alo, @as(i32, D), HIDDEN_NORM_EPS, @as(i32, 0), @as(i32, GS) });
             try q.gemm(d, dr.pscr, dr.h, dr.ahi, dr.alo, l.kp_attn, dr.dyn, L);
             try d.launch(dr.k.dconv, .{ .x = L, .y = D / 512 }, .{ dr.h, dr.dyn, @as(i32, @intCast(l.kp_attn.n)), l.base_attn, @as(i32, 0), dr.x, @as(i32, 0), dr.h2, dr.ahi, dr.alo });
             try q.gemm(d, dr.pscr, dr.h2, dr.ahi, dr.alo, l.qkv, dr.p, L);
@@ -398,17 +426,17 @@ pub const Drafter = struct {
             try d.launch(dr.k.rowsums_rows, .{ .x = L }, .{ dr.o, @as(i32, NH * HD), dr.ahi, dr.alo });
             try q.gemm(d, dr.pscr, dr.o, dr.ahi, dr.alo, l.o, dr.r16, L);
             try d.launch(dr.k.dconv, .{ .x = L, .y = D / 512 }, .{ dr.r16, dr.dyn, @as(i32, @intCast(l.kp_attn.n)), l.base_attn, @as(i32, 1), dr.x, @as(i32, 1), dr.h2, dr.ahi, dr.alo });
-            try d.launch(d.k.add_rmsnorm, .{ .x = L }, .{ dr.x, dr.r16, l.post_norm, dr.h, dr.ahi, dr.alo, @as(i32, D), HIDDEN_NORM_EPS, @as(i32, 0) });
+            try d.launch(d.k.add_rmsnorm, .{ .x = L }, .{ dr.x, dr.r16, l.post_norm, dr.h, dr.ahi, dr.alo, @as(i32, D), HIDDEN_NORM_EPS, @as(i32, 0), @as(i32, GS) });
             try q.gemm(d, dr.pscr, dr.h, dr.ahi, dr.alo, l.kp_mlp, dr.dyn, L);
             try d.launch(dr.k.dconv, .{ .x = L, .y = D / 512 }, .{ dr.h, dr.dyn, @as(i32, @intCast(l.kp_mlp.n)), l.base_mlp, @as(i32, 0), dr.x, @as(i32, 0), dr.h2, dr.ahi, dr.alo });
             try q.gemm(d, dr.pscr, dr.h2, dr.ahi, dr.alo, l.gu, dr.p, L);
-            try d.launch(d.k.swiglu, .{ .x = L, .y = 17 }, .{ dr.p, dr.h2, dr.ahi, dr.alo });
+            try d.launch(d.k.swiglu, .{ .x = L, .y = 17 }, .{ dr.p, dr.h2, dr.ahi, dr.alo, @as(i32, GS) });
             try q.gemm(d, dr.pscr, dr.h2, dr.ahi, dr.alo, l.down, dr.r16, L);
             try d.launch(dr.k.dconv, .{ .x = L, .y = D / 512 }, .{ dr.r16, dr.dyn, @as(i32, @intCast(l.kp_mlp.n)), l.base_mlp, @as(i32, 1), dr.x, @as(i32, 1), dr.h2, dr.ahi, dr.alo });
         }
         // rows 1 .. L − 1: final norm, selector projection, head over the two spans, top 16
         const rows = count;
-        try d.launch(d.k.add_rmsnorm, .{ .x = rows }, .{ q.off(dr.x, D * 4), dr.r16, dr.norm, dr.h, dr.ahi, dr.alo, @as(i32, D), HIDDEN_NORM_EPS, @as(i32, 0) });
+        try d.launch(d.k.add_rmsnorm, .{ .x = rows }, .{ q.off(dr.x, D * 4), dr.r16, dr.norm, dr.h, dr.ahi, dr.alo, @as(i32, D), HIDDEN_NORM_EPS, @as(i32, 0), @as(i32, GS) });
         try q.gemm(d, dr.pscr, dr.h, dr.ahi, dr.alo, dr.sel, dr.selp, rows);
         try q.gemm(d, dr.pscr, dr.h, dr.ahi, dr.alo, dr.head, dr.logits, rows);
         try d.launch(dr.k.topk_part, .{ .x = 256, .y = rows }, .{ dr.logits, @as(i32, HEAD_N), @as(i32, @intCast(dr.head.n)), dr.pv, dr.pi });

@@ -1,8 +1,9 @@
 // Glue du Qwen3.8-27B sur Intel Xe2 (OpenCL C, ocloc), d'après la référence torch du portage
 // (tensorfold/families/qwen3_5/cuda/reference.py). Conventions :
 //   x   : flux résiduel fp32 [T, 5120] ; h : entrée normée d'un GEMM, fp16 [T, K]
-//   AHI, ALO : sommes de ligne de h par groupe de 64 (famille de GEMM « biais par DPAS ») : s = Σ h (fp32, k croissant)
-//              / 64, AHI = fp16(s), ALO = fp16(s − AHI), [T, K / 64] ; mêmes bits que rowsum_hl du banc.
+//   AHI, ALO : sommes de ligne de h par groupe de GSZ (famille de GEMM « biais par DPAS ») : s = Σ h (fp32, k croissant)
+//              / GSZ, AHI = fp16(s), ALO = fp16(s − AHI), [T, K / GSZ] ; mêmes bits que rowsum_hl du banc. GSZ (64 ou
+//              128) est un argument : celui de la projection qui lit h.
 // Sous-groupes de 16 ; réductions dans un ordre fixe (sous-groupe puis mémoire locale, rang croissant).
 #pragma OPENCL FP_CONTRACT OFF
 
@@ -30,18 +31,18 @@ static float wg_sum256(float v, local float *red) {
   return t;
 }
 
-// Sommes de ligne d'une ligne fp16 rangée en mémoire locale (K valeurs), écrites en [row, K / 64] : un sous-groupe par
-// groupe de 64, 4 valeurs par couloir (k croissant), puis la somme du sous-groupe ; ordre fixe.
-static void rowsums(local const half *hl, int K, global half *AHI, global half *ALO, long row) {
-  const int lane = get_sub_group_local_id(), nsg = get_num_sub_groups();
-  for (int g = get_sub_group_id(); g < K / GS; g += nsg) {
+// Sommes de ligne d'une ligne fp16 rangée en mémoire locale (K valeurs), écrites en [row, K / gs] : un sous-groupe par
+// groupe de gs, gs / 16 valeurs par couloir (k croissant), puis la somme du sous-groupe ; ordre fixe.
+static void rowsums(local const half *hl, int K, global half *AHI, global half *ALO, long row, int gs) {
+  const int lane = get_sub_group_local_id(), nsg = get_num_sub_groups(), per = gs / 16;
+  for (int g = get_sub_group_id(); g < K / gs; g += nsg) {
     float s = 0.0f;
-    for (int k = 0; k < 4; k++) s += (float)hl[g * GS + lane * 4 + k];
-    s = sub_group_reduce_add(s) * (1.0f / GS);
+    for (int k = 0; k < per; k++) s += (float)hl[g * gs + lane * per + k];
+    s = sub_group_reduce_add(s) * (1.0f / gs);
     if (lane == 0) {
       const half hi = convert_half_rte(s);
-      AHI[row * (K / GS) + g] = hi;
-      ALO[row * (K / GS) + g] = convert_half_rte(s - (float)hi);
+      AHI[row * (K / gs) + g] = hi;
+      ALO[row * (K / gs) + g] = convert_half_rte(s - (float)hi);
     }
   }
 }
@@ -59,11 +60,47 @@ KERNEL(256) void embed(global const int *IDS, global const uint *W, global const
   }
 }
 
+// Plongement dense : x = bf16(E[id]) (table fp16 [V, D], checkpoint GPTQ).
+KERNEL(256) void embed_dense(global const int *IDS, global const half *E, global float *X, int D) {
+  const int t = get_group_id(0);
+  const long id = IDS[t];
+  for (int e = get_local_id(0); e < D; e += 256) X[(long)t * D + e] = rbf((float)E[id * D + e]);
+}
+
+// Petite projection dense fp16 (portes a, b du GDN au format GPTQ, gardées en fp16 comme le checkpoint) :
+// P[t, c0 + n] = fp16(Σ_k H[t, k]·W[n, k]), N = 96, K = 5 120, par DPAS. Un groupe de 256 par (16 lignes, 16 colonnes) :
+// le sous-groupe s somme les K de la tranche s (320, dans l'ordre), puis les 16 tranches s'ajoutent dans l'ordre ;
+// le sous-groupe r écrit la ligne r. Les bits d'une ligne ne dépendent ni de T ni de sa place.
+#pragma OPENCL EXTENSION cl_intel_subgroup_matrix_multiply_accumulate : enable
+KERNEL(256) void dense_rows(global const half *H, global const half *W, global half *P, int T, int ldp, int c0) {
+  local float red[16 * 16 * 16];
+  const int K = 5120, KS = K / 16;
+  const int m0 = get_group_id(0) * 16, n0 = get_group_id(1) * 16, sg = get_sub_group_id(), lane = get_sub_group_local_id();
+  float8 acc0 = 0.0f, acc1 = 0.0f;
+  global const uint *wr = (global const uint *)(W + (long)(n0 + lane) * K);
+  for (int k = sg * KS; k < (sg + 1) * KS; k += 16) {
+    short8 a0, a1;
+    intel_sub_group_2d_block_read_16b_8r16x1c((global void *)H, K * 2, T, K * 2, (int2)(k, m0), (private ushort *)&a0);
+    intel_sub_group_2d_block_read_16b_8r16x1c((global void *)H, K * 2, T, K * 2, (int2)(k, m0 + 8), (private ushort *)&a1);
+    const int8 bb = as_int8(vload8(0, wr + k / 2));
+    acc0 = intel_sub_group_f16_f16_matrix_mad_k16(a0, bb, acc0);
+    acc1 = intel_sub_group_f16_f16_matrix_mad_k16(a1, bb, acc1);
+  }
+  for (int r = 0; r < 8; r++) {
+    red[(sg * 16 + r) * 16 + lane] = acc0[r];
+    red[(sg * 16 + 8 + r) * 16 + lane] = acc1[r];
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  float v = 0.0f;
+  for (int s = 0; s < 16; s++) v += red[(s * 16 + sg) * 16 + lane];
+  if (m0 + sg < T) P[(long)(m0 + sg) * ldp + c0 + n0 + lane] = convert_half_rte(v);
+}
+
 // x ← bf16(x + r) (si R), h = fp16(bf16(rms(x)·w)), et ses sommes de ligne. Un groupe de 512 par ligne (10 valeurs
 // par fil pour D = 5 120 ; 512 est le plafond en mode 256 registres) ; somme des carrés : sous-groupes, puis les 32
 // sommes partielles dans l'ordre.
 KERNEL(512) void add_rmsnorm(global float *X, global const half *R, global const ushort *WN, global half *H,
-                              global half *AHI, global half *ALO, int D, float eps, int has_r) {
+                              global half *AHI, global half *ALO, int D, float eps, int has_r, int gs) {
   local float red[32];
   local half hl[5120];
   const int t = get_group_id(0), lid = get_local_id(0);
@@ -92,7 +129,7 @@ KERNEL(512) void add_rmsnorm(global float *X, global const half *R, global const
     hl[e] = v;
   }
   barrier(CLK_LOCAL_MEM_FENCE);
-  rowsums(hl, D, AHI, ALO, t);
+  rowsums(hl, D, AHI, ALO, t, gs);
 }
 
 // GDN, avant la récurrence. P : sortie du GEMM gdn.in, fp16 [T, 16 640] = qkv (10 240) | z (6 144) | a (48) | b (48),
@@ -189,7 +226,7 @@ KERNEL(256) void gdn_pre_rows(global const half *P, global const half *CIN, glob
 // Après la récurrence : out = fp16(bf16(SiLU(z)·rms(y)·w)) par tête de 128, et ses sommes de ligne (K = 6 144).
 // Y : sortie du GDN bf16 [T, 48, 128] ; z dans P (colonnes 10 240 + …). Un groupe de 256 par jeton.
 KERNEL(256) void gated_norm(global const ushort *Y, global const half *P, global const ushort *WN, global half *H,
-                            global half *AHI, global half *ALO, float eps) {
+                            global half *AHI, global half *ALO, float eps, int gs) {
   local half hl[6144];
   const int t = get_group_id(0), sg = get_sub_group_id(), lane = get_sub_group_local_id();
   for (int hh = sg; hh < 48; hh += 16) {
@@ -209,7 +246,7 @@ KERNEL(256) void gated_norm(global const ushort *Y, global const half *P, global
     }
   }
   barrier(CLK_LOCAL_MEM_FENCE);
-  rowsums(hl, 6144, AHI, ALO, t);
+  rowsums(hl, 6144, AHI, ALO, t, gs);
 }
 
 // Attention, avant le noyau : P = sortie du GEMM attn.qkv fp16 [T, 14 336] = (q 256 | porte 256) × 24 | k 4 × 256 |
@@ -250,7 +287,7 @@ KERNEL(256) void attn_prep(global const half *P, global const ushort *QN, global
 
 // Sortie de l'attention : fp16(bf16(o·σ(porte))) [T, 6 144] et ses sommes de ligne. O bf16 [T, 24, 256].
 KERNEL(256) void attn_gate(global const ushort *O, global const half *P, global half *H, global half *AHI,
-                           global half *ALO) {
+                           global half *ALO, int gs) {
   local half hl[6144];
   const int t = get_group_id(0);
   for (int e = get_local_id(0); e < 6144; e += 256) {
@@ -261,12 +298,12 @@ KERNEL(256) void attn_gate(global const ushort *O, global const half *P, global 
     hl[e] = o;
   }
   barrier(CLK_LOCAL_MEM_FENCE);
-  rowsums(hl, 6144, AHI, ALO, t);
+  rowsums(hl, 6144, AHI, ALO, t, gs);
 }
 
 // SwiGLU : GU fp16 [T, 34 816] = gate (17 408) | up (17 408) ; act = fp16(bf16(SiLU(g)·u)) et ses sommes de ligne.
-// Grille (T, 17) : un groupe de 256 par bloc de 1 024 colonnes (16 groupes de 64).
-KERNEL(256) void swiglu(global const half *GU, global half *H, global half *AHI, global half *ALO) {
+// Grille (T, 17) : un groupe de 256 par bloc de 1 024 colonnes (1 024 / gs groupes de sommes).
+KERNEL(256) void swiglu(global const half *GU, global half *H, global half *AHI, global half *ALO, int gs) {
   local half hl[1024];
   const int t = get_group_id(0), blk = get_group_id(1), lid = get_local_id(0);
   for (int e = lid; e < 1024; e += 256) {
@@ -276,15 +313,15 @@ KERNEL(256) void swiglu(global const half *GU, global half *H, global half *AHI,
     hl[e] = o;
   }
   barrier(CLK_LOCAL_MEM_FENCE);
-  const int lane = get_sub_group_local_id();
-  for (int g = get_sub_group_id(); g < 16; g += 16) {
+  const int lane = get_sub_group_local_id(), per = gs / 16, ng = 1024 / gs;
+  for (int g = get_sub_group_id(); g < ng; g += 16) {
     float s = 0.0f;
-    for (int k = 0; k < 4; k++) s += (float)hl[g * GS + lane * 4 + k];
-    s = sub_group_reduce_add(s) * (1.0f / GS);
+    for (int k = 0; k < per; k++) s += (float)hl[g * gs + lane * per + k];
+    s = sub_group_reduce_add(s) * (1.0f / gs);
     if (lane == 0) {
       const half hi = convert_half_rte(s);
-      AHI[(long)t * 272 + blk * 16 + g] = hi;
-      ALO[(long)t * 272 + blk * 16 + g] = convert_half_rte(s - (float)hi);
+      AHI[(long)t * (17408 / gs) + blk * ng + g] = hi;
+      ALO[(long)t * (17408 / gs) + blk * ng + g] = convert_half_rte(s - (float)hi);
     }
   }
 }
@@ -362,5 +399,59 @@ kernel void repack(global const uint *MW, global const ushort *MS, global const 
     const int g = w / (GS / 8);
     S[(long)g * NT + n0 + n] = convert_half_rte(bf2f(MS[(long)n * (K / GS) + g]));
     BG[(long)g * NT + n0 + n] = convert_half_rte(bf2f(MB[(long)n * (K / GS) + g]) * GS);
+  }
+}
+
+// Réempaquetage au chargement d'une projection GPTQ symétrique 4 bits (mots [K/8, N] int32, quartet j = k 8w + j ;
+// échelles fp16 [K/G, N] ; zéro 8) vers la disposition du GEMM : mêmes mots entrelacés, S = s, biais × G = −8·s·G.
+kernel void repack_gptq(global const uint *QW, global const half *SC, global uint *W, global half *S, global half *BG,
+                        int N, int K, int NT, int n0, int G) {
+  const int n = get_global_id(0), w = get_global_id(1);
+  if (n >= N || w >= K / 8) return;
+  const uint m = QW[(long)w * N + n];
+  uint o = 0;
+  for (int p = 0; p < 4; p++) {
+    o |= ((m >> (8 * p)) & 0xFu) << (4 * p);
+    o |= ((m >> (8 * p + 4)) & 0xFu) << (16 + 4 * p);
+  }
+  W[(long)w * NT + n0 + n] = o;
+  if (w % (G / 8) == 0) {
+    const int g = w / (G / 8);
+    const half s = SC[(long)g * N + n];
+    S[(long)g * NT + n0 + n] = s;
+    BG[(long)g * NT + n0 + n] = convert_half_rte((float)s * (-8.0f * G));
+  }
+}
+
+// Quantification affine 4 bits, groupes de 64, d'un poids fp16 [N, K] (tête GPTQ) par l'algorithme de MLX
+// (affine_quantize : bord de plus grande valeur absolue sur une valeur entière, échelles et biais arrondis bf16),
+// vers la disposition MLX (mots [N, K/8], échelles et biais bf16 [N, K/64]) que `repack` lit. Un fil par (n, g).
+kernel void quantize_mlx(global const half *Wt, int N, int K, global uint *MW, global ushort *MS, global ushort *MB) {
+  const int n = get_global_id(0), g = get_global_id(1);
+  if (n >= N || g >= K / 64) return;
+  global const half *row = Wt + (long)n * K + g * 64;
+  float lo = INFINITY, hi = -INFINITY;
+  for (int i = 0; i < 64; i++) {
+    const float v = (float)row[i];
+    lo = fmin(lo, v);
+    hi = fmax(hi, v);
+  }
+  const bool neg = fabs(lo) > fabs(hi);
+  float scale = fmax((hi - lo) / 15.0f, 1e-7f);
+  scale = neg ? scale : -scale;
+  const float edge = neg ? lo : hi;
+  const float q0 = rint(edge / scale);
+  if (q0 != 0.0f) scale = edge / q0;
+  const float bias = q0 == 0.0f ? 0.0f : edge;
+  const float s = rbf(scale), b = rbf(bias);
+  MS[(long)n * (K / 64) + g] = f2bf(s);
+  MB[(long)n * (K / 64) + g] = f2bf(b);
+  for (int w = 0; w < 8; w++) {
+    uint word = 0;
+    for (int j = 0; j < 8; j++) {
+      const int q = clamp((int)rint(((float)row[w * 8 + j] - b) / s), 0, 15);
+      word |= (uint)q << (4 * j);
+    }
+    MW[(long)n * (K / 8) + g * 8 + w] = word;
   }
 }

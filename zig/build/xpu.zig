@@ -14,6 +14,7 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         .{ "glue", "zig/kernels/xpu/qwen27/glue.cl", "" },
         .{ "decode", "zig/kernels/xpu/qwen27/decode.cl", "" },
         .{ "gemm", "zig/kernels/xpu/qwen27/gemm.cl", " -DGSZ=64" },
+        .{ "gemm128", "zig/kernels/xpu/qwen27/gemm.cl", " -DGSZ=128" },
         .{ "gdn", "zig/kernels/xpu/qwen27/gdn_chunk.cl", "" },
         .{ "drafter", "zig/kernels/xpu/qwen27/drafter.cl", "" },
     }) |k| {
@@ -32,29 +33,35 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         const dir = c.addOutputDirectoryArg("ocloc-prompt-attention");
         _ = files.addCopyFile(dir.path(b, "prompt_attention.bin"), "prompt_attention.bin");
     }
-    // nGEN generator, built for the host and run at build time for the two prompt GEMM families (group 64).
+    // nGEN generator, built for the host and run at build time for the two prompt GEMM families, groups of 64 (MLX)
+    // and 128 (GPTQ).
     const gen = b.addSystemCommand(&.{ "c++", "-std=c++17", "-O1", "-fno-operator-names", b.fmt("-I{s}", .{ngen_include}), "-o" });
     const gen_bin = gen.addOutputFileArg("w4_ngen");
     gen.addFileArg(b.path("zig/tools/xpu/w4_ngen.cpp"));
-    for ([_]struct { []const u8, []const []const u8 }{
-        .{ "ngen_wide", &.{ "tn2", "fold32", "lag", "dpb", "layout3", "b3" } },
-        .{ "ngen_narrow", &.{ "tn2", "fold32", "lag", "dpb", "layout3", "s4", "asplit" } },
+    for ([_]struct { []const u8, []const u8, []const []const u8 }{
+        .{ "ngen_wide", "64", &.{ "tn2", "fold32", "lag", "dpb", "layout3", "b3" } },
+        .{ "ngen_narrow", "64", &.{ "tn2", "fold32", "lag", "dpb", "layout3", "s4", "asplit" } },
+        .{ "ngen_wide128", "128", &.{ "tn2", "fold32", "lag", "dpb", "layout3", "b3" } },
+        .{ "ngen_narrow128", "128", &.{ "tn2", "fold32", "lag", "dpb", "layout3", "s4", "asplit" } },
     }) |z| {
         const run = std.Build.Step.Run.create(b, b.fmt("nGEN {s}", .{z[0]}));
         run.addFileArg(gen_bin);
-        run.addArgs(&.{ "xe2", "64" });
+        run.addArgs(&.{ "xe2", z[1] });
         const out = run.addOutputFileArg(b.fmt("{s}.zebin", .{z[0]}));
-        run.addArgs(z[1]);
+        run.addArgs(z[2]);
         _ = files.addCopyFile(out, b.fmt("{s}.zebin", .{z[0]}));
     }
     const embedded = b.createModule(.{ .root_source_file = files.add("xpu_qwen27_kernels.zig",
         \\pub const glue align(8) = @embedFile("glue.bin").*;
         \\pub const decode align(8) = @embedFile("decode.bin").*;
         \\pub const gemm align(8) = @embedFile("gemm.bin").*;
+        \\pub const gemm128 align(8) = @embedFile("gemm128.bin").*;
         \\pub const gdn align(8) = @embedFile("gdn.bin").*;
         \\pub const drafter align(8) = @embedFile("drafter.bin").*;
         \\pub const ngen_wide align(8) = @embedFile("ngen_wide.zebin").*;
         \\pub const ngen_narrow align(8) = @embedFile("ngen_narrow.zebin").*;
+        \\pub const ngen_wide128 align(8) = @embedFile("ngen_wide128.zebin").*;
+        \\pub const ngen_narrow128 align(8) = @embedFile("ngen_narrow128.zebin").*;
         \\pub const prompt_attention align(8) = @embedFile("prompt_attention.bin").*;
         \\
     ) });
