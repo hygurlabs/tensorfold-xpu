@@ -1,0 +1,116 @@
+# Backend XPU (Intel Arc Pro B70) du moteur Zig de TensorFold
+
+Portage **non officiel** : un backend `xpu` pour le moteur Zig de TensorFold, qui pilote une carte Intel Xe2
+(Arc Pro B70, Battlemage G31, 32 Go) directement par **Level Zero**, sans PyTorch, sans SYCL, sans Python à
+l'exécution. Il sert **Qwen3.8-27B** derrière l'API OpenAI du serveur `tensorfold-native`, avec le brouillonneur
+DFlash2 en arbre.
+
+## Ce qu'il sert
+
+| | |
+|---|---|
+| Modèle | Qwen3.8-27B (`model_type` `qwen3_5` : 48 couches GDN + 16 d'attention) |
+| Formats | MLX affine 4 bits groupes de 64 (`mlx-q4g64`), GPTQ symétrique 4 bits groupes de 128 (`gptq-int4-g128`) |
+| Brouillons | DFlash2 (`--drafter`), arbre best-first de 15 nœuds, glouton et échantillonné |
+| Service | un flux à la fois (`serial_host`) ; multi-flux et MoE : voir [plan-multiflux-moe.md](plan-multiflux-moe.md) |
+
+Au format GPTQ, les couches sont en int4 g128 telles que stockées. Les portes `in_proj_a/b` du GDN restent en fp16
+dense, comme le checkpoint, et l'embedding est fp16. La tête de sortie est requantifiée au chargement en affine
+4/64 par l'algorithme de MLX : sa justesse est celle de la tête 4 bits du checkpoint MLX (même jeton que la tête
+fp16 dans 97,4 % des cas, KL 3,9e-3 ; `tools/xpu/head_study.py`).
+
+## Construire
+
+Prérequis : Zig 0.17, le pilote `xe` et le runtime de calcul Intel (Level Zero), `ocloc` (compilateur hors ligne
+d'Intel), un compilateur C++17 et les en-têtes nGEN de oneDNN.
+
+```sh
+zig build xpu-native -Doptimize=ReleaseFast -Dngen-include=<chemin vers ngen>   # zig-out/xpu/bin/tensorfold-native
+zig build xpu-qwen27 -Doptimize=ReleaseFast -Dngen-include=<chemin vers ngen>   # exécutable de test xpu-qwen27
+```
+
+Les noyaux OpenCL C sont compilés par `ocloc` pour `-Dxpu-device` (défaut `bmg`). Les GEMM du prompt sont générés en
+ISA par nGEN au moment du build (`zig/tools/xpu/w4_ngen.cpp`) ; tout est embarqué dans l'exécutable.
+
+## Lancer
+
+```sh
+tensorfold-native serve MODELE --drafter DFLASH2 --context 16384 --host 127.0.0.1 --port 8081
+```
+
+Options par variables d'environnement :
+
+| Variable | Effet |
+|---|---|
+| `XPU_PREFILL_INT8=1` | **Option locale** : GEMM du prompt en W4A8, activations int8 par (ligne, groupe de 128), GPTQ seulement. Le décodage reste en fp16. |
+| `XPU_TREE=N` | Nœuds de l'arbre DFlash2 par tour (15 par défaut ; 0 : une chaîne) |
+| `XPU_BLOCK=N` | Lignes du bloc du brouillonneur (8) |
+
+## Chiffres (B70 à 230 W, serveur, un flux)
+
+| | MLX g64 | GPTQ g128 | GPTQ g128 + W4A8 |
+|---|---|---|---|
+| Préremplissage 1 k / 4 k / 8 k jetons | 1 612 / 1 600 / 1 566 tok/s | 1 765 / 1 747 / 1 710 tok/s | 2 218 / 2 337 / 2 294 tok/s |
+| Décodage série | 33,1 tok/s | 34,8 tok/s | 34,8 tok/s |
+| Arbre DFlash2, code / chat, glouton | 133,1 / 98,7 tok/s | 137,2 / 93,3 tok/s | 137,5 / 99,5 tok/s |
+| Arbre DFlash2, code / chat, température 1 | 123,4 / 96,9 tok/s | 117,1 / 93,6 tok/s | 117,5 / 93,8 tok/s |
+
+Bancs : `bench_openai.py` (préremplissage, décodage) et `bench_concurrent.py --alone --serial` (brouillons), dans
+`tools/` de la branche `main` de ce dépôt. Le débit drafté dépend du texte produit ; les deux formats n'écrivent pas le même.
+
+Le préremplissage est **borné par la puissance** : à 230 W, la carte tourne à ~2 180 MHz pendant un prompt (PL2),
+pas aux 2 600 du DPAS pur. Le GEMM gate|up seul tient 146 TFLOPS fp16 et ~209 TOPS en int8.
+
+## Justesse : ce qui est vérifié
+
+- **Oracle** : les jetons gloutons égalent ceux de la référence torch fp32 du portage Python (même prompt, 32
+  jetons), en MLX et en GPTQ, avec et sans W4A8.
+- **Drafté == série** : bit à bit, avec des brouillons parfaits, faux et réels, en chaîne et en arbre, en glouton
+  et en échantillonné (`xpu-qwen27` avec `XPU_VERIFY_TEST`, et `bench_concurrent --alone --serial` sur le serveur).
+- **W4A8** : perplexité sur trois textes bruts (anglais, code, français) +0,04 à +0,13 %, KL ≈ 3e-3 face au fp16 ;
+  pour comparaison, MLX et GPTQ s'écartent l'un de l'autre de 0,06 à 0,11 en KL
+  (`tools/xpu/a8_study.py`).
+- **Mesurer sur du texte brut** : dans un tour utilisateur de chat, le modèle (référence fp32 comprise) prédit mal
+  le jeton suivant, car il n'est entraîné que sur les réponses. Les perplexités y sont sans signification.
+
+## Organisation du code
+
+| Fichier | Rôle |
+|---|---|
+| `zig/src/xpu/ze.zig` | Accès à Level Zero : mémoire, modules, noyaux, listes de commandes |
+| `zig/src/xpu/qwen27.zig` | Le modèle : chargement (MLX, GPTQ), forward couche par couche, `Runner` (`prompt`, `step`, `verify`, `verifyTree`, `commit`, `commitPath`) |
+| `zig/src/xpu/drafter.zig` | DFlash2 : contexte de taps, bloc proposé, sélecteur, arbre best-first, `treeRound` |
+| `zig/src/native/xpu.zig` | La prise sur le serveur (`serial_host`) : prompt, tirage, tours draftés |
+| `zig/src/xpu/qwen27_main.zig` | Exécutable de test : oracle, contrats, profils, sondes |
+| `zig/kernels/xpu/qwen27/*.cl` | Noyaux OpenCL C : GEMM int4 du décodage, GDN par morceaux et en série, attention de décodage, normes, SwiGLU, quantification int8, brouillonneur |
+| `zig/kernels/xpu/qwen27/triton/prompt_attention.spv` | Attention du prompt (noyau Triton du portage Python, en SPIR-V) |
+| `zig/tools/xpu/w4_ngen.cpp` | Générateur nGEN des GEMM du prompt : int4 fp16 (`w4g_dpb`, `w4g_s4dpb`, épilogue SwiGLU) et W4A8 (`w4a8`) |
+| `zig/build/xpu.zig` | Étapes de build |
+
+Seul fichier du cœur modifié : `zig/src/core/serial_host.zig` (9 lignes, `draft_sampled` : brouillons pour les
+requêtes échantillonnées ; `null` pour les autres backends, `zig build test` passe).
+
+## Exécutable de test
+
+```sh
+xpu-qwen27 MODELE ids.txt 32          # prompt (ids séparés par des espaces), 32 jetons gloutons, temps
+xpu-qwen27 MODELE --bench=4096 2      # prompt synthétique de 4 096 jetons (attention : ne remplace pas de vrais jetons)
+```
+
+| Variable | Effet |
+|---|---|
+| `XPU_DRAFTER=DIR`, `XPU_TREE`, `XPU_BLOCK` | tours draftés, comparés à la série |
+| `XPU_VERIFY_TEST=1` | contrat drafté == série avec des brouillons parfaits et faux |
+| `XPU_PROFILE=1` | temps GPU par noyau |
+| `XPU_DUMP_H=FICHIER` | états cachés finaux de chaque ligne (études de justesse) |
+| `XPU_A8=128` ou `token`, `XPU_A8_SITES` | étude W4A8 : quantification simulée des entrées des GEMM du prompt |
+| `XPU_CHUNK`, `XPU_CTX` | lignes par morceau de prompt (1 024), contexte (4 096) |
+| `XPU_OVERLAP_PROBE`, `XPU_GEMM_ZEBIN`, `XPU_A8_ZEBIN` (+ `XPU_A8_PROJ`) | sondes : recouvrement GEMM/GDN, GEMM fp16 ou W4A8 en boucle |
+
+## Limites
+
+- Un seul modèle : les dimensions du 27B sont des constantes (`qwen27.zig`) et certaines formes sont écrites dans
+  les noyaux (GDN de 128, attention de 256, rapport de têtes 6).
+- Un flux à la fois ; pas encore de cache de préfixes ni de reprise de réponse (`decode_chunk`).
+- Formats 4 bits seulement (MLX g64, GPTQ g128 symétrique). Le W4A8 demande le GPTQ g128.
+- Les commentaires des noyaux sont en français : à passer en anglais avant toute proposition amont.
