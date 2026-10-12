@@ -733,3 +733,5 @@ pub const Runner = struct {
         return std.mem.sliceTo(&r.d.g.props.name, 0);
     }
 };
+
+pub const drafter = @import("drafter.zig");
