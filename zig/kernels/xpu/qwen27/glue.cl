@@ -278,20 +278,24 @@ KERNEL(256) void gdn_pre_rows(global const half *P, global const half *CIN, glob
   // le même ordre que ligne par ligne : mêmes bits.
   const int t0 = get_group_id(0) * 8, sg = get_sub_group_id(), lane = get_sub_group_local_id(), lid = get_local_id(0);
   const int head = get_group_id(1) * 16 + sg;
+  // lectures et écritures en bloc de sous-groupe : l'élément i du couloir est le canal 128 tête + 16 i + couloir
+#define ROW8(r) as_half8((r) < 3 ? intel_sub_group_block_read_us8((global const ushort *)(CIN + (r) * NCONV + head * 128)) \
+                                 : intel_sub_group_block_read_us8((global const ushort *)(P + (long)((r) - 3) * 16640 + head * 128)))
   float w[8][4], x[8][3];
   for (int i = 0; i < 8; i++) {
     const int c = head * 128 + i * 16 + lane;
     for (int j = 0; j < 4; j++) w[i][j] = bf2f(CW[c * 4 + j]);
-    for (int j = 0; j < 3; j++) {
-      const int r = t0 + j;
-      x[i][j] = r < 3 ? (float)CIN[r * NCONV + c] : (float)P[(long)(r - 3) * 16640 + c];
-    }
+  }
+  for (int j = 0; j < 3; j++) {
+    const half8 xr = ROW8(t0 + j);
+    for (int i = 0; i < 8; i++) x[i][j] = (float)xr[i];
   }
   for (int t = t0; t < min(t0 + 8, T); t++) {
     float v[8], ss = 0.0f;
+    const half8 x3r = ROW8(t + 3);
     for (int i = 0; i < 8; i++) {
-      const int c = head * 128 + i * 16 + lane, r = t + 3;
-      const float x3 = r < 3 ? (float)CIN[r * NCONV + c] : (float)P[(long)(r - 3) * 16640 + c];
+      const int c = head * 128 + i * 16 + lane;
+      const float x3 = (float)x3r[i];
       float s = 0.0f;
       s += x[i][0] * w[i][0];
       s += x[i][1] * w[i][1];
@@ -306,13 +310,17 @@ KERNEL(256) void gdn_pre_rows(global const half *P, global const half *CIN, glob
       if (T < 3 && t == 0)
         for (int q = 0; q < 3 - T; q++) COUT[q * NCONV + c] = CIN[(q + T) * NCONV + c];
     }
+    ushort8 o;
     if (head < 32) {
       const float inv = rsqrt(sub_group_reduce_add(ss) / 128.0f + 1e-6f);
       const float scale = head < 16 ? 1.0f / 128.0f : rsqrt(128.0f);
       global ushort *dst = head < 16 ? Q + ((long)t * 16 + head) * 128 : K + ((long)t * 16 + head - 16) * 128;
-      for (int i = 0; i < 8; i++) dst[i * 16 + lane] = f2bf(v[i] * inv * scale);
-    } else
-      for (int i = 0; i < 8; i++) V[(long)t * 6144 + (head - 32) * 128 + i * 16 + lane] = f2bf(v[i]);
+      for (int i = 0; i < 8; i++) o[i] = f2bf(v[i] * inv * scale);
+      intel_sub_group_block_write_us8(dst, o);
+    } else {
+      for (int i = 0; i < 8; i++) o[i] = f2bf(v[i]);
+      intel_sub_group_block_write_us8(V + (long)t * 6144 + (head - 32) * 128, o);
+    }
     if (get_group_id(1) == 0 && lid < 48) {
       const float a = (float)P[(long)t * 16640 + 16384 + lid], b = (float)P[(long)t * 16640 + 16432 + lid];
       const float sp = a + bf2f(DT[lid]);
@@ -322,6 +330,7 @@ KERNEL(256) void gdn_pre_rows(global const half *P, global const half *CIN, glob
     }
   }
 }
+#undef ROW8
 
 // Après la récurrence : out = fp16(bf16(SiLU(z)·rms(y)·w)) par tête de 128, et ses sommes de ligne (K = 6 144), ou
 // (A8) sa quantification W4A8 pour la sortie du mixer.
@@ -331,21 +340,23 @@ KERNEL(256) void gated_norm(global const ushort *Y, global const half *P, global
                             global float *SA, int MS) {
   local half hl[6144];
   const int t = get_group_id(0), sg = get_sub_group_id(), lane = get_sub_group_local_id();
+  const ushort8 wn = intel_sub_group_block_read_us8(WN);   // élément i du couloir : 16 i + couloir (lectures en bloc)
   for (int hh = sg; hh < 48; hh += 16) {
+    const ushort8 yv = intel_sub_group_block_read_us8(Y + ((long)t * 48 + hh) * 128);
+    const half8 zv = as_half8(intel_sub_group_block_read_us8((global const ushort *)(P + (long)t * 16640 + 10240 + hh * 128)));
     float v[8], ss = 0.0f;
     for (int i = 0; i < 8; i++) {
-      v[i] = bf2f(Y[((long)t * 48 + hh) * 128 + i * 16 + lane]);
+      v[i] = bf2f(yv[i]);
       ss += v[i] * v[i];
     }
     const float inv = rsqrt(sub_group_reduce_add(ss) / 128.0f + eps);
+    half8 o;
     for (int i = 0; i < 8; i++) {
-      const int e = hh * 128 + i * 16 + lane;
-      const float yn = v[i] * inv * bf2f(WN[i * 16 + lane]);
-      const float z = (float)P[(long)t * 16640 + 10240 + e];
-      const half o = convert_half_rte(rbf(silu(z) * yn));
-      if (!rot) H[(long)t * 6144 + e] = o;
-      hl[e] = o;
+      const float yn = v[i] * inv * bf2f(wn[i]);
+      o[i] = convert_half_rte(rbf(silu((float)zv[i]) * yn));
+      hl[hh * 128 + i * 16 + lane] = o[i];
     }
+    if (!rot) intel_sub_group_block_write_us8((global ushort *)(H + (long)t * 6144 + hh * 128), as_ushort8(o));
   }
   barrier(CLK_LOCAL_MEM_FENCE);
   out_rows(hl, 6144, H, t, rot, gs, A8, SA, MS, AHI, ALO);
@@ -467,13 +478,16 @@ KERNEL(256) void attn_prep(global const half *P, global const ushort *QN, global
 KERNEL(256) void attn_gate(global const ushort *O, global const half *P, global half *H, global half *AHI,
                            global half *ALO, int gs, int rot, global char *A8, global float *SA, int MS) {
   local half hl[6144];
-  const int t = get_group_id(0);
-  for (int e = get_local_id(0); e < 6144; e += 256) {
-    const int hh = e / 256, d = e % 256;
-    const float g = (float)P[(long)t * 14336 + hh * 512 + 256 + d];
-    const half o = convert_half_rte(rbf(bf2f(O[(long)t * 6144 + e]) * sigmoid_f(g)));
-    if (!rot) H[(long)t * 6144 + e] = o;
-    hl[e] = o;
+  const int t = get_group_id(0), lane = get_sub_group_local_id();
+  for (int b = get_sub_group_id(); b < 48; b += get_num_sub_groups()) {   // blocs de 128, lectures en bloc
+    const ushort8 ov = intel_sub_group_block_read_us8(O + (long)t * 6144 + b * 128);
+    const half8 gv = as_half8(intel_sub_group_block_read_us8((global const ushort *)(P + (long)t * 14336 + (b / 2) * 512 + 256 + (b % 2) * 128)));
+    half8 o;
+    for (int i = 0; i < 8; i++) {
+      o[i] = convert_half_rte(rbf(bf2f(ov[i]) * sigmoid_f((float)gv[i])));
+      hl[b * 128 + i * 16 + lane] = o[i];
+    }
+    if (!rot) intel_sub_group_block_write_us8((global ushort *)(H + (long)t * 6144 + b * 128), as_ushort8(o));
   }
   barrier(CLK_LOCAL_MEM_FENCE);
   out_rows(hl, 6144, H, t, rot, gs, A8, SA, MS, AHI, ALO);
