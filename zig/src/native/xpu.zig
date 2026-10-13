@@ -231,7 +231,7 @@ fn openLanes(gpa: Allocator, io: std.Io, runner: *xq.Runner, drafter: ?*Drafter,
     errdefer h.core.deinit();
     h.host = api.LaneHost.init(gpa, io, &h.core, .{ .name = "qwen27-xpu", .lanes = slots, .context_window = context, .prefill_step = 1024 });
     if (drafter != null) {
-        try h.back.initRing();
+        h.back.initDrafts();
         h.host.lone = .{ .ctx = &h.back, .run = XpuLanes.lone, .@"resume" = XpuLanes.resumeLone, .sampled = true };
     }
     try h.host.start();
