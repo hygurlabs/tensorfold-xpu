@@ -42,9 +42,9 @@ Avec `--parallel N` (N > 1), chaque flux a son emplacement sur la carte : état 
 sauvegarde pour la vérification) et cache K/V (64 Ko par jeton de `--context`). Le nombre d'emplacements est borné
 par la mémoire restante après le chargement (`slotsThatFit`). Un flux seul qui demande des brouillons tourne en
 arbre DFlash2. Dès qu'un autre arrive, le cœur le reprend dans des tours partagés : un forward pour les fenêtres de
-tous les flux (chacune une chaîne : le jeton en attente, puis les copies du contexte ou une chaîne DFlash2), 16 lignes
-au plus. Chaque emplacement a son contexte DFlash2 (K/V du brouillonneur en anneau de 2 080 positions, ~42 Mo) qui
-absorbe toutes ses lignes gardées ; les chaînes de tous les flux sont proposées en une passe du brouillonneur. Quand
+tous les flux (le jeton en attente, puis les copies du contexte en chaîne, ou les brouillons DFlash2 du flux : un arbre
+à partir de 5 brouillons, une chaîne en dessous), 16 lignes au plus. Chaque emplacement a son contexte DFlash2 (K/V du brouillonneur en anneau de 2 080 positions, ~42 Mo) qui
+absorbe toutes ses lignes gardées ; les brouillons de tous les flux sont proposés en une passe du brouillonneur. Quand
 les autres flux finissent, celui qui reste repasse en arbre DFlash2 (`Lone.resume`).
 
 Options par variables d'environnement :
@@ -62,15 +62,15 @@ Options par variables d'environnement :
 
 | | MLX g64 | GPTQ g128 | GPTQ g128 + W4A8 | RTN tourné + W4A4 |
 |---|---|---|---|---|
-| Préremplissage 1 k / 4 k / 8 k jetons (tok/s) | 1 764 / 1 754 / 1 723 | 1 956 / 1 932 / 1 918 | 2 576 / 2 554 / 2 505 | 2 791 / 2 769 / 2 714 |
-| Un flux seul, arbre DFlash2, code / chat, glouton | 128 / 98 | 132 / 89 | 132 / 96 | 125 / 98 |
-| 2 / 4 / 8 flux simultanés, code, glouton (agrégé) | 197 / 293 / 324 | 222 / 309 / 269 | 222 / 309 / 269 | 202 / 287 / 260 |
-| 2 / 4 / 8 flux simultanés, chat, glouton (agrégé) | 143 / 238 / 299 | 129 / 216 / 207 | 153 / 230 / 223 | 155 / 249 / 226 |
-| Décodage `bench_openai`, 1 / 2 / 4 / 8 requêtes (agrégé) | 172 / 245 / 340 / 345 | 165 / 304 / 336 / 469 | 165 / 321 / 364 / 457 | 178 / 308 / 366 / 474 |
+| Préremplissage 1 k / 4 k / 8 k jetons (tok/s) | 1 783 / 1 772 / 1 742 | 1 975 / 1 965 / 1 930 | 2 617 / 2 585 / 2 540 | 2 830 / 2 811 / 2 754 |
+| Un flux seul, arbre DFlash2, code / chat, glouton | 129 / 98 | 133 / 90 | 133 / 97 | 126 / 99 |
+| 2 / 4 / 8 flux simultanés, code, glouton (agrégé) | 211 / 294 / 326 | 235 / 310 / 270 | 235 / 310 / 270 | 222 / 288 / 260 |
+| 2 / 4 / 8 flux simultanés, chat, glouton (agrégé) | 151 / 239 / 300 | 148 / 215 / 208 | 162 / 230 / 224 | 162 / 249 / 227 |
+| Décodage `bench_openai`, 1 / 2 / 4 / 8 requêtes (agrégé) | 173 / 243 / 343 / 350 | 165 / 300 / 337 / 439 | 165 / 336 / 367 / 456 | 179 / 325 / 364 / 463 |
 
-Avant les chaînes DFlash2 par flux (copies seules dans les tours partagés), 2 / 4 / 8 flux de code faisaient
-64 / 120 / 182 tok/s en GPTQ. Validation : `zig build test`, oracle, drafté == série, multi-flux == série, et
-`bench_concurrent --alone --serial` sur 1, 2, 4 et 8 flux, en glouton et en échantillonné, pour les quatre
+Avant les brouillons DFlash2 par flux (copies seules dans les tours partagés), 2 / 4 / 8 flux de code faisaient
+64 / 120 / 182 tok/s en GPTQ. Validation : `zig build test`, oracle, drafté == série, multi-flux == série (chaînes et
+arbres), et `bench_concurrent --alone --serial` sur 1, 2, 4 et 8 flux, en glouton et en échantillonné, pour les quatre
 configurations : 64 cellules toutes égales, aucune erreur dans les journaux des serveurs.
 
 Bancs : `bench_openai.py` (préremplissage, décodage) et `bench_concurrent.py --alone --serial` (brouillons), dans
@@ -127,7 +127,7 @@ xpu-qwen27 MODELE --bench=4096 2      # prompt synthétique de 4 096 jetons (att
 |---|---|
 | `XPU_DRAFTER=DIR`, `XPU_TREE`, `XPU_BLOCK` | tours draftés, comparés à la série |
 | `XPU_VERIFY_TEST=1` | contrat drafté == série avec des brouillons parfaits et faux |
-| `XPU_MULTI_TEST=N` | contrat multi-flux : N emplacements, tours partagés (une ligne, puis fenêtres de 4 lignes) == série, et débit agrégé |
+| `XPU_MULTI_TEST=N` | contrat multi-flux : N emplacements, tours partagés (une ligne, fenêtres de 4 lignes, puis arbres de 7 lignes) == série, et débit agrégé |
 | `XPU_ROWS_PROBE=1` | coût d'un forward de 1 à 16 lignes |
 | `XPU_PROFILE=1` | temps GPU par noyau |
 | `XPU_DUMP_H=FICHIER` | états cachés finaux de chaque ligne (études de justesse) |
@@ -139,8 +139,7 @@ xpu-qwen27 MODELE --bench=4096 2      # prompt synthétique de 4 096 jetons (att
 
 - Un seul modèle : les dimensions du 27B sont des constantes (`qwen27.zig`) et certaines formes sont écrites dans
   les noyaux (GDN de 128, attention de 256, rapport de têtes 6).
-- En multi-flux, les tours partagés vérifient des chaînes (pas d'arbre DFlash2 par flux). Sur un texte très répétitif,
-  où les copies suffisent, la passe du brouillonneur coûte ~6-9 % à 4-8 flux. Pas encore de cache de préfixes ni de
-  reprise de réponse (`decode_chunk`).
+- Sur un texte très répétitif, où les copies suffisent, la passe du brouillonneur des tours partagés coûte quelques
+  pourcents à 4-8 flux. Pas encore de cache de préfixes ni de reprise de réponse (`decode_chunk`).
 - Formats 4 bits seulement (MLX g64, GPTQ g128 symétrique). Le W4A8 demande le GPTQ g128.
 - Les commentaires des noyaux sont en français : à passer en anglais avant toute proposition amont.
