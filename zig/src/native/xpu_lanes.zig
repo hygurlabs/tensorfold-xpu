@@ -13,6 +13,7 @@ const Allocator = std.mem.Allocator;
 
 const ring = 64;
 const TAP_ROW = 5 * xq.D * 2; // bf16 [5 D]
+const TREE_MIN = 5; // drafts from which a stream's window is a DFlash2 tree (below: its chain)
 
 pub const Lanes = struct {
     gpa: Allocator,
@@ -33,7 +34,8 @@ pub const Lanes = struct {
     wslots: [16]u32 = undefined, // and each window's slot
     wfirst: [16]u32 = undefined, // and its first row
     absorbed: [16]bool = @splat(false), // the window's kept rows already in its slot's drafter context
-    chain: [xq.MAX_SLOTS][16]u32 = undefined, // each slot's DFlash2 chain for its next window
+    chain: [xq.MAX_SLOTS][16]u32 = undefined, // each slot's DFlash2 drafts for its next window (a tree)
+    chain_par: [xq.MAX_SLOTS][16]i32 = undefined, // and each one's parent (−1: the pending token)
     chain_n: [xq.MAX_SLOTS]u32 = @splat(0),
     prompt_skip: u32 = 0, // a prefill's first rows the drafter never reads (further than WIN from the prompt's end)
 
@@ -67,39 +69,45 @@ pub const Lanes = struct {
         if (k < n) try d.addTaps(xq.off(taps, @as(usize, k) * TAP_ROW), n - k);
     }
 
-    /// The last verify's windows `which`: each one's first `keep[i]` rows' taps into its slot's drafter context, in
-    /// one pass.
-    fn absorb(b: *Lanes, which: []const usize, keep: []const u32) !void {
+    /// The last verify's windows `which`: the taps of each one's kept path (rows of the window) into its slot's
+    /// drafter context, in one pass.
+    fn absorb(b: *Lanes, which: []const usize, paths: []const []const u32) !void {
         const d = b.drafter orelse return;
         var items: [16]xq.drafter.Absorb = undefined;
-        for (which, keep, items[0..which.len]) |i, k, *it| {
-            it.* = .{ .slot = b.wslots[i], .taps = xq.off(b.runner.acts.taps, @as(usize, b.wfirst[i]) * TAP_ROW), .n = k };
+        for (which, paths, items[0..which.len]) |i, path, *it| {
+            var straight = true;
+            for (path, 0..) |row, j| straight = straight and row == j;
+            it.* = .{ .slot = b.wslots[i], .taps = xq.off(b.runner.acts.taps, @as(usize, b.wfirst[i]) * TAP_ROW), .n = @intCast(path.len), .rows = if (straight) null else path };
             b.absorbed[i] = true;
         }
         try d.absorbMulti(items[0..which.len]);
     }
 
-    /// Keeps the first `keep[i]` rows of the last verify's window i (their taps to the drafter, unless taken already).
-    fn keepRows(b: *Lanes, keep: []const u32) !void {
+    /// Keeps the root path `paths[i]` of the last verify's window i (its taps to the drafter, unless taken already).
+    fn keepRows(b: *Lanes, paths: []const []const u32) !void {
         var which: [16]usize = undefined;
-        var ks: [16]u32 = undefined;
+        var ps: [16][]const u32 = undefined;
         var n: usize = 0;
-        for (keep, 0..) |k, i| if (!b.absorbed[i]) {
+        for (paths, 0..) |p, i| if (!b.absorbed[i]) {
             which[n] = i;
-            ks[n] = k;
+            ps[n] = p;
             n += 1;
         };
-        try b.absorb(which[0..n], ks[0..n]);
+        try b.absorb(which[0..n], ps[0..n]);
         @memset(&b.absorbed, false);
-        try b.runner.keepMulti(keep);
+        try b.runner.keepPaths(paths);
     }
 
-    /// A verify whose rows all stayed: the core calls keep only to drop rows, so the next call keeps them all first.
+    /// A verify whose rows all stayed: the core calls keep only to drop rows, so the next call keeps them all first
+    /// (chains: a tree window is always kept by the core).
     fn settle(b: *Lanes) !void {
         if (b.count == 0) return;
         const n = b.count;
         b.count = 0;
-        try b.keepRows(b.widths[0..n]);
+        const all = [16]u32{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
+        var paths: [16][]const u32 = undefined;
+        for (paths[0..n], b.widths[0..n]) |*p, w| p.* = all[0..w];
+        try b.keepRows(paths[0..n]);
     }
 
     fn slotOf(b: *const Lanes, s: *const lanes.Stream) ?u32 {
@@ -211,13 +219,12 @@ pub const Lanes = struct {
         var total: usize = 0;
         for (windows, 0..) |w, i| {
             if (w.held > 0) return error.HeldDrafts;
-            if (w.parents) |p| for (p, 0..) |x, j| if (x != @as(i32, @intCast(j)) - 1) return error.TreeWindow;
             const rows = w.rows();
             if (total + rows > 16) return error.WindowTooWide;
             const ids = b.ids[total..][0..rows];
             ids[0] = w.pending;
             @memcpy(ids[1..], w.tokens);
-            wins[i] = .{ .slot = b.slotOf(w.stream) orelse return error.UnknownStream, .ids = ids };
+            wins[i] = .{ .slot = b.slotOf(w.stream) orelse return error.UnknownStream, .ids = ids, .parents = w.parents };
             b.wslots[i] = wins[i].slot;
             b.wfirst[i] = @intCast(total);
             b.widths[i] = @intCast(rows);
@@ -240,18 +247,13 @@ pub const Lanes = struct {
         b.count = windows.len;
     }
 
-    /// Each window keeps a prefix of its chain.
+    /// Each window keeps a root path (a prefix of its chain, or a path down its tree).
     fn keepFn(ptr: *anyopaque, windows: []const be.Window, paths: []const []const u32) anyerror!void {
         const b = self(ptr);
         if (windows.len != b.count or paths.len != b.count) return error.NothingToKeep;
-        var keep: [16]u32 = undefined;
-        for (paths, 0..) |p, i| {
-            if (p.len == 0) return error.NothingToKeep;
-            for (p, 0..) |row, j| if (row != j) return error.TreePath;
-            keep[i] = @intCast(p.len);
-        }
+        for (paths) |p| if (p.len == 0) return error.NothingToKeep;
         b.count = 0;
-        try b.keepRows(keep[0..paths.len]);
+        try b.keepRows(paths);
     }
 
     /// Each asked stream's DFlash2 chain for its next window, all in one drafter pass: in a shared round before the
@@ -260,10 +262,11 @@ pub const Lanes = struct {
         const b = self(ptr);
         const d = b.drafter orelse return;
         var which: [16]usize = undefined;
-        var ks: [16]u32 = undefined;
+        var ps: [16][]const u32 = undefined;
         var na: usize = 0;
         var items: [16]xq.drafter.Block = undefined;
         var asked: [16]u32 = undefined;
+        var reqs: [16]*const be.DraftRequest = undefined;
         var ni: usize = 0;
         var depth: u32 = 0;
         for (requests) |q| {
@@ -271,30 +274,42 @@ pub const Lanes = struct {
             b.chain_n[slot] = 0;
             if (q.rows) |rows| if (b.count > 0) {
                 const i = std.mem.indexOfScalar(u32, b.wslots[0..b.count], slot) orelse return error.UnknownStream;
-                for (rows, 0..) |row, j| if (row != j) return error.TreePath;
                 if (!b.absorbed[i]) {
                     which[na] = i;
-                    ks[na] = @intCast(rows.len);
+                    ps[na] = rows;
                     na += 1;
                 }
             };
             if (q.depth == 0 or ni == items.len) continue;
             items[ni] = .{ .slot = slot, .pending = if (q.rows != null) q.follow[q.follow.len - 1] else try b.value(q.first orelse return error.NoFirstToken) };
-            asked[ni] = @min(q.depth, b.block - 1);
-            depth = @max(depth, asked[ni]);
+            asked[ni] = @min(q.depth, b.nodes);
+            reqs[ni] = &q;
+            depth = @max(depth, @min(asked[ni], b.block - 1));
             ni += 1;
         }
-        try b.absorb(which[0..na], ks[0..na]);
+        try b.absorb(which[0..na], ps[0..na]);
         if (ni == 0) return;
         for (requests) |q| if (q.depth > 0) {
             try d.use(b.slotOf(q.stream).?);
             if (d.end() + 1 != q.position) return error.BadDraftPosition;
         };
         try d.latticeMulti(items[0..ni], depth);
-        for (items[0..ni], asked[0..ni], 0..) |it, n, i| {
+        // each stream's best-first tree of its asked drafts over its lattice (a sampled stream's with the target's
+        // keyed noise at its positions, as the lone driver's trees)
+        for (items[0..ni], asked[0..ni], reqs[0..ni], 0..) |it, n, q, i| {
             d.take(i);
-            d.chain(it.pending, n, b.chain[it.slot][0..n]);
-            b.chain_n[it.slot] = n;
+            var noise: [16][xq.drafter.TOPK]f64 = undefined;
+            const sp = q.stream.sampling;
+            if (sp) |x| for (0..depth) |dd| for (0..xq.drafter.TOPK) |j| {
+                noise[dd][j] = -@log(-@log(lanes.sampling.uniform(x.seed, q.position + dd, d.cand[dd][j])));
+            };
+            if (n < TREE_MIN) { // few drafts: a chain goes deeper than a tree of siblings
+                d.chain(it.pending, n, b.chain[it.slot][0..n]);
+                for (b.chain_par[it.slot][0..n], 0..) |*x, j| x.* = @as(i32, @intCast(j)) - 1;
+                b.chain_n[it.slot] = n;
+                continue;
+            }
+            b.chain_n[it.slot] = d.tree(it.pending, n, if (sp != null) &noise else null, if (sp) |x| x.temperature else 1.0, b.chain[it.slot][0..n], b.chain_par[it.slot][0..n]);
         }
     }
 
@@ -306,8 +321,7 @@ pub const Lanes = struct {
         b.chain_n[slot] = 0;
         const tokens = try gpa.dupe(u32, b.chain[slot][0..n]);
         errdefer gpa.free(tokens);
-        const parents = try gpa.alloc(i32, n);
-        for (parents, 0..) |*p, i| p.* = @as(i32, @intCast(i)) - 1;
+        const parents = try gpa.dupe(i32, b.chain_par[slot][0..n]); // by draft, −1 the pending token
         return .{ .count = n, .tokens = tokens, .parents = parents };
     }
 

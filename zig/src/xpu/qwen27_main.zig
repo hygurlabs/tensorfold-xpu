@@ -368,6 +368,75 @@ fn multiTest(r: *q.Runner, prompt: []const u32, n: u32) !void {
         const at = std.mem.indexOfDiff(u32, got[k][0..steps], &serial[k]);
         if (at) |x| std.debug.print("  slot {d} differs at token {d}\n", .{ k, x });
     };
+    // shared tree windows of 7 rows (parents −1 0 0 2 1 3 3): even slots' serial reply down rows 2, 3, 5 (a parent
+    // that is not the row before), odd slots' at row 1 only; the walk keeps a root path, keepPaths replays it
+    @memset(&have, 0);
+    for (0..n) |k| {
+        try r.select(@intCast(k));
+        try r.reset();
+        try r.prompt(prompt[k % 8 ..], true);
+    }
+    const par = [7]i32{ -1, 0, 0, 2, 1, 3, 3 };
+    var trounds: usize = 0;
+    while (true) {
+        var wins: [16]q.Runner.Win = undefined;
+        var tids: [16][7]u32 = undefined;
+        var nw: usize = 0;
+        var rows: usize = 0;
+        for (0..n) |k| {
+            if (have[k] >= steps or rows + 7 > 16) continue;
+            const x = &tids[k];
+            x.* = .{ if (k == r.slot) r.last else r.seqs[k].last, 7, 0, 0, 11, 0, 13 };
+            const at = have[k];
+            const sv = struct {
+                fn f(row: []const u32, i: usize) u32 {
+                    return if (i < row.len) row[i] else 0;
+                }
+            }.f;
+            if (k % 2 == 0) {
+                x[2] = sv(&serial[k], at + 1);
+                x[3] = sv(&serial[k], at + 2);
+                x[5] = sv(&serial[k], at + 3);
+            } else x[1] = sv(&serial[k], at + 1);
+            wins[nw] = .{ .slot = @intCast(k), .ids = x, .parents = &par };
+            nw += 1;
+            rows += 7;
+        }
+        if (nw == 0) break;
+        try r.verifyMulti(wins[0..nw]);
+        var pbuf: [16][7]u32 = undefined;
+        var paths: [16][]const u32 = undefined;
+        var row0: usize = 0;
+        for (wins[0..nw], 0..) |w, i| {
+            var len: usize = 1;
+            pbuf[i][0] = 0;
+            walk: while (true) {
+                const cur = pbuf[i][len - 1];
+                for (1..7) |c| if (par[c] == @as(i32, @intCast(cur)) and w.ids[c] == r.block[row0 + cur]) {
+                    pbuf[i][len] = @intCast(c);
+                    len += 1;
+                    continue :walk;
+                };
+                break;
+            }
+            paths[i] = pbuf[i][0..len];
+            const k = w.slot;
+            for (paths[i]) |c| if (have[k] < steps + 8) {
+                got[k][have[k]] = w.ids[c];
+                have[k] += 1;
+            };
+            row0 += 7;
+        }
+        try r.keepPaths(paths[0..nw]);
+        trounds += 1;
+    }
+    var equalt = true;
+    for (0..n) |k| equalt = equalt and std.mem.eql(u32, got[k][0..steps], &serial[k]);
+    std.debug.print("multi test: tree windows of 7 rows, {d} rounds, equal to serial: {}\n", .{ trounds, equalt });
+    if (!equalt) for (0..n) |k| {
+        const at = std.mem.indexOfDiff(u32, got[k][0..steps], &serial[k]);
+        if (at) |x| std.debug.print("  slot {d} differs at token {d}\n", .{ k, x });
+    };
     var m: u32 = 1;
     while (m <= n) : (m *= 2) {
         var best: f64 = 1e9;

@@ -526,6 +526,7 @@ pub const Acts = struct {
     chain: *anyopaque, // i32 [16, 17]: the tree table of a chain (row t at depth t), for the decode attention
     tree: *anyopaque, // i32 [16, 17]: the verified block's tree table (decode.cl, DEPTH and ANC)
     path: *anyopaque, // i32 [16]: the rows of the kept path
+    mpath: *anyopaque, // i32 [16, 2, 16]: keepPaths' per-window paths, rows of the block then rows of the window
     sl: *anyopaque, // fp32 [16, 48, 128, 128]: GDN state after each row of a verified tree
     mt: *anyopaque, // u64 [LAYERS, 16, 8]: stepMulti's per-row state addresses
     mpos: *anyopaque, // i32 [16]: and positions
@@ -546,7 +547,7 @@ pub const Acts = struct {
             .pm = try d.alloc_(16 * 24 * ns * 4), .pl = try d.alloc_(16 * 24 * ns * 4), .po = try d.alloc_(16 * 24 * ns * 256 * 4),
             .pscr = try d.alloc_(CHUNK * D * 4), .logits = try d.alloc_(16 * VOCAB * 2), .tok = try d.alloc_(16 * 4), .pv = try d.alloc_(16 * 1024), .pi = try d.alloc_(16 * 1024), .taps = try d.alloc_(CHUNK * 5 * D * 2), .ids = try d.alloc_(CHUNK * 4),
             .zeros = try d.alloc_(CHUNK * 48 * 128 * 2), .ones = try d.alloc_(CHUNK * 48 * 4),
-            .chain = try d.upload(std.mem.sliceAsBytes(&chainTable())), .tree = try d.alloc_(16 * 17 * 4), .path = try d.alloc_(16 * 4),
+            .chain = try d.upload(std.mem.sliceAsBytes(&chainTable())), .tree = try d.alloc_(16 * 17 * 4), .path = try d.alloc_(16 * 4), .mpath = try d.alloc_(16 * 2 * 16 * 4),
             .sl = try d.alloc_(16 * 48 * 128 * 128 * 4),
             .mt = try d.alloc_(LAYERS * 16 * 8 * 8), .mpos = try d.alloc_(16 * 4),
             .a8 = try d.alloc_(CHUNK * FF), .sa = try d.alloc_((FF / 128) * (CHUNK + 32) * 4),
@@ -791,7 +792,7 @@ fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mode) 
             } else if (T > 16) {                         // the port's Triton prompt kernel: 256 rows a program
                 try d.launch(d.k.prompt_attn, .{ .x = (T + 255) / 256, .y = 24 }, .{ a.q, l.kc.?, l.vc.?, a.y, @as(i32, @intCast(p0)), t32, @as(i32, @intCast(ctx)), nul, nul });
             } else {
-                try d.launch(d.k.attn_decode, .{ .x = ns, .y = 4, .z = T }, .{ a.q, l.kc.?, l.vc.?, a.pm, a.pl, a.po, @as(i32, @intCast(p0)), @as(i32, @intCast(ns)), @as(f32, 1.0 / 16.0), table, mt, mpos, kvCap() });
+                try d.launch(d.k.attn_decode, .{ .x = ns, .y = 4, .z = T }, .{ a.q, l.kc.?, l.vc.?, a.pm, a.pl, a.po, @as(i32, @intCast(p0)), @as(i32, @intCast(ns)), @as(f32, 1.0 / 16.0), if (mode.multi != null) tree else table, mt, mpos, kvCap() });
                 try d.launch(d.k.attn_merge, .{ .x = 24, .y = T }, .{ a.pm, a.pl, a.po, a.y, @as(i32, @intCast(p0)), @as(i32, @intCast(ns)), table, mpos });
             }
             if (kv8 & 1 != 0) try d.launch(d.k.rot_heads, .{ .x = T, .y = 24 }, .{a.y});
@@ -916,6 +917,8 @@ pub const Runner = struct {
     ids_host: [16]u32 = @splat(0),
     multi_slots: [16]u32 = @splat(0), // the last verifyMulti's slots, by window
     multi_count: u32 = 0,
+    multi_tree: bool = false, // the last verifyMulti had tree windows: every window's states are replayed at the keep
+    mpath_host: [16 * 2 * 16]i32 = @splat(0),
     seqs: [MAX_SLOTS]struct { pos: u32 = 0, last: u32 = 0 } = @splat(.{}),
     /// Target hidden states for a drafter: when on, every forward fills acts.taps and calls `on_taps` with its rows.
     taps_on: bool = false,
@@ -1046,7 +1049,8 @@ pub const Runner = struct {
     }
 
     /// A window of a shared verify: `ids` (the slot's pending token, then its drafts as a chain) from its position.
-    pub const Win = struct { slot: u32, ids: []const u32 };
+    /// `parents` (a tree window): each row's parent row in the window (row 0: −1); null: a chain.
+    pub const Win = struct { slot: u32, ids: []const u32, parents: ?[]const i32 = null };
 
     /// Every window in one forward (16 rows at most, one window a slot): each row's greedy token in `block`, its
     /// logits row for `rowLogits`; nothing moves until `keepMulti`. Bits per row equal the slot's one-token steps.
@@ -1068,6 +1072,46 @@ pub const Runner = struct {
             }
             max_pos = @max(max_pos, p + @as(u32, @intCast(w.ids.len)) - 1);
             T += w.ids.len;
+        }
+        // tree windows: one tree table for the block (rows and ancestors numbered in the block), each row at its
+        // window's position plus its depth
+        var tree = false;
+        for (wins) |w| if (w.parents) |pa| {
+            if (pa.len != w.ids.len) return error.BadBlock;
+            for (pa, 0..) |x, j| if (x != @as(i32, @intCast(j)) - 1) {
+                tree = true;
+            };
+        };
+        if (tree) {
+            max_pos = 0;
+            for (wins, 0..) |w, i| {
+                const first: usize = @intCast(r.win_host[2 * i]);
+                const p = r.seqs[w.slot].pos;
+                for (0..w.ids.len) |j| {
+                    const t = first + j;
+                    const row = r.tree_host[t * 17 ..][0..17];
+                    const pj: i32 = if (w.parents) |pa| pa[j] else @as(i32, @intCast(j)) - 1;
+                    if (j == 0) {
+                        if (pj != -1) return error.BadBlock;
+                        row[0] = 0;
+                        row[1] = @intCast(t);
+                    } else {
+                        if (pj < 0 or pj >= j) return error.BadBlock;
+                        const pr = r.tree_host[(first + @as(usize, @intCast(pj))) * 17 ..][0..17];
+                        const dp: usize = @intCast(pr[0] & 255);
+                        row[0] = @intCast(dp + 1);
+                        @memcpy(row[1 .. dp + 2], pr[1 .. dp + 2]);
+                        row[dp + 2] = @intCast(t);
+                        if (pj + 1 != j) { // LOAD: the parent is not the row before; SAVE: a child is not the row after
+                            row[0] |= 512;
+                            pr[0] |= 256;
+                        }
+                    }
+                    r.pos_host[t] = @intCast(p + @as(u32, @intCast(row[0] & 255)));
+                    max_pos = @max(max_pos, p + @as(u32, @intCast(row[0] & 255)));
+                }
+            }
+            try ze.check(r.d.g.api.zeCommandListAppendMemoryCopy(r.d.list, r.acts.tree, &r.tree_host, T * 17 * 4, null, 0, null));
         }
         for (&r.model.layers, 0..) |*l, i| for (wins, 0..) |w, wi| {
             const first: usize = @intCast(r.win_host[2 * wi]);
@@ -1091,41 +1135,78 @@ pub const Runner = struct {
         const d = &r.d;
         try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, r.acts.mt, &r.mt_host, LAYERS * 16 * 8 * 8, null, 0, null));
         try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, r.acts.mpos, &r.pos_host, T * 4, null, 0, null));
-        _ = try forward(d, &r.model, &r.acts, @ptrCast(r.ids_host[0..T]), 0, .{ .want = .rows, .stash = true, .taps = r.taps_on, .multi = .{ .mt = r.acts.mt, .pos = r.acts.mpos, .max_pos = max_pos } });
+        _ = try forward(d, &r.model, &r.acts, @ptrCast(r.ids_host[0..T]), 0, .{ .want = .rows, .stash = true, .taps = r.taps_on, .tree = tree, .multi = .{ .mt = r.acts.mt, .pos = r.acts.mpos, .max_pos = max_pos } });
         var toks: [16]i32 = undefined;
         try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, &toks, r.acts.tok, T * 4, null, 0, null));
         try d.sync();
         for (r.block[0..T], toks[0..T]) |*o, t| o.* = @intCast(t);
         for (wins, 0..) |w, i| r.multi_slots[i] = w.slot;
         r.multi_count = @intCast(wins.len);
+        r.multi_tree = tree;
     }
 
     /// Keeps the first `keep[i]` rows of window i of the last verifyMulti: a whole window takes the state its forward
     /// wrote, a shorter one replays its kept rows from the stash; each slot moves on by its kept rows.
     pub fn keepMulti(r: *Runner, keep: []const u32) !void {
-        if (keep.len != r.multi_count) return error.BadCommit;
+        var rows: [16]u32 = undefined;
+        for (&rows, 0..) |*x, i| x.* = @intCast(i);
+        var paths: [16][]const u32 = undefined;
+        if (keep.len > 16) return error.BadCommit;
+        for (keep, 0..) |k, i| paths[i] = rows[0..@min(k, 16)];
+        return r.keepPaths(paths[0..keep.len]);
+    }
+
+    /// Keeps window i's root path `paths[i]` (rows of the window, [0] = 0, each the parent of the next): a whole chain
+    /// window takes the state its forward wrote; otherwise its GDN and convolution states are replayed along the path
+    /// from the stash and its K/V moved to their positions (after tree windows every window replays).
+    pub fn keepPaths(r: *Runner, paths: []const []const u32) !void {
+        if (paths.len != r.multi_count) return error.BadCommit;
         const d = &r.d;
         const nul: ?*anyopaque = null;
-        for (keep, 0..) |k, i| {
+        for (paths, 0..) |path, i| {
+            const first: u32 = @intCast(r.win_host[2 * i]);
+            const width: u32 = @intCast(r.win_host[2 * i + 1]);
+            if (path.len == 0 or path.len > width or path[0] != 0) return error.BadCommit;
+            for (path, 0..) |row, dd| {
+                if (row >= width or (dd > 0 and row <= path[dd - 1])) return error.BadCommit;
+                r.mpath_host[(i * 2) * 16 + dd] = @intCast(first + row);
+                r.mpath_host[(i * 2 + 1) * 16 + dd] = @intCast(row);
+            }
+        }
+        try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, r.acts.mpath, &r.mpath_host, paths.len * 2 * 16 * 4, null, 0, null));
+        for (paths, 0..) |path, i| {
             const sl = r.multi_slots[i];
             const first: u32 = @intCast(r.win_host[2 * i]);
             const width: u32 = @intCast(r.win_host[2 * i + 1]);
-            if (k == 0 or k > width) return error.BadCommit;
-            for (&r.model.layers) |*l| if (!l.attn) {
+            const k: u32 = @intCast(path.len);
+            var straight = true;
+            for (path, 0..) |row, dd| straight = straight and row == dd;
+            const brows = off(r.acts.mpath, (i * 2) * 16 * 4); // the path in rows of the block
+            const wrows = off(r.acts.mpath, (i * 2 + 1) * 16 * 4); // and of the window
+            for (&r.model.layers) |*l| {
+                if (l.attn) {
+                    if (!straight) try d.launch(d.k.kv_move, .{ .x = 4 }, .{ l.slot_kc[sl].?, l.slot_vc[sl].?, @as(i32, @intCast(r.seqs[sl].pos)), wrows, @as(i32, @intCast(k)), kvCap() });
+                    continue;
+                }
                 const cur = l.slot_cur[sl];
-                if (k == width) {
+                if (k == width and straight and !r.multi_tree) {
                     std.mem.swap(?*anyopaque, &l.slot_rec[sl], &l.slot_save[sl]);
-                } else {
+                } else if (straight and !r.multi_tree) {
                     const st = l.stash.?;
                     try d.launch(d.k.gdn_step, .{ .x = 16, .y = 48 }, .{ off(st, ST_Q + first * 16 * 128 * 2), off(st, ST_K + first * 16 * 128 * 2), off(st, ST_V + first * 48 * 128 * 2), off(st, ST_G + first * 48 * 4), off(st, ST_B + first * 48 * 4), l.slot_rec[sl].?, l.slot_rec[sl].?, r.acts.y, @as(i32, @intCast(k)), nul, nul, nul, nul });
                     try d.launch(d.k.conv_commit, .{ .x = 40 }, .{ l.slot_conv[sl][cur].?, off(st, ST_P + first * GDN_IN * 2), l.slot_conv[sl][1 - cur].?, @as(i32, @intCast(k)), nul });
+                } else {
+                    const st = l.stash.?;
+                    try d.launch(d.k.gdn_step, .{ .x = 16, .y = 48 }, .{ off(st, ST_Q), off(st, ST_K), off(st, ST_V), off(st, ST_G), off(st, ST_B), l.slot_rec[sl].?, l.slot_rec[sl].?, r.acts.y, @as(i32, @intCast(k)), brows, nul, nul, nul });
+                    try d.launch(d.k.conv_commit, .{ .x = 40 }, .{ l.slot_conv[sl][cur].?, off(st, ST_P), l.slot_conv[sl][1 - cur].?, @as(i32, @intCast(k)), brows });
                 }
                 l.slot_cur[sl] = 1 - cur;
-            };
+            }
             r.seqs[sl].pos += k;
-            r.seqs[sl].last = r.block[first + k - 1];
+            r.seqs[sl].last = r.block[first + path[k - 1]];
         }
         r.multi_count = 0;
+        r.multi_tree = false;
         // the selected slot's views follow its arrays
         for (&r.model.layers) |*l| if (!l.attn) {
             l.rec = l.slot_rec[r.slot];
@@ -1133,7 +1214,7 @@ pub const Runner = struct {
             l.conv_cur = l.slot_cur[r.slot];
         };
         r.pos = r.seqs[r.slot].pos;
-        r.last = r.seqs[r.slot].last;
+        r.last = r.seqs[r.slot].last; // mpath_host stays until the next verifyMulti, which waits for the list
     }
 
     /// One token for each of several slots: a verifyMulti of one-row windows, all kept.

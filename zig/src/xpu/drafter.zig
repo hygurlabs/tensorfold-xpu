@@ -71,8 +71,9 @@ const Lat = struct {
 
 /// A block of a batched lattice: a slot's context and its pending token.
 pub const Block = struct { slot: u32, pending: u32 };
-/// Rows to absorb into a slot's context (target taps bf16 [n, 5 D] on the device).
-pub const Absorb = struct { slot: u32, taps: *anyopaque, n: u32 };
+/// Rows to absorb into a slot's context (target taps bf16 [n, 5 D] on the device); `rows`: the n rows of `taps` to take,
+/// in order (a tree's kept path), else its first n.
+pub const Absorb = struct { slot: u32, taps: *anyopaque, n: u32, rows: ?[]const u32 = null };
 
 /// A device-side MLX affine part (words [n, k/8], scales and biases bf16 [n, k/64]) to repack at column n0.
 const Mlx = struct { w: *anyopaque, s: *anyopaque, b: *anyopaque, n: u32 };
@@ -509,7 +510,7 @@ pub const Drafter = struct {
     /// Each item's rows into its slot's context, in one pass (fc, its norm, each layer's k and v).
     pub fn absorbMulti(dr: *Drafter, items: []const Absorb) !void {
         if (items.len == 0) return;
-        if (items.len == 1) {
+        if (items.len == 1 and items[0].rows == null) {
             try dr.use(items[0].slot);
             return dr.addTaps(items[0].taps, items[0].n);
         }
@@ -519,7 +520,9 @@ pub const Drafter = struct {
         for (items, 0..) |it, b| {
             try dr.use(it.slot);
             if (R + it.n > MAXB or it.n > WIN) return error.TooManyRows;
-            try q.copy(d, q.off(dr.tapsbuf, @as(usize, R) * 5 * D * 2), it.taps, @as(usize, it.n) * 5 * D * 2);
+            if (it.rows) |rows| {
+                for (rows[0..it.n], 0..) |row, j| try q.copy(d, q.off(dr.tapsbuf, @as(usize, R + j) * 5 * D * 2), q.off(it.taps, @as(usize, row) * 5 * D * 2), 5 * D * 2);
+            } else try q.copy(d, q.off(dr.tapsbuf, @as(usize, R) * 5 * D * 2), it.taps, @as(usize, it.n) * 5 * D * 2);
             const c = dr.ctx();
             for (0..it.n) |j| dr.rows_host[R + j] = .{ @intCast(c.end + j), 0, 0, @intCast(b) };
             for (0..LAYERS) |li| dr.ptrs_host[li][b] = .{ @intFromPtr(c.kc[li]), @intFromPtr(c.vc[li]) };

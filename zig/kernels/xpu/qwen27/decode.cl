@@ -88,12 +88,17 @@ KERNEL(16) void gdn_step(global const ushort *Q, global const ushort *K, global 
 KERNEL(16) void attn_decode(global const ushort *Q, global const ushort *KC, global const ushort *VC, global float *PM,
                             global float *PL, global float *PO, int p0, int NS, float scale, global const int *TREE,
                             global const ulong *MT, global const int *POS, int cap) {
-  // MT (si non nul) : plusieurs flux, une ligne chacun : caches MT[8t], MT[8t + 1], clés 0 … POS[t] toutes en cache
+  // MT (si non nul) : plusieurs flux, une ligne chacun : caches MT[8t], MT[8t + 1], clés 0 … POS[t] toutes en cache ;
+  // avec TREE aussi (fenêtres en arbre), avant la position de la fenêtre le cache, au-delà les ancêtres, rangés à
+  // POS[première] + (ligne − première)
   // cap > 0 : cache en int8 (256 octets par rangée, échelles après cap · 4 rangées)
   const int sp = get_group_id(0), hk = get_group_id(1), t = get_group_id(2), lane = get_sub_group_local_id();
+  int base = p0, wf = 0;
   if (MT) {
     KC = (global const ushort *)MT[t * 8];
     VC = (global const ushort *)MT[t * 8 + 1];
+    wf = (int)MT[t * 8 + 6];
+    base = TREE ? POS[wf] : 0x7fffffff;
   }
   const int last = MT ? POS[t] : p0 + DEPTH(t), j0 = sp * SPLIT, j1 = min(j0 + SPLIT, last + 1);
   float q[6][16], o[6][16], m[6], l[6];
@@ -106,7 +111,7 @@ KERNEL(16) void attn_decode(global const ushort *Q, global const ushort *KC, glo
     l[a] = 0.0f;
   }
   for (int j = j0; j < j1; j++) {
-    const long kr = (MT || j < p0) ? j : p0 + ANC(t, j - p0); // rangée du cache de la clé j
+    const long kr = j < base ? j : base + ANC(t, j - base) - wf; // rangée du cache de la clé j
     float kv[16];
     if (cap) {
       const global char *k8 = (const global char *)KC + (kr * 4 + hk) * 256;

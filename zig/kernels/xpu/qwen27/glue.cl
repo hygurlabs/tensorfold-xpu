@@ -216,7 +216,8 @@ KERNEL(256) void gdn_pre(global const half *P, global const half *CIN, global ha
                          global const ulong *MT) {
   // MT (si non nul) : plusieurs flux, chacun une chaîne de lignes ; la ligne t, j-ième de sa fenêtre (première ligne
   // MT[8t + 6], largeur MT[8t + 7]), lit l'état d'entrée de son flux en MT[8t + 2] et écrit son état après la fenêtre
-  // en MT[8t + 3]
+  // en MT[8t + 3]. Avec TREE aussi, des fenêtres en arbre : la ligne lit ses ancêtres (lignes du bloc) ; l'état après
+  // la fenêtre est alors refait au keep, le long du chemin gardé.
   local float cv[256];
   const int t = get_group_id(0), blk = get_group_id(1), lid = get_local_id(0), sg = get_sub_group_id();
   const int lane = get_sub_group_local_id(), c = blk * 256 + lid;
@@ -226,15 +227,16 @@ KERNEL(256) void gdn_pre(global const half *P, global const half *CIN, global ha
     COUT = (global half *)MT[t * 8 + 3];
   }
   const int wf = MT ? (int)MT[t * 8 + 6] : 0, ww = MT ? (int)MT[t * 8 + 7] : T;
-  const int dep = MT ? t - wf : TREE ? TREE[t * 17] & 255 : t;
+  const int dep = TREE ? TREE[t * 17] & 255 : MT ? t - wf : t;
   for (int j = 0; j < 4; j++) {
     const int dd = dep - 3 + j;                       // profondeur de l'entrée (négative : l'état d'entrée)
-    const int row = MT ? wf + dd : dd < 0 ? 0 : (TREE ? TREE[t * 17 + 1 + dd] : dd);
+    const int row = dd < 0 ? 0 : TREE ? TREE[t * 17 + 1 + dd] : MT ? wf + dd : dd;
     const float x = dd < 0 ? (float)CIN[(3 + dd) * NCONV + c] : (float)P[(long)row * 16640 + c];
     s += x * bf2f(CW[c * 4 + j]);
   }
   cv[lid] = rbf(silu(s));
-  if (MT) {                                            // la fenêtre comme un bloc de ww lignes
+  if (MT && TREE) {
+  } else if (MT) {                                     // la fenêtre comme un bloc de ww lignes
     if (dep >= ww - 3) COUT[(dep - (ww - 3)) * NCONV + c] = P[(long)t * 16640 + c];
     if (ww < 3 && dep == 0)
       for (int r = 0; r < 3 - ww; r++) COUT[r * NCONV + c] = CIN[(r + ww) * NCONV + c];
@@ -425,11 +427,13 @@ KERNEL(256) void attn_prep(global const half *P, global const ushort *QN, global
   // cap > 0 : cache K/V en int8 (store_kv8)
   // kv8 (étude du cache K/V) : & 1 q, k, v tournés par Hadamard ; & 2 k, v quantifiés par (jeton, tête), en int8, ou
   // en int4 avec & 4
-  // TREE (si non nul) : la position de la ligne t est p0 + sa profondeur ; ses K, V restent rangés à p0 + t.
+  // TREE (si non nul) : la position de la ligne t est p0 + sa profondeur ; ses K, V restent rangés à p0 + t. Avec MT
+  // aussi (fenêtres en arbre) : POS[t] est sa position, ses K, V vont à la rangée POS[première] + (t − première).
   // MT (si non nul) : plusieurs flux, une ligne chacun : caches MT[8t], MT[8t + 1], position POS[t], où K, V vont.
   const int t = get_group_id(0), sg = get_sub_group_id(), lane = get_sub_group_local_id();
   const float pos = (float)(MT ? POS[t] : p0 + (TREE ? TREE[t * 17] & 255 : t));
-  const long krow = MT ? POS[t] : p0 + t;               // rangée du cache où vont K et V
+  const int wf = MT ? (int)MT[t * 8 + 6] : 0;
+  const long krow = MT ? (TREE ? POS[wf] + t - wf : POS[t]) : p0 + t; // rangée du cache où vont K et V
   if (MT) {
     KC = (global ushort *)MT[t * 8];
     VC = (global ushort *)MT[t * 8 + 1];
