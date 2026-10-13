@@ -47,6 +47,12 @@ tous les flux (le jeton en attente, puis les copies du contexte en chaîne, ou l
 absorbe toutes ses lignes gardées ; les brouillons de tous les flux sont proposés en une passe du brouillonneur. Quand
 les autres flux finissent, celui qui reste repasse en arbre DFlash2 (`Lone.resume`).
 
+Sorties structurées (`response_format` JSON / `json_schema`, champs `guided_*`) avec `--parallel N` : chaque ligne est
+tirée parmi les jetons que la grammaire permet (argmax, ou l'échantillonneur à clé sur les jetons permis). Il faut
+`libtfgrammar.so` à côté du serveur (`zig build grammar -Dxgrammar=DIR`, xgrammar v0.2.8, copiée dans
+`zig-out/xpu/lib/`). Une requête structurée ne passe pas par l'arbre DFlash2 du flux seul : ~86 tok/s contre ~145 sur une
+réponse JSON longue.
+
 Options par variables d'environnement :
 
 | Variable | Effet |
