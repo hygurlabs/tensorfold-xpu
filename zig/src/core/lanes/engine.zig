@@ -109,6 +109,18 @@ pub const Engine = struct {
         try e.live.append(e.gpa, s);
     }
 
+    /// Hand a live stream to another driver between rounds (adopt's inverse): it leaves the rounds with its cache
+    /// settled by the backend and its pending token, no drafts held.
+    pub fn detach(e: *Engine, s: *Stream) void {
+        for (e.live.items, 0..) |x, i| {
+            if (x == s) {
+                _ = e.live.orderedRemove(i);
+                break;
+            }
+        }
+        s.dropRoundState(e.gpa);
+    }
+
     /// Release a cancelled stream between rounds: no pending draws or drafts.
     pub fn discard(e: *Engine, s: *Stream) void {
         s.finished = true;

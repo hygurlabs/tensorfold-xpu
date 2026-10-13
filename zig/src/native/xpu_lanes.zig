@@ -1,6 +1,7 @@
 //! The XPU 27B on the lane host: a stream a runner slot, shared rounds across slots (Runner.verifyMulti: each
 //! stream's pending token and its copied drafts as a chain, 16 rows a forward), and a lone drafted stream on DFlash2
-//! trees in slot 0 (the host's `lone` driver) until another stream arrives.
+//! trees (the host's `lone` driver) until another stream arrives; when the others end, the one left resumes alone, its
+//! drafter context rebuilt from the taps of its last rows (each slot keeps RING of them).
 const std = @import("std");
 const api = @import("engine_api");
 const lanes = @import("lanes");
@@ -10,6 +11,8 @@ const Drafter = xq.drafter.Drafter;
 const Allocator = std.mem.Allocator;
 
 const ring = 64;
+const RING = 256; // a slot's last rows whose taps are kept: the drafter's context when the stream resumes alone
+const TAP_ROW = 5 * xq.D * 2; // bf16 [5 D]
 
 pub const Lanes = struct {
     gpa: Allocator,
@@ -27,6 +30,10 @@ pub const Lanes = struct {
     ids: [16]u32 = undefined, // the last verify's rows, window after window
     widths: [16]u32 = undefined, // and each window's rows
     count: usize = 0,
+    wslots: [16]u32 = undefined, // and each window's slot
+    taps_ring: ?*anyopaque = null, // bf16 [slots][RING][5 D], when a drafter is attached
+    ring_end: [xq.MAX_SLOTS]u64 = @splat(0), // rows a slot pushed: its position while its taps are kept
+    feed: bool = false, // the prompt's taps go to the drafter too (a lone stream's prefill)
 
     fn self(ptr: *anyopaque) *Lanes {
         return @ptrCast(@alignCast(ptr));
@@ -42,12 +49,49 @@ pub const Lanes = struct {
         return .{ .exact_width = 16, .mtp = false, .speculate = false, .speculate_early = false, .drafts = 0, .hidden_rows = true, .streams_exact = true, .batch_rows = 16, .max_streams = b.slots, .lone_copies = false };
     }
 
+    /// The taps ring (and the runner's taps callback): with a drafter attached.
+    pub fn initRing(b: *Lanes) !void {
+        b.taps_ring = try b.runner.d.alloc_(@as(usize, b.slots) * RING * TAP_ROW);
+        b.runner.on_taps = .{ .ctx = b, .f = onTaps };
+    }
+
+    fn onTaps(ctx: *anyopaque, taps: *anyopaque, n: u32) anyerror!void {
+        const b = self(ctx);
+        try b.ringPush(b.runner.slot, taps, n);
+        if (b.feed) try b.drafter.?.addTaps(taps, n);
+    }
+
+    /// `slot`'s next `n` rows' taps (rows of `taps` in order) into its ring: the last RING stay.
+    fn ringPush(b: *Lanes, slot: u32, taps: *anyopaque, n: u32) !void {
+        const tr = b.taps_ring orelse return;
+        const d = &b.runner.d;
+        const skip = n -| RING;
+        var done: u32 = skip;
+        while (done < n) {
+            const at: u32 = @intCast((b.ring_end[slot] + done) % RING);
+            const rows = @min(n - done, RING - at);
+            try xq.copy(d, xq.off(tr, (@as(usize, slot) * RING + at) * TAP_ROW), xq.off(taps, @as(usize, done) * TAP_ROW), @as(usize, rows) * TAP_ROW);
+            done += rows;
+        }
+        b.ring_end[slot] += n;
+    }
+
+    /// Keeps the first `keep[i]` rows of the last verify's window i; their taps into the windows' rings.
+    fn keepRows(b: *Lanes, keep: []const u32) !void {
+        try b.runner.keepMulti(keep);
+        var first: usize = 0;
+        for (keep, 0..) |k, i| {
+            try b.ringPush(b.wslots[i], xq.off(b.runner.acts.taps, first * TAP_ROW), k);
+            first += b.widths[i];
+        }
+    }
+
     /// A verify whose rows all stayed: the core calls keep only to drop rows, so the next call keeps them all first.
     fn settle(b: *Lanes) !void {
         if (b.count == 0) return;
         const n = b.count;
         b.count = 0;
-        try b.runner.keepMulti(b.widths[0..n]);
+        try b.keepRows(b.widths[0..n]);
     }
 
     fn slotOf(b: *const Lanes, s: *const lanes.Stream) ?u32 {
@@ -82,8 +126,13 @@ pub const Lanes = struct {
         const r = b.runner;
         try r.select(slot);
         try r.reset();
-        r.taps_on = taps;
-        defer r.taps_on = false;
+        r.taps_on = taps or b.taps_ring != null;
+        b.feed = taps;
+        defer {
+            r.taps_on = false;
+            b.feed = false;
+        }
+        b.ring_end[slot] = 0;
         if (taps) if (b.drafter) |d| d.reset();
         s.cached = 0;
         try r.prompt(ids, true);
@@ -130,6 +179,8 @@ pub const Lanes = struct {
         try b.settle();
         const r = b.runner;
         try r.select(slot);
+        r.taps_on = b.taps_ring != null;
+        defer r.taps_on = false;
         try r.step(try b.value(feed));
         return b.push(try b.draw(s, slot, if (s.sampling != null) try r.logits() else null, position));
     }
@@ -155,10 +206,13 @@ pub const Lanes = struct {
             ids[0] = w.pending;
             @memcpy(ids[1..], w.tokens);
             wins[i] = .{ .slot = b.slotOf(w.stream) orelse return error.UnknownStream, .ids = ids };
+            b.wslots[i] = wins[i].slot;
             b.widths[i] = @intCast(rows);
             total += rows;
         }
         const r = b.runner;
+        r.taps_on = b.taps_ring != null;
+        defer r.taps_on = false;
         try r.verifyMulti(wins[0..windows.len]);
         var row: u32 = 0;
         for (windows, out, 0..) |w, o, i| {
@@ -182,8 +236,8 @@ pub const Lanes = struct {
             for (p, 0..) |row, j| if (row != j) return error.TreePath;
             keep[i] = @intCast(p.len);
         }
-        try b.runner.keepMulti(keep[0..paths.len]);
         b.count = 0;
+        try b.keepRows(keep[0..paths.len]);
     }
 
     fn draftFn(_: *anyopaque, _: []const be.DraftRequest) anyerror!void {}
@@ -199,7 +253,7 @@ pub const Lanes = struct {
     /// core takes it over (true; its state stands in slot 0, its pending token the last it committed).
     pub fn lone(ctx: *anyopaque, s: *lanes.Stream, hooks: api.LoneHooks) anyerror!bool {
         const b = self(ctx);
-        const d = b.drafter orelse return error.DraftNotAttached;
+        if (b.drafter == null) return error.DraftNotAttached;
         try b.settle();
         if (b.owners[0] != null) return error.StreamBusy;
         b.owners[0] = s;
@@ -208,16 +262,51 @@ pub const Lanes = struct {
             b.owners[0] = null;
         };
         try b.prefillSlot(s, 0, true);
-        const r = b.runner;
-        var pending = try b.draw(s, 0, b.first_logits[0], s.prompt_len);
+        const pending = try b.draw(s, 0, b.first_logits[0], s.prompt_len);
         _ = try s.commit(b.gpa, &.{pending}, &.{});
         hooks.committed(hooks.ctx);
+        handed = try b.alone(s, 0, pending, hooks);
+        return handed;
+    }
+
+    /// The stream the lane core was left with, alone again in its slot: the drafter's context restarts on the taps of
+    /// its last rows (RING at most), then DFlash2 trees as `lone`.
+    pub fn resumeLone(ctx: *anyopaque, s: *lanes.Stream, hooks: api.LoneHooks) anyerror!bool {
+        const b = self(ctx);
+        const d = b.drafter orelse return error.DraftNotAttached;
+        try b.settle();
+        const slot = b.slotOf(s) orelse return error.UnknownStream;
+        const r = b.runner;
+        try r.select(slot);
+        var handed = false;
+        defer if (!handed) {
+            b.owners[slot] = null;
+        };
+        const n: u32 = if (b.taps_ring != null and b.ring_end[slot] == r.pos) @min(r.pos, RING) else 0;
+        d.restart(r.pos - n);
+        if (n > 0) {
+            const at: u32 = @intCast((r.pos - n) % RING);
+            const first = @min(n, RING - at);
+            const tr = b.taps_ring.?;
+            try xq.copy(&r.d, r.acts.taps, xq.off(tr, (@as(usize, slot) * RING + at) * TAP_ROW), @as(usize, first) * TAP_ROW);
+            if (first < n) try xq.copy(&r.d, xq.off(r.acts.taps, @as(usize, first) * TAP_ROW), xq.off(tr, @as(usize, slot) * RING * TAP_ROW), @as(usize, n - first) * TAP_ROW);
+            try d.addTaps(r.acts.taps, n);
+        }
+        handed = try b.alone(s, slot, s.pending orelse return error.NoPending, hooks);
+        return handed;
+    }
+
+    /// DFlash2 trees for `s` in `slot` from `pending` (committed, not fed) until it ends (false) or another stream
+    /// arrives (true: its cache settled, `pending` and `cache_len` set for the lane core).
+    fn alone(b: *Lanes, s: *lanes.Stream, slot: u32, pending0: u32, hooks: api.LoneHooks) !bool {
+        const d = b.drafter.?;
+        const r = b.runner;
+        var pending = pending0;
         var out: [16]u32 = undefined;
         while (!s.finished) {
             if (hooks.yield(hooks.ctx)) {
                 s.cache_len = r.pos;
                 s.pending = pending;
-                handed = true;
                 return true;
             }
             if (s.isCancelled()) return error.Cancelled;
@@ -226,6 +315,7 @@ pub const Lanes = struct {
             var sampled: Sampled = .{ .b = b, .s = s.sampling orelse .{ .seed = 0 } };
             const drawer: ?xq.drafter.Draw = if (s.sampling) |sp| .{ .ctx = &sampled, .row = Sampled.row, .gumbel = Sampled.gumbel, .temperature = sp.temperature } else null;
             const round = try xq.drafter.treeRound(d, pending, b.block - 1, b.nodes, drawer, &out);
+            try b.ringPush(slot, r.acts.taps, @intCast(round.tokens.len));
             s.rounds += 1;
             s.drafted += round.drafted;
             s.accepted += round.accepted;

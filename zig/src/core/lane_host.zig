@@ -418,19 +418,44 @@ pub const LaneHost = struct {
 
     /// An idle backend driver takes a lone drafted request, sampled when supported; never one with logprobs.
     fn loneFits(h: *LaneHost, job: *Job) bool {
-        const r = job.request;
         const lone = h.lone orelse return false;
-        if ((r.sampling != null and !lone.sampled) or !r.drafts or r.think_budget > 0 or r.loop_guard or r.call != null or r.structure != null or r.logprobs != null) return false;
+        if (!loneRequest(lone, job.request)) return false;
         h.lock();
         defer h.unlock();
         return h.admitted.items.len == 1 and !h.foregroundWaiting() and h.cancels.items.len == 0 and h.core.activeCount() == 0;
     }
 
+    fn loneRequest(lone: api.Lone, r: *const Request) bool {
+        return !((r.sampling != null and !lone.sampled) or !r.drafts or r.think_budget > 0 or r.loop_guard or r.call != null or r.structure != null or r.logprobs != null);
+    }
+
+    /// The lane core down to one stream the lone driver can take again (it resumes): the stream leaves the rounds and
+    /// goes on alone until it ends or another stream arrives.
+    fn resumeLone(h: *LaneHost) void {
+        const lone = h.lone orelse return;
+        const go = lone.@"resume" orelse return;
+        h.lock();
+        const ok = h.admitted.items.len == 1 and h.filling.items.len == 0 and !h.foregroundWaiting() and h.cancels.items.len == 0 and !h.closing and h.core.activeCount() == 1;
+        h.unlock();
+        if (!ok) return;
+        const job = h.admitted.items[0];
+        if (!job.started or job.stream.finished or job.stream.paused or job.stream.pending == null or !loneRequest(lone, job.request)) return;
+        h.core.detach(&job.stream);
+        job.prefill_sent = true;
+        _ = h.driveLone(job, go);
+    }
+
     /// Send lone-driver tokens as they land; arrivals and cancellation return its stream to the lane core.
     fn runLone(h: *LaneHost, job: *Job, began: i96) bool {
-        h.lone_job = job;
         job.delivered = 0;
+        job.began = began;
+        return h.driveLone(job, h.lone.?.run);
+    }
+
+    fn driveLone(h: *LaneHost, job: *Job, go: *const fn (ctx: *anyopaque, s: *lanes.Stream, hooks: api.LoneHooks) anyerror!bool) bool {
+        h.lone_job = job;
         const lone = h.lone.?;
+        const began = job.began;
         const Hooks = struct {
             fn committed(ctx: *anyopaque) void {
                 const host: *LaneHost = @ptrCast(@alignCast(ctx));
@@ -449,8 +474,7 @@ pub const LaneHost = struct {
                 return host.foregroundWaiting() or host.cancels.items.len > 0 or host.closing;
             }
         };
-        job.began = began;
-        const paused = lone.run(lone.ctx, &job.stream, .{ .ctx = h, .committed = Hooks.committed, .yield = Hooks.yield });
+        const paused = go(lone.ctx, &job.stream, .{ .ctx = h, .committed = Hooks.committed, .yield = Hooks.yield });
         h.lone_job = null;
         const handed = paused catch |e| {
             if (!job.prefill_sent) emit(job, .{ .prefilled = 0 });
@@ -569,6 +593,7 @@ pub const LaneHost = struct {
                     h.unlock();
                 } else i += 1;
             }
+            h.resumeLone();
         }
     }
 

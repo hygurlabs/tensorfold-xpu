@@ -230,7 +230,10 @@ fn openLanes(gpa: Allocator, io: std.Io, runner: *xq.Runner, drafter: ?*Drafter,
     h.core = lanes.Engine.init(gpa, &h.cfg, h.back.backend(), h.wall.clock());
     errdefer h.core.deinit();
     h.host = api.LaneHost.init(gpa, io, &h.core, .{ .name = "qwen27-xpu", .lanes = slots, .context_window = context, .prefill_step = 1024 });
-    if (drafter != null) h.host.lone = .{ .ctx = &h.back, .run = XpuLanes.lone, .sampled = true };
+    if (drafter != null) {
+        try h.back.initRing();
+        h.host.lone = .{ .ctx = &h.back, .run = XpuLanes.lone, .@"resume" = XpuLanes.resumeLone, .sampled = true };
+    }
     try h.host.start();
     std.log.info("qwen27-xpu: {d} streams of {d} tokens{s}", .{ slots, context, if (drafter != null) ", DFlash2 trees for a lone stream" else "" });
     return .{ .engine = h.host.engine(), .close = LaneServed.close, .ctx = h };
@@ -253,7 +256,6 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
                 problem.* = try std.fmt.allocPrint(a, "the XPU engine could not load the drafter {s}: {s}", .{ dir, @errorName(err) });
                 return null;
             };
-            runner.on_taps = .{ .ctx = dr.?, .f = Host.onTaps };
         };
         return try openLanes(gpa, io, runner, dr, o, context);
     }

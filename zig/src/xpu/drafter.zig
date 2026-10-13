@@ -97,7 +97,8 @@ pub const Drafter = struct {
     pred: []const u8, // codebooks bf16 [vocab, 256], on the host (mmap)
     succ: []const u8,
     cap: u32,
-    end: u32 = 0, // context rows held (absolute positions 0 .. end)
+    end: u32 = 0, // context rows held (absolute positions start .. end)
+    start: u32 = 0, // the first context row (restart: a context from a later position)
     // the last block's lattice: per depth the top 16 candidates (target ids), their logits, the selector projection
     cand: [MAXL][TOPK]u32 = undefined,
     unary: [MAXL][TOPK]f64 = undefined,
@@ -304,7 +305,13 @@ pub const Drafter = struct {
 
     /// A fresh sequence: no context rows.
     pub fn reset(dr: *Drafter) void {
-        dr.end = 0;
+        dr.restart(0);
+    }
+
+    /// A context from position `at` on (the target's rows before it unseen): addTaps appends from there.
+    pub fn restart(dr: *Drafter, at: u32) void {
+        dr.start = at;
+        dr.end = at;
     }
 
     /// Appends `n` committed target rows (taps bf16 [n, 5 D] on the device) to the context: fc, its norm, then each
@@ -415,7 +422,7 @@ pub const Drafter = struct {
         try q.embedRows(d, m, dr.ids, dr.x, L);
         const l32: i32 = @intCast(L);
         const end: i32 = @intCast(dr.end);
-        const c0: i32 = @intCast(dr.end -| WIN);
+        const c0: i32 = @intCast(@max(dr.end -| WIN, dr.start));
         for (&dr.layers) |*l| {
             try d.launch(d.k.add_rmsnorm, .{ .x = L }, .{ dr.x, dr.r16, l.in_norm, dr.h, dr.ahi, dr.alo, @as(i32, D), HIDDEN_NORM_EPS, @as(i32, 0), @as(i32, GS), q.no_q8, q.no_q8, @as(i32, 0), @as(i32, 0) });
             try q.gemm(d, dr.pscr, dr.h, dr.ahi, dr.alo, l.kp_attn, dr.dyn, L);

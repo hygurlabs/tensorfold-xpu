@@ -369,6 +369,9 @@ pub const Lone = struct {
     sampled: bool = false, // it drives sampled streams too
     /// Prefills `s` and decodes it until it finishes (false) or `hooks.yield` hands it to the lane core (true).
     run: *const fn (ctx: *anyopaque, s: *lanes.Stream, hooks: LoneHooks) anyerror!bool,
+    /// Optional: decodes `s`, a stream the lane core held (its cache settled, `pending` and `cache_len` set), alone
+    /// the same way, when the core is down to it.
+    @"resume": ?*const fn (ctx: *anyopaque, s: *lanes.Stream, hooks: LoneHooks) anyerror!bool = null,
 };
 
 /// What a lone driver tells the host between rounds: tokens landed; and asks: hand the stream over now?
