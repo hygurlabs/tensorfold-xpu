@@ -25,7 +25,9 @@ pub const Lanes = struct {
     block: u32 = 8,
     nodes: u32 = 15,
     owners: [xq.MAX_SLOTS]?*lanes.Stream = @splat(null),
-    first_logits: [xq.MAX_SLOTS]?[]f32 = @splat(null), // a sampled stream's prompt-row logits, for `first`
+    first_logits: [xq.MAX_SLOTS]?[]f32 = @splat(null), // a sampled or structured stream's prompt-row logits, for `first`
+    masked_vals: ?[]f64 = null, // a structured sampled row's allowed candidates
+    masked_ids: ?[]u64 = null,
     drawn: [ring]u32 = undefined,
     next: u64 = 0,
     ids: [16]u32 = undefined, // the last verify's rows, window after window
@@ -44,7 +46,7 @@ pub const Lanes = struct {
     }
 
     pub fn backend(b: *Lanes) be.Backend {
-        return .{ .ptr = b, .vtable = &.{ .prefill = prefillFn, .first = firstFn, .queue = queueFn, .read = readFn, .verify = verifyFn, .keep = keepFn, .draft = draftFn, .tree = treeFn, .release = releaseFn } };
+        return .{ .ptr = b, .vtable = &.{ .prefill = prefillFn, .first = firstFn, .first_masked = firstMaskedFn, .queue = queueFn, .read = readFn, .verify = verifyFn, .keep = keepFn, .draft = draftFn, .tree = treeFn, .release = releaseFn } };
     }
 
     /// What the round loop reads: chains of up to 16 rows (a window's rows equal one-token steps bit for bit), every
@@ -155,7 +157,7 @@ pub const Lanes = struct {
         }
         s.cached = 0;
         try r.prompt(ids, true);
-        if (s.sampling != null) {
+        if (s.sampling != null or s.grammar != null) {
             const row = try r.logits();
             const keep = b.first_logits[slot] orelse try b.gpa.alloc(f32, row.len);
             @memcpy(keep, row);
@@ -190,6 +192,47 @@ pub const Lanes = struct {
         const b = self(ptr);
         const slot = b.slotOf(s) orelse return error.UnknownStream;
         return b.push(try b.draw(s, slot, b.first_logits[slot], position));
+    }
+
+    /// Structured output: the stream's draw among the tokens `mask` allows (one bit a token): greedy, the allowed
+    /// argmax (the first on ties, as the GPU's); sampled, the keyed sampler over the allowed tokens (its top k of them,
+    /// as the unmasked draw keeps the row's top k).
+    fn drawMasked(b: *Lanes, s: *const lanes.Stream, row: []const f32, position: u64, mask: []const u32) !u32 {
+        if (s.sampling) |sp| if (sp.temperature > 0) {
+            const vals = b.masked_vals orelse try b.gpa.alloc(f64, row.len);
+            b.masked_vals = vals;
+            const ids = b.masked_ids orelse try b.gpa.alloc(u64, row.len);
+            b.masked_ids = ids;
+            const k: usize = if (sp.top_k == 0) row.len else sp.top_k;
+            var n: usize = 0;
+            for (row, 0..) |v32, i| {
+                if (!lanes.grammar.allows(mask, i)) continue;
+                const v: f64 = v32;
+                if (!std.math.isFinite(v)) return error.NonfiniteLogits;
+                if (n == k and !(v > vals[k - 1])) continue; // equal values keep the lower id
+                var j = if (n < k) n else k - 1;
+                if (n < k) n += 1;
+                if (k < row.len) while (j > 0 and v > vals[j - 1]) : (j -= 1) {
+                    vals[j] = vals[j - 1];
+                    ids[j] = ids[j - 1];
+                };
+                vals[j] = v;
+                ids[j] = i;
+            }
+            if (n == 0) return error.NoAllowedToken;
+            return @intCast(try lanes.sampling.choose(b.gpa, vals[0..n], ids[0..n], position, sp));
+        };
+        var best: ?usize = null;
+        for (row, 0..) |v, id| if (lanes.grammar.allows(mask, id) and (best == null or v > row[best.?])) {
+            best = id;
+        };
+        return @intCast(best orelse return error.NoAllowedToken);
+    }
+
+    fn firstMaskedFn(ptr: *anyopaque, s: *lanes.Stream, position: u64, mask: []const u32) anyerror!u64 {
+        const b = self(ptr);
+        const slot = b.slotOf(s) orelse return error.UnknownStream;
+        return b.push(try b.drawMasked(s, b.first_logits[slot] orelse return error.NoLogits, position, mask));
     }
 
     fn queueFn(ptr: *anyopaque, s: *lanes.Stream, feed: be.Feed, position: u64) anyerror!u64 {
@@ -237,7 +280,13 @@ pub const Lanes = struct {
         try r.verifyMulti(wins[0..windows.len]);
         var row: u32 = 0;
         for (windows, out, 0..) |w, o, i| {
+            const words = if (w.masks.len > 0) w.masks.len / b.widths[i] else 0;
             for (0..b.widths[i]) |j| {
+                if (words > 0) { // structured output: the row's grammar bits
+                    o.sampled[j] = try b.drawMasked(w.stream, try r.rowLogits(row), w.positions[j], w.masks[j * words ..][0..words]);
+                    row += 1;
+                    continue;
+                }
                 const logits = if (w.stream.sampling != null) try r.rowLogits(row) else null;
                 o.sampled[j] = if (w.stream.sampling) |sp| try b.pick(b.pick_ctx, logits.?, w.positions[j], sp) else r.block[row];
                 row += 1;
