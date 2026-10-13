@@ -52,7 +52,7 @@ Options par variables d'environnement :
 | Variable | Effet |
 |---|---|
 | `XPU_PREFILL_INT4=1` | **Option locale**, avec `XPU_PREFILL_INT8=1` et un checkpoint tourné (`zig/tools/xpu/rotate_w4.py`, repère `hadamard128`) : entrée de `down` en int4 (DPAS u4 × s4), +8 % de préremplissage à qualité égale au GPTQ W4A8 ; `XPU_PREFILL_INT4_SITES=10` y ajoute les sorties de mixer (+12 %, perplexité +1 %). |
-| `XPU_KV_INT8=1` | Cache K/V en int8 (échelle par position et tête K/V) : moitié de la mémoire, 12 flux au lieu de 7 à 16 k jetons, 7 au lieu de 3 à 32 k ; perplexité inchangée (±0,04 %). Attention du prompt `attn_prompt8` : Q·Kᵀ en DPAS int8, P·V en fp16. |
+| `XPU_KV_INT8=1` | **Option** (le défaut reste bf16) : cache K/V en int8 (échelle par position et tête K/V) : moitié de la mémoire, 12 flux au lieu de 7 à 16 k jetons, 7 au lieu de 3 à 32 k ; perplexité inchangée (±0,04 %), acceptation DFlash2 inchangée. Les réponses ne sont pas identiques au bit près à celles du cache bf16 (15 réponses gloutonnes sur 24 identiques sur 256 jetons, les autres divergent sur des quasi-égalités) ; les contrats drafté == série et multi-flux == série tiennent dans ce mode. Attention du prompt `attn_prompt8` : Q·Kᵀ en DPAS int8, P·V en fp16. |
 | `XPU_ATTN_TRITON=1` | Attention du prompt par le noyau Triton du portage Python au lieu de la nôtre (`attn_prompt`) |
 | `XPU_PREFILL_INT8=1` | **Option locale** : GEMM du prompt en W4A8, activations int8 par (ligne, groupe de 128), GPTQ seulement. Le décodage reste en fp16. |
 | `XPU_TREE=N` | Nœuds de l'arbre DFlash2 par tour (15 par défaut ; 0 : une chaîne) |
