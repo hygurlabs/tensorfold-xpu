@@ -40,6 +40,8 @@ pub const Lanes = struct {
     chain_par: [xq.MAX_SLOTS][16]i32 = undefined, // and each one's parent (−1: the pending token)
     chain_n: [xq.MAX_SLOTS]u32 = @splat(0),
     prompt_skip: u32 = 0, // a prefill's first rows the drafter never reads (further than WIN from the prompt's end)
+    costs: [16]lanes.config.Cost = undefined, // a window's ms by rows (verify and keep), timed by measure()
+    timed: usize = 0,
 
     fn self(ptr: *anyopaque) *Lanes {
         return @ptrCast(@alignCast(ptr));
@@ -53,7 +55,37 @@ pub const Lanes = struct {
     /// stream's window in one shared forward of 16 rows at most; with the drafter, DFlash2 chains as the head's drafts.
     pub fn facts(b: *const Lanes) lanes.Model {
         const head = b.drafter != null;
-        return .{ .exact_width = 16, .mtp = head, .speculate = head, .speculate_early = false, .drafts = if (head) b.block - 1 else 0, .mtp_step_ms = if (head) 0.6 else 0, .draft_streams = head, .hidden_rows = true, .streams_exact = true, .batch_rows = 16, .max_streams = b.slots, .lone_copies = false };
+        return .{ .exact_width = 16, .mtp = head, .speculate = head, .speculate_early = false, .drafts = if (head) b.block - 1 else 0, .mtp_step_ms = if (head) 0.6 else 0, .draft_streams = head, .window_costs = b.costs[0..b.timed], .hidden_rows = true, .streams_exact = true, .batch_rows = 16, .max_streams = b.slots, .lone_copies = false };
+    }
+
+    /// Each window width's ms (a verify of 1 … 16 rows and its keep) on a scratch context in the last slot, so the
+    /// round loop's depth rule weighs expected tokens a ms (without timed costs it drafts 3 rows at most).
+    pub fn measure(b: *Lanes) !void {
+        const r = b.runner;
+        const slot = b.slots - 1;
+        try r.select(slot);
+        try r.reset();
+        var ids: [128]u32 = undefined;
+        for (&ids, 0..) |*t, i| t.* = @intCast((i * 7919 + 13) % xq.VOCAB);
+        try r.prompt(&ids, false);
+        const one = [_]u32{0};
+        const time = struct {
+            fn f(rr: *xq.Runner, sl: u32, row: []const u32, k: []const u32) !f64 {
+                const t0 = xq.now();
+                try rr.verifyMulti(&.{.{ .slot = sl, .ids = row }});
+                try rr.keepPaths(&.{k});
+                try rr.d.sync();
+                return xq.now() - t0;
+            }
+        }.f;
+        for (0..3) |_| _ = try time(r, slot, ids[0..16], &one); // the widest first, while the clocks ramp up
+        for (&b.costs, 1..) |*c, w| {
+            var best: f64 = 1e9;
+            for (0..3) |_| best = @min(best, try time(r, slot, ids[0..w], &one));
+            c.* = .{ .width = @intCast(w), .ms = best * 1e3 };
+        }
+        b.timed = b.costs.len;
+        try r.reset();
     }
 
     /// Every forward's taps reach the drafter context of the slot it ran (with a drafter attached).
