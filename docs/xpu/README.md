@@ -41,9 +41,11 @@ tensorfold-native serve MODELE --drafter DFLASH2 --parallel 8 --context 16384 --
 Avec `--parallel N` (N > 1), chaque flux a son emplacement sur la carte : état GDN (2 × 151 Mo, l'état et sa
 sauvegarde pour la vérification) et cache K/V (64 Ko par jeton de `--context`). Le nombre d'emplacements est borné
 par la mémoire restante après le chargement (`slotsThatFit`). Un flux seul qui demande des brouillons tourne en
-arbre DFlash2 dans l'emplacement 0. Dès qu'un autre arrive, le cœur le reprend dans des tours partagés : un
-forward pour les fenêtres de tous les flux (chacune une chaîne, le jeton en attente puis les copies du contexte),
-16 lignes au plus.
+arbre DFlash2. Dès qu'un autre arrive, le cœur le reprend dans des tours partagés : un forward pour les fenêtres de
+tous les flux (chacune une chaîne : le jeton en attente, puis les copies du contexte ou une chaîne DFlash2), 16 lignes
+au plus. Chaque emplacement a son contexte DFlash2 (K/V du brouillonneur en anneau de 2 080 positions, ~42 Mo) qui
+absorbe toutes ses lignes gardées ; les chaînes de tous les flux sont proposées en une passe du brouillonneur. Quand
+les autres flux finissent, celui qui reste repasse en arbre DFlash2 (`Lone.resume`).
 
 Options par variables d'environnement :
 
@@ -56,24 +58,24 @@ Options par variables d'environnement :
 | `XPU_TREE=N` | Nœuds de l'arbre DFlash2 par tour (15 par défaut ; 0 : une chaîne) |
 | `XPU_BLOCK=N` | Lignes du bloc du brouillonneur (8) |
 
-## Chiffres (B70 à 230 W, serveur `--parallel 8 --context 16384`, validation du 2026-10-12)
+## Chiffres (B70 à 230 W, serveur `--parallel 8 --context 16384`, validation du 2026-10-13)
 
-| | MLX g64 | GPTQ g128 | GPTQ g128 + W4A8 |
-|---|---|---|---|
-| Préremplissage 1 k / 4 k / 8 k jetons | 1 694 / 1 675 / 1 643 tok/s | 1 866 / 1 838 / 1 802 tok/s | 2 416 / 2 381 / 2 321 tok/s |
-| Un flux seul, arbre DFlash2, code / chat, glouton | 128,5 / 98,0 tok/s | 133,0 / 93,1 tok/s | 133,1 / 97,0 tok/s |
-| Un flux seul, arbre DFlash2, code / chat, température 1 | 119,4 / 94,3 tok/s | 114,1 / 91,6 tok/s | 114,1 / 91,5 tok/s |
-| 8 flux simultanés, code / chat, glouton (agrégé) | 210 / 203 tok/s | 183 / 166 tok/s | 183 / 170 tok/s |
-| Décodage `bench_openai`, 8 requêtes (agrégé) | 355 tok/s | 507 tok/s | 418 tok/s |
-| Tours partagés seuls, 1 / 8 flux (`XPU_MULTI_TEST`) | 32 / 219 tok/s | 34 / 227 tok/s | 34 / 227 tok/s |
+| | MLX g64 | GPTQ g128 | GPTQ g128 + W4A8 | RTN tourné + W4A4 |
+|---|---|---|---|---|
+| Préremplissage 1 k / 4 k / 8 k jetons (tok/s) | 1 764 / 1 754 / 1 723 | 1 956 / 1 932 / 1 918 | 2 576 / 2 554 / 2 505 | 2 791 / 2 769 / 2 714 |
+| Un flux seul, arbre DFlash2, code / chat, glouton | 128 / 98 | 132 / 89 | 132 / 96 | 125 / 98 |
+| 2 / 4 / 8 flux simultanés, code, glouton (agrégé) | 197 / 293 / 324 | 222 / 309 / 269 | 222 / 309 / 269 | 202 / 287 / 260 |
+| 2 / 4 / 8 flux simultanés, chat, glouton (agrégé) | 143 / 238 / 299 | 129 / 216 / 207 | 153 / 230 / 223 | 155 / 249 / 226 |
+| Décodage `bench_openai`, 1 / 2 / 4 / 8 requêtes (agrégé) | 172 / 245 / 340 / 345 | 165 / 304 / 336 / 469 | 165 / 321 / 364 / 457 | 178 / 308 / 366 / 474 |
 
-Validation : `zig build test`, oracle, drafté == série, multi-flux == série, et `bench_concurrent --alone --serial`
-sur 1, 2, 4 et 8 flux, en glouton et en échantillonné, pour les trois configurations : 48 cellules toutes égales, aucune
-erreur dans les journaux des serveurs.
+Avant les chaînes DFlash2 par flux (copies seules dans les tours partagés), 2 / 4 / 8 flux de code faisaient
+64 / 120 / 182 tok/s en GPTQ. Validation : `zig build test`, oracle, drafté == série, multi-flux == série, et
+`bench_concurrent --alone --serial` sur 1, 2, 4 et 8 flux, en glouton et en échantillonné, pour les quatre
+configurations : 64 cellules toutes égales, aucune erreur dans les journaux des serveurs.
 
 Bancs : `bench_openai.py` (préremplissage, décodage) et `bench_concurrent.py --alone --serial` (brouillons), dans
 `tools/` de la branche `main` de ce dépôt. Le débit drafté dépend du texte produit ; les deux formats n'écrivent pas le
-même. Dans les tours partagés, chaque flux tourne à 25-32 tok/s : seul un flux seul drafte (arbre DFlash2).
+même.
 
 Le préremplissage est **borné par la puissance** : à 230 W, la carte tourne à ~2 180 MHz pendant un prompt (PL2),
 pas aux 2 600 du DPAS pur. Le GEMM gate|up seul tient 146 TFLOPS fp16 et ~209 TOPS en int8.
@@ -109,8 +111,10 @@ pas aux 2 600 du DPAS pur. Le GEMM gate|up seul tient 146 TFLOPS fp16 et ~209 TO
 | `zig/tools/xpu/w4_ngen.cpp` | Générateur nGEN des GEMM du prompt : int4 fp16 (`w4g_dpb`, `w4g_s4dpb`, épilogue SwiGLU) et W4A8 (`w4a8`) |
 | `zig/build/xpu.zig` | Étapes de build |
 
-Seul fichier du cœur modifié : `zig/src/core/serial_host.zig` (9 lignes, `draft_sampled` : brouillons pour les
-requêtes échantillonnées ; `null` pour les autres backends, `zig build test` passe).
+Fichiers du cœur modifiés (`zig build test` passe) : `zig/src/core/serial_host.zig` (9 lignes, `draft_sampled` :
+brouillons pour les requêtes échantillonnées ; `null` pour les autres backends) ; `zig/src/core/engine_api.zig`
+(`Lone.resume`, optionnel), `zig/src/core/lane_host.zig` (un flux resté seul repasse au pilote seul quand le backend le
+propose), `zig/src/core/lanes/engine.zig` (`Engine.detach`, l'inverse d'`adopt`).
 
 ## Exécutable de test
 
@@ -135,7 +139,8 @@ xpu-qwen27 MODELE --bench=4096 2      # prompt synthétique de 4 096 jetons (att
 
 - Un seul modèle : les dimensions du 27B sont des constantes (`qwen27.zig`) et certaines formes sont écrites dans
   les noyaux (GDN de 128, attention de 256, rapport de têtes 6).
-- En multi-flux, seul un flux seul drafte (arbre DFlash2) ; dans les tours partagés, les brouillons sont les
-  copies du contexte. Pas encore de cache de préfixes ni de reprise de réponse (`decode_chunk`).
+- En multi-flux, les tours partagés vérifient des chaînes (pas d'arbre DFlash2 par flux). Sur un texte très répétitif,
+  où les copies suffisent, la passe du brouillonneur coûte ~6-9 % à 4-8 flux. Pas encore de cache de préfixes ni de
+  reprise de réponse (`decode_chunk`).
 - Formats 4 bits seulement (MLX g64, GPTQ g128 symétrique). Le W4A8 demande le GPTQ g128.
 - Les commentaires des noyaux sont en français : à passer en anglais avant toute proposition amont.
