@@ -759,6 +759,10 @@ fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mode) 
     const q8a: ?*anyopaque = if (q8on) a.a8 else null;
     const q8s: ?*anyopaque = if (q8on) a.sa else null;
     const q8ms: i32 = @intCast(CHUNK + 32);
+    // the mixers' out projection in W4A8: its input quantized by attn_gate / gated_norm (not when it is in int4)
+    const q8out = q8on and !(prefill_int4 and int4_sites & 2 != 0);
+    const q8oa: ?*anyopaque = if (q8out) a.a8 else null;
+    const q8os: ?*anyopaque = if (q8out) a.sa else null;
     const table = if (mode.tree) a.tree else a.chain;
     const mpos: ?*anyopaque = if (mode.multi) |mm| mm.pos else null;
     try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, a.ids, ids.ptr, ids.len * 4, null, 0, null));
@@ -791,7 +795,7 @@ fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mode) 
                 try d.launch(d.k.attn_merge, .{ .x = 24, .y = T }, .{ a.pm, a.pl, a.po, a.y, @as(i32, @intCast(p0)), @as(i32, @intCast(ns)), table, mpos });
             }
             if (kv8 & 1 != 0) try d.launch(d.k.rot_heads, .{ .x = T, .y = 24 }, .{a.y});
-            try d.launch(d.k.attn_gate, .{ .x = T }, .{ a.y, a.p, a.h, a.ahi, a.alo, gs, rot_on });
+            try d.launch(d.k.attn_gate, .{ .x = T }, .{ a.y, a.p, a.h, a.ahi, a.alo, gs, rot_on, q8oa, q8os, q8ms });
         } else {
             const cin = l.conv[l.conv_cur].?;
             const cout = l.conv[1 - l.conv_cur].?;
@@ -843,11 +847,11 @@ fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mode) 
                 try dumpBuf(d, "beta0", a.beta, T * 48, .f32);
                 try dumpBuf(d, "y0", a.y, T * 6144, .bf16);
             }
-            try d.launch(d.k.gated_norm, .{ .x = T }, .{ a.y, a.p, l.gnorm.?, a.h, a.ahi, a.alo, EPS, gs, rot_on });
+            try d.launch(d.k.gated_norm, .{ .x = T }, .{ a.y, a.p, l.gnorm.?, a.h, a.ahi, a.alo, EPS, gs, rot_on, q8oa, q8os, q8ms });
             if (probe) try dumpBuf(d, "o0", a.h, T * 6144, .f16);
         }
         try a8(d, a, a.h, 6144, T, 2);
-        try pgemm(d, a, a.h, l.mixer_out, a.r, T, false, 0, int4_sites & 2 != 0);
+        try pgemm(d, a, a.h, l.mixer_out, a.r, T, q8out, 0, int4_sites & 2 != 0);
         if (probe) try dumpBuf(d, "r0", a.r, T * D, .f16);
         try d.launch(if (T > 16) d.k.add_rmsnorm else d.k.add_rmsnorm_dec, .{ .x = T }, .{ a.x, a.r, l.post_norm, a.h, a.ahi, a.alo, @as(i32, D), EPS, @as(i32, 1), gs, q8a, q8s, q8ms, rot_on });
         try a8(d, a, a.h, D, T, 4);
@@ -989,7 +993,7 @@ pub const Runner = struct {
             .ngen_swiglu_g128 = try d.kernel(try d.g.module(&kb.ngen_swiglu128), "w4g_dpb_swiglu", 256),
             .rowsums_ff = try d.kernel(mg, "rowsums_ff", 128), .fakequant_rows = try d.kernel(mg, "fakequant_rows", 256),
             .a8 = try d.kernel(try d.g.module(&kb.ngen_a8), "w4a8", 256), .a8_swiglu = try d.kernel(try d.g.module(&kb.ngen_a8_swiglu), "w4a8_swiglu", 256),
-            .quant_a8 = try d.kernel(mg, "quant_a8", 256), .quant_a4 = try d.kernel(mg, "quant_a4", 256),
+            .quant_a8 = try d.kernel(mg, "quant_a8", 128), .quant_a4 = try d.kernel(mg, "quant_a4", 128),
             .a4 = try d.kernel(try d.g.module(&kb.ngen_a4), "w4a4", 256),
             .dec_wide = try d.kernel(mm, "w4k1_decode", 64), .dec_wide64 = try d.kernel(mm, "w4k1_d64", 64), .dec_narrow = try d.kernel(mm, "w4k_dsplit", 64),
             .gdn_prep = try d.kernel(mgd, "gdn_prep", 64), .gdn_state = try d.kernel(mgd, "gdn_state", 256),
